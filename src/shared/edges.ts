@@ -137,6 +137,22 @@ export interface AppInfo {
   workspaceRoot: string;
 }
 
+/** The installed app's updates (src/main/updater.ts), from the releases on GitHub. */
+export interface UpdateStatus {
+  /** "unsupported": a development build, which has no installer to update. "ready": downloaded, installs when the app restarts. */
+  state: "unsupported" | "idle" | "checking" | "up-to-date" | "downloading" | "ready" | "error";
+  currentVersion: string;
+  /** The newer version being downloaded, or ready to install. */
+  version: string | null;
+  /** Download progress, 0-100, while downloading. */
+  percent: number | null;
+  error: string | null;
+  /** When a check last reached the releases; null before the first. */
+  checkedAt: number | null;
+  /** Check every few hours and download new versions in the background. */
+  automatic: boolean;
+}
+
 export interface StagedAttachment {
   id: string;
   name: string;
@@ -210,6 +226,12 @@ export const mainEdge = defineEdge("main", {
       z.object({ enabled: z.boolean(), onlyWhenUnfocused: z.boolean(), sound: z.boolean() }),
     ),
     restartApp: method<void>().noArgs,
+    getUpdateStatus: method<UpdateStatus>().noArgs,
+    /** Asks the releases for a newer version, which then downloads in the background; resolves once the check answers. */
+    checkForUpdates: method<UpdateStatus>().noArgs,
+    /** Quits, installs the downloaded update and starts the app again. */
+    installUpdate: method<void>().noArgs,
+    changeAutomaticUpdates: method<UpdateStatus>().args(z.object({ enabled: z.boolean() })),
     readOnboardingSeen: method<boolean>().noArgs,
     changeOnboardingSeen: method<void>().args(z.object({ seen: z.boolean() })),
 
@@ -321,6 +343,7 @@ export const mainEdge = defineEdge("main", {
     "cloud-settings-changed": event<CloudSettings>(),
     "box-location-changed": event<BoxLocationState>(),
     "agent-browser-changed": event<AgentBrowserState>(),
+    "update-status-changed": event<UpdateStatus>(),
   },
 });
 

@@ -49,6 +49,8 @@ export interface Settings {
   spellCheck: boolean;
   hardwareAcceleration: boolean;
   notifications: { enabled: boolean; onlyWhenUnfocused: boolean; sound: boolean };
+  /** Check GitHub for new versions every few hours and download them (installed app only). */
+  updates: { automatic: boolean };
   onboardingSeen: boolean;
   models: ModelPrefs;
   cloud: CloudPrefs;
@@ -78,6 +80,7 @@ const DEFAULTS: Settings = {
   spellCheck: true,
   hardwareAcceleration: true,
   notifications: { enabled: true, onlyWhenUnfocused: true, sound: true },
+  updates: { automatic: true },
   onboardingSeen: false,
   models: DEFAULT_MODEL_PREFS,
   cloud: { kind: "headless", idleMinutes: 10, askBeforeCommands: false },
@@ -122,6 +125,7 @@ export class SettingsStore {
       ...rest,
       schemaVersion: 2,
       notifications: { ...DEFAULTS.notifications, ...stored.notifications },
+      updates: { ...DEFAULTS.updates, ...stored.updates },
       models,
       cloud: { ...DEFAULTS.cloud, ...stored.cloud },
       box: { ...DEFAULTS.box, ...stored.box },
