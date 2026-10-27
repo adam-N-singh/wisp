@@ -1,0 +1,146 @@
+/* Design tokens: `--wisp-*` colors, plus the type, radius and spacing scales. Text
+   uses the system font stack. */
+
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 13px;
+  --font-size-lg: 14px;
+  --line-height-xs: 14px;
+  --line-height-sm: 16px;
+  --line-height-base: 18px;
+  --line-height-lg: 22px;
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-base: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-2xl: 14px;
+  --radius-3xl: 16px;
+  --radius-4xl: 18px;
+  --radius-full: 9999px;
+
+  --titlebar-height: 40px;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --wisp-bg-pane: #ffffff;
+  --wisp-bg-chrome: #fcfcfc;
+  --wisp-bg-sidebar: #f5f5f5;
+  --wisp-bg-elevated: #ffffff;
+  --wisp-bg-elevated-hover: #f1f1f1;
+  --wisp-bg-scrim: #00000080;
+  --wisp-bg-hover: #1c1c1c0f;
+  --wisp-bg-active: #1c1c1c14;
+  --wisp-bg-primary: #1c1c1c;
+  --wisp-bg-primary-hover: #363636;
+  --wisp-bg-primary-disabled: #1c1c1c26;
+  --wisp-bg-secondary: #1c1c1c0f;
+  --wisp-bg-secondary-hover: #1c1c1c1a;
+  --wisp-bg-secondary-active: #1c1c1c2e;
+  --wisp-bg-tertiary: #1c1c1c0f;
+  --wisp-bg-quaternary: #1c1c1c0a;
+  --wisp-fill-bubble-agent: #1c1c1c0f;
+  --wisp-fill-bubble-user: #1c1c1cff;
+  --wisp-text-on-bubble-user: #ffffff;
+  --wisp-fill-attachment-card: #ffffff;
+  --wisp-text-primary: #1c1c1c;
+  --wisp-text-secondary: #1c1c1cad;
+  --wisp-text-tertiary: #1c1c1c8f;
+  --wisp-text-quaternary: #1c1c1c66;
+  --wisp-text-on-primary: #ffffff;
+  --wisp-icon-primary: #1c1c1ceb;
+  --wisp-icon-secondary: #1c1c1ca8;
+  --wisp-icon-tertiary: #1c1c1c85;
+  --wisp-border-primary-translucent: #1c1c1c3d;
+  --wisp-border-secondary-translucent: #1c1c1c1f;
+  --wisp-border-tertiary-translucent: #1c1c1c14;
+  --wisp-border-quaternary-translucent: #1c1c1c0f;
+  --wisp-border-focus-primary: #1e86fc;
+  --wisp-shadow-card: 0 1px 2px #1c1c1c09, 0 0 0 1px #1c1c1c0f;
+  --wisp-shadow-popover: 0 8px 24px #1c1c1c1a, 0 2px 6px #1c1c1c1a, 0 0 0 1px #1c1c1c14;
+  --wisp-shadow-modal: 0 24px 64px #1c1c1c1a, 0 4px 12px #1c1c1c1a, 0 0 0 1px #1c1c1c14;
+  --wisp-bg-accent-primary: #1680f3;
+  --wisp-bg-accent-primary-hover: #126fd4;
+  --wisp-bg-accent-secondary: #1e86fc17;
+  --wisp-bg-accent-secondary-hover: #1e86fc2b;
+  --wisp-text-accent-primary: #0b6dd3;
+  --wisp-bg-danger-primary: #e72e3b;
+  --wisp-bg-danger-primary-hover: #c82532;
+  --wisp-bg-danger-secondary: #fb2b3e17;
+  --wisp-text-danger-primary: #cd2834;
+  --wisp-border-danger-primary: #e72e3b;
+  --wisp-bg-success-primary: #10ab61;
+  --wisp-bg-success-secondary: #14c16f17;
+  --wisp-text-success-primary: #00854a;
+  --wisp-bg-warn-primary: #da830e;
+  --wisp-bg-warn-secondary: #f5931217;
+  --wisp-text-warn-primary: #aa6300;
+  --wisp-border-warn-primary: #da830e;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --wisp-bg-pane: #161616;
+  --wisp-bg-chrome: #121212;
+  --wisp-bg-sidebar: #0e0e0e;
+  --wisp-bg-elevated: #1f1f1f;
+  --wisp-bg-elevated-hover: #2c2c2c;
+  --wisp-bg-scrim: #000000b2;
+  --wisp-bg-hover: #f5f5f50f;
+  --wisp-bg-active: #f5f5f514;
+  --wisp-bg-primary: #f5f5f5;
+  --wisp-bg-primary-hover: #dbdbdb;
+  --wisp-bg-primary-disabled: #f5f5f521;
+  --wisp-bg-secondary: #f5f5f50a;
+  --wisp-bg-secondary-hover: #f5f5f514;
+  --wisp-bg-secondary-active: #f5f5f533;
+  --wisp-bg-tertiary: #f5f5f50a;
+  --wisp-bg-quaternary: #f5f5f505;
+  --wisp-fill-bubble-agent: #f5f5f50a;
+  --wisp-fill-bubble-user: #f5f5f52e;
+  --wisp-text-on-bubble-user: #f5f5f5;
+  --wisp-fill-attachment-card: #252525;
+  --wisp-text-primary: #f5f5f5;
+  --wisp-text-secondary: #f5f5f5a8;
+  --wisp-text-tertiary: #f5f5f58a;
+  --wisp-text-quaternary: #f5f5f561;
+  --wisp-text-on-primary: #121212;
+  --wisp-icon-primary: #f5f5f5e6;
+  --wisp-icon-secondary: #f5f5f5a3;
+  --wisp-icon-tertiary: #f5f5f580;
+  --wisp-border-primary-translucent: #f5f5f538;
+  --wisp-border-secondary-translucent: #f5f5f51a;
+  --wisp-border-tertiary-translucent: #f5f5f50f;
+  --wisp-border-quaternary-translucent: #f5f5f50a;
+  --wisp-border-focus-primary: #1884fc;
+  --wisp-shadow-card: 0 0 0 1px #f5f5f50f;
+  --wisp-shadow-popover: 0 8px 24px #000000a0, 0 0 0 1px #f5f5f51a;
+  --wisp-shadow-modal: 0 24px 64px #000000b0, 0 0 0 1px #f5f5f51a;
+  --wisp-bg-accent-primary: #116dd2;
+  --wisp-bg-accent-primary-hover: #1784fb;
+  --wisp-bg-accent-secondary: #1884fc12;
+  --wisp-bg-accent-secondary-hover: #1884fc26;
+  --wisp-text-accent-primary: #4d9bff;
+  --wisp-bg-danger-primary: #cf2b35;
+  --wisp-bg-danger-primary-hover: #f73643;
+  --wisp-bg-danger-secondary: #fc2c3e12;
+  --wisp-text-danger-primary: #ff6463;
+  --wisp-border-danger-primary: #cf2b35;
+  --wisp-bg-success-primary: #0e9f5a;
+  --wisp-bg-success-secondary: #14c37012;
+  --wisp-text-success-primary: #00ba69;
+  --wisp-bg-warn-primary: #c8770c;
+  --wisp-bg-warn-secondary: #f6941212;
+  --wisp-text-warn-primary: #e28600;
+  --wisp-border-warn-primary: #c8770c;
+}

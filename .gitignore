@@ -1,0 +1,8 @@
+node_modules/
+dist/
+release/
+.test-dist/
+test/e2e/screenshots/
+*.log
+deploy/.env
+deploy/box.env

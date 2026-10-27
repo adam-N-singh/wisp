@@ -1,0 +1,18 @@
+// What a running agent is doing, as one line of text.
+import type { AgentSummary, CurrentActivity } from "../../shared/model";
+
+/** "2 background commands running", while an agent that has finished its turn still has some. */
+export function backgroundText(agent: Pick<AgentSummary, "asyncTaskCount">): string {
+  const count = agent.asyncTaskCount ?? 0;
+  return count === 1 ? "1 background command running" : `${count} background commands running`;
+}
+
+/** A tool's summary, a search line while the model searches (with the query once known), else thinking. */
+export function activityText(activity: CurrentActivity | undefined): string {
+  if (activity?.kind === "tool") return activity.detail ?? "Working…";
+  if (activity?.kind === "searching") {
+    const where = activity.tool === "x_search" ? " on X" : "";
+    return activity.detail != null ? `Searching the web${where} for “${activity.detail}”` : `Searching the web${where}…`;
+  }
+  return "Thinking…";
+}

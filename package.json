@@ -1,0 +1,81 @@
+{
+  "name": "wisp",
+  "productName": "Wisp",
+  "version": "0.1.0",
+  "description": "A desktop app for personal AI agents that run on your own model accounts.",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "dist/main/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:watch": "node scripts/build.mjs --watch",
+    "build:box-server": "node scripts/build.mjs --box-server",
+    "box-server": "node dist/box-server/main.cjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "electron .",
+    "dev": "node scripts/build.mjs && electron .",
+    "test": "node scripts/test.mjs",
+    "test:e2e": "node scripts/build.mjs && node test/e2e/run.mjs",
+    "test:e2e:remote": "node scripts/build.mjs && node test/e2e/remote-box.mjs",
+    "package": "node scripts/build.mjs --production && electron-builder --win --x64"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "1.2.0",
+    "@e2b/desktop": "2.5.0",
+    "e2b": "2.58.0",
+    "highlight.js": "11.11.1",
+    "katex": "0.19.0",
+    "mermaid": "12.2.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0",
+    "web-tree-sitter": "0.25.10",
+    "ws": "8.18.3",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "6.0.1",
+    "electron": "44.7.2",
+    "electron-builder": "26.0.12",
+    "esbuild": "0.28.2",
+    "playwright": "1.56.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "tree-sitter-bash": "0.25.0",
+    "typescript": "6.0.3",
+    "vite": "8.3.4"
+  },
+  "build": {
+    "appId": "dev.local.wisp",
+    "productName": "Wisp",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "dist/wasm/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/app-icon-512.png"
+    },
+    "protocols": [
+      {
+        "name": "Wisp",
+        "schemes": [
+          "wisp"
+        ]
+      }
+    ]
+  }
+}

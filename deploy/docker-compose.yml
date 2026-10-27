@@ -1,0 +1,48 @@
+# The box server behind Caddy, which gets and renews a Let's Encrypt
+# certificate on its own.
+#   1. Point a DNS name at the server and open ports 80 and 443.
+#   2. cp .env.example .env and set BOX_DOMAIN (optionally cp box.env.example box.env for keys set on the server).
+#   3. docker compose up -d --build
+#   4. docker compose exec box cat /data/gateway-token
+#      In the app: Settings → Box → Remote server, https://<BOX_DOMAIN> and that token.
+services:
+  box:
+    build:
+      context: ..
+      args:
+        CLAUDE_CODE: ${CLAUDE_CODE:-0}
+    image: wisp-box
+    # Shown on approval cards for tools that run on the box (MCP servers, Claude Code).
+    hostname: box
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: box.env
+        required: false
+    environment:
+      WISP_BOX_BEHIND_TLS_PROXY: "1"
+    volumes:
+      - box-data:/data
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - box
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      BOX_DOMAIN: ${BOX_DOMAIN:?set BOX_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  box-data:
+  caddy-data:
+  caddy-config:

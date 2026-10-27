@@ -1,0 +1,37 @@
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  cursor: crosshair;
+  background: rgba(0, 0, 0, 0.28);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  user-select: none;
+}
+
+#hint {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 9999px;
+  background: rgba(20, 20, 20, 0.86);
+  color: #f5f5f5;
+  font-size: 13px;
+  pointer-events: none;
+}
+
+body.selecting #hint {
+  opacity: 0;
+}
+
+#selection {
+  position: fixed;
+  border: 2px solid #1e86fc;
+  border-radius: 4px;
+  background: rgba(30, 134, 252, 0.08);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}

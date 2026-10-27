@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; img-src 'self' blob: data: wisp-media:; media-src 'self' blob: wisp-media:; frame-src wisp-visualization:; connect-src 'self' wisp-media:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Wisp</title>
+    <style>
+      :root:not([data-theme]) { background: transparent; }
+      #boot-shell { position: fixed; inset: 0; background: transparent; }
+      #root:not(:empty) + #boot-shell { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="boot-shell" aria-hidden="true"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

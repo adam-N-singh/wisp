@@ -1,0 +1,238 @@
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  color: var(--wisp-text-primary);
+  user-select: none;
+}
+
+button,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+.panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+}
+
+.panel--collapsed {
+  align-items: center;
+  justify-content: center;
+}
+
+.mark {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  border: 1px solid var(--wisp-border-secondary-translucent);
+  border-radius: 50%;
+  background: var(--wisp-bg-elevated);
+  box-shadow: 0 6px 18px #0000002e;
+  cursor: grab;
+}
+
+.mark--working::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 2px solid var(--wisp-bg-accent-primary);
+  border-top-color: transparent;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.mark__dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--wisp-bg-elevated);
+  background: var(--wisp-bg-warn-primary);
+}
+
+.panel--expanded {
+  flex-direction: column;
+  margin: 6px;
+  border-radius: var(--radius-3xl);
+  border: 1px solid var(--wisp-border-secondary-translucent);
+  background: var(--wisp-bg-elevated);
+  box-shadow: 0 8px 28px #00000040;
+  overflow: hidden;
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 6px 10px;
+  cursor: grab;
+}
+
+.panel__name {
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel__spacer {
+  flex: 1;
+}
+
+.panel__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--radius-base);
+  background: transparent;
+  color: var(--wisp-icon-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.panel__icon:hover {
+  background: var(--wisp-bg-hover);
+  color: var(--wisp-icon-primary);
+}
+
+.panel__preview {
+  margin: 0 12px 6px;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-sm);
+  color: var(--wisp-text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.panel__attachments {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 6px;
+}
+
+.panel__chip {
+  position: relative;
+}
+
+.panel__chip img {
+  width: 44px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: var(--radius-base);
+  border: 1px solid var(--wisp-border-secondary-translucent);
+}
+
+.panel__chip button {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--wisp-bg-primary);
+  color: var(--wisp-text-on-primary);
+  cursor: pointer;
+}
+
+.panel__composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  margin: auto 8px 8px;
+  padding: 6px 6px 6px 10px;
+  border-radius: var(--radius-xl);
+  background: var(--wisp-bg-secondary);
+}
+
+.panel__composer textarea {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-base);
+  user-select: text;
+}
+
+.panel__send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: var(--wisp-bg-primary);
+  color: var(--wisp-text-on-primary);
+  cursor: pointer;
+}
+
+.panel__send:disabled {
+  background: var(--wisp-bg-primary-disabled);
+  cursor: default;
+}
+
+.panel__menu {
+  display: flex;
+  flex-direction: column;
+  padding: 0 6px 6px;
+  overflow-y: auto;
+}
+
+.panel__menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.panel__menu button span {
+  flex: 1;
+}
+
+.panel__menu button:hover {
+  background: var(--wisp-bg-elevated-hover);
+}
+
+.panel__menu-unmount {
+  margin-top: 4px;
+  border-top: 1px solid var(--wisp-border-tertiary-translucent) !important;
+  border-radius: 0 !important;
+  color: var(--wisp-text-secondary);
+}

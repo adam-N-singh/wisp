@@ -1,0 +1,411 @@
+{
+  "categories": [
+    { "key": "developer", "label": "Developer Tools" },
+    { "key": "productivity", "label": "Productivity" },
+    { "key": "infrastructure", "label": "Infrastructure" },
+    { "key": "design", "label": "Design" },
+    { "key": "payments", "label": "Payments" },
+    { "key": "support", "label": "Customer Support" },
+    { "key": "research", "label": "Research" }
+  ],
+  "apps": [
+    {
+      "id": "github",
+      "name": "GitHub",
+      "publisher": "GitHub",
+      "category": "developer",
+      "description": "Browse and change repositories, issues, pull requests and Actions runs on GitHub.",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer {token}" },
+      "auth": "token",
+      "fields": [
+        {
+          "key": "token",
+          "label": "Personal access token",
+          "secret": true,
+          "required": true,
+          "placeholder": "github_pat_…",
+          "hint": "A fine-grained token: choose the repositories and permissions agents may use.",
+          "hintUrl": "https://github.com/settings/personal-access-tokens/new"
+        }
+      ],
+      "website": "https://github.com",
+      "docs": "https://github.com/github/github-mcp-server",
+      "color": "#181717",
+      "featured": true
+    },
+    {
+      "id": "sentry",
+      "name": "Sentry",
+      "publisher": "Sentry",
+      "category": "developer",
+      "description": "Search errors and traces, triage issues and dig into problems in your Sentry projects.",
+      "url": "https://mcp.sentry.dev/mcp",
+      "auth": "oauth",
+      "website": "https://sentry.io",
+      "docs": "https://mcp.sentry.dev",
+      "color": "#362D59",
+      "featured": true
+    },
+    {
+      "id": "linear",
+      "name": "Linear",
+      "publisher": "Linear",
+      "category": "productivity",
+      "description": "Search, create and update Linear issues, projects and comments.",
+      "url": "https://mcp.linear.app/mcp",
+      "auth": "oauth",
+      "website": "https://linear.app",
+      "docs": "https://linear.app/docs/mcp",
+      "color": "#5E6AD2",
+      "featured": true
+    },
+    {
+      "id": "notion",
+      "name": "Notion",
+      "publisher": "Notion",
+      "category": "productivity",
+      "description": "Search, read, create and update the pages and databases in your Notion workspace.",
+      "url": "https://mcp.notion.com/mcp",
+      "auth": "oauth",
+      "website": "https://www.notion.com",
+      "docs": "https://developers.notion.com/guides/mcp/overview",
+      "color": "#000000",
+      "featured": true
+    },
+    {
+      "id": "atlassian",
+      "name": "Atlassian",
+      "publisher": "Atlassian",
+      "category": "productivity",
+      "description": "Search, create and update Jira work items and Confluence pages.",
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "auth": "oauth",
+      "website": "https://www.atlassian.com",
+      "docs": "https://developer.atlassian.com/cloud/rovo-mcp/guides/getting-started/",
+      "color": "#0052CC",
+      "featured": true
+    },
+    {
+      "id": "airtable",
+      "name": "Airtable",
+      "publisher": "Airtable",
+      "category": "productivity",
+      "description": "Query and update the bases, tables, records and comments in your Airtable.",
+      "url": "https://mcp.airtable.com/mcp",
+      "auth": "oauth",
+      "website": "https://www.airtable.com",
+      "docs": "https://airtable.com/developers/agents/mcp/getting-started",
+      "color": "#18BFFF"
+    },
+    {
+      "id": "monday",
+      "name": "monday.com",
+      "publisher": "monday.com",
+      "category": "productivity",
+      "description": "Read and update monday.com boards, items, docs and dashboards.",
+      "url": "https://mcp.monday.com/mcp",
+      "headers": { "Authorization": "Bearer {token}" },
+      "auth": "token",
+      "fields": [
+        {
+          "key": "token",
+          "label": "API token",
+          "secret": true,
+          "required": true,
+          "hint": "In monday.com, open your profile picture → Developers → My access tokens."
+        }
+      ],
+      "website": "https://monday.com",
+      "docs": "https://developer.monday.com/api-reference/docs/mcp-api-token",
+      "color": "#6161FF",
+      "monogram": "M"
+    },
+    {
+      "id": "stripe",
+      "name": "Stripe",
+      "publisher": "Stripe",
+      "category": "payments",
+      "description": "Search Stripe's docs and work with the customers, payments, invoices and subscriptions in your Stripe account.",
+      "url": "https://mcp.stripe.com",
+      "auth": "oauth",
+      "website": "https://stripe.com",
+      "docs": "https://docs.stripe.com/mcp",
+      "color": "#635BFF",
+      "featured": true
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare",
+      "publisher": "Cloudflare",
+      "category": "infrastructure",
+      "description": "Search Cloudflare's API and call it to manage your account: zones, DNS, Workers and more.",
+      "url": "https://mcp.cloudflare.com/mcp",
+      "auth": "oauth",
+      "website": "https://www.cloudflare.com",
+      "docs": "https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/",
+      "color": "#F38020"
+    },
+    {
+      "id": "supabase",
+      "name": "Supabase",
+      "publisher": "Supabase",
+      "category": "infrastructure",
+      "description": "Run SQL, apply migrations, read logs and manage edge functions in your Supabase projects.",
+      "url": "https://mcp.supabase.com/mcp",
+      "query": { "project_ref": "{project_ref}" },
+      "auth": "oauth",
+      "fields": [
+        {
+          "key": "project_ref",
+          "label": "Project ref",
+          "placeholder": "abcdefghijklmnopqrst",
+          "hint": "Limits agents to one project. It's the id in your project's dashboard address. Leave it empty for all your projects."
+        }
+      ],
+      "website": "https://supabase.com",
+      "docs": "https://supabase.com/docs/guides/ai-tools/mcp",
+      "color": "#3ECF8E"
+    },
+    {
+      "id": "neon",
+      "name": "Neon",
+      "publisher": "Neon",
+      "category": "infrastructure",
+      "description": "Manage Neon Postgres projects and branches, run SQL and plan schema migrations.",
+      "url": "https://mcp.neon.tech/mcp",
+      "auth": "oauth",
+      "website": "https://neon.com",
+      "docs": "https://neon.com/docs/ai/neon-mcp-server",
+      "color": "#00E599"
+    },
+    {
+      "id": "pagerduty",
+      "name": "PagerDuty",
+      "publisher": "PagerDuty",
+      "category": "infrastructure",
+      "description": "Look into and manage PagerDuty incidents, services, schedules and on-call teams.",
+      "url": "https://mcp.pagerduty.com/mcp",
+      "headers": { "Authorization": "Token token={apiKey}" },
+      "auth": "token",
+      "fields": [
+        {
+          "key": "apiKey",
+          "label": "API key",
+          "secret": true,
+          "required": true,
+          "hint": "A user token (My Profile → User Settings → Create API User Token) or an account key (Integrations → API Access Keys). For EU accounts, add https://mcp.eu.pagerduty.com/mcp as a custom app."
+        }
+      ],
+      "website": "https://www.pagerduty.com",
+      "docs": "https://docs.pagerduty.com/ai-automation/advance/pagerduty-mcp-server",
+      "color": "#06AC38"
+    },
+    {
+      "id": "render",
+      "name": "Render",
+      "publisher": "Render",
+      "category": "infrastructure",
+      "description": "Manage Render services and deploys, read logs and metrics, and query your databases read-only.",
+      "url": "https://mcp.render.com/mcp",
+      "headers": { "Authorization": "Bearer {apiKey}" },
+      "auth": "token",
+      "fields": [
+        {
+          "key": "apiKey",
+          "label": "API key",
+          "secret": true,
+          "required": true,
+          "placeholder": "rnd_…",
+          "hint": "Create one in Render under Account Settings → API Keys.",
+          "hintUrl": "https://dashboard.render.com/u/settings?add-api-key"
+        }
+      ],
+      "website": "https://render.com",
+      "docs": "https://render.com/docs/mcp-server",
+      "color": "#000000"
+    },
+    {
+      "id": "postman",
+      "name": "Postman",
+      "publisher": "Postman",
+      "category": "developer",
+      "description": "Work with your Postman workspaces, collections, environments and API specs.",
+      "url": "https://mcp.postman.com/minimal",
+      "auth": "oauth",
+      "website": "https://www.postman.com",
+      "docs": "https://learning.postman.com/docs/reference/postman-api/postman-mcp-server/postman-mcp-remote-server",
+      "color": "#FF6C37"
+    },
+    {
+      "id": "buildkite",
+      "name": "Buildkite",
+      "publisher": "Buildkite",
+      "category": "developer",
+      "description": "Inspect Buildkite pipelines, builds and job logs, and retry or start builds.",
+      "url": "https://mcp.buildkite.com/mcp",
+      "auth": "oauth",
+      "website": "https://buildkite.com",
+      "docs": "https://buildkite.com/docs/apis/mcp-server",
+      "color": "#14CC80"
+    },
+    {
+      "id": "webflow",
+      "name": "Webflow",
+      "publisher": "Webflow",
+      "category": "design",
+      "description": "Manage Webflow sites: CMS collections, pages, components, styles and publishing.",
+      "url": "https://mcp.webflow.com/mcp",
+      "auth": "oauth",
+      "website": "https://webflow.com",
+      "docs": "https://developers.webflow.com/mcp/reference/getting-started",
+      "color": "#146EF5"
+    },
+    {
+      "id": "wix",
+      "name": "Wix",
+      "publisher": "Wix",
+      "category": "design",
+      "description": "Manage your Wix sites and their business apps, such as stores, bookings and the CMS.",
+      "url": "https://mcp.wix.com/mcp",
+      "auth": "oauth",
+      "website": "https://www.wix.com",
+      "docs": "https://dev.wix.com/docs/sdk/articles/use-the-wix-mcp/about-the-wix-mcp",
+      "color": "#116DFF"
+    },
+    {
+      "id": "intercom",
+      "name": "Intercom",
+      "publisher": "Intercom",
+      "category": "support",
+      "description": "Search conversations and contacts, add internal notes and manage Help Center articles in Intercom.",
+      "url": "https://mcp.intercom.com/mcp",
+      "auth": "oauth",
+      "website": "https://www.intercom.com",
+      "docs": "https://developers.intercom.com/docs/guides/mcp",
+      "color": "#1F8DED"
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "publisher": "Hugging Face",
+      "category": "research",
+      "description": "Search the Hugging Face Hub for models, datasets, Spaces and papers, and read their details.",
+      "url": "https://huggingface.co/mcp",
+      "headers": { "Authorization": "Bearer {token}" },
+      "auth": "none",
+      "fields": [
+        {
+          "key": "token",
+          "label": "Access token",
+          "secret": true,
+          "placeholder": "hf_…",
+          "hint": "Without one, agents get the public tools. A token adds your own account's tools.",
+          "hintUrl": "https://huggingface.co/settings/tokens"
+        }
+      ],
+      "website": "https://huggingface.co",
+      "docs": "https://huggingface.co/docs/hub/agents-mcp",
+      "color": "#FFD21E",
+      "monogram": "HF",
+      "featured": true
+    },
+    {
+      "id": "deepwiki",
+      "name": "DeepWiki",
+      "publisher": "Cognition",
+      "category": "research",
+      "description": "Read the generated wikis of public GitHub repositories and ask questions about their code.",
+      "url": "https://mcp.deepwiki.com/mcp",
+      "auth": "none",
+      "website": "https://deepwiki.com",
+      "docs": "https://docs.devin.ai/work-with-devin/deepwiki-mcp",
+      "color": "#1F3A5F",
+      "monogram": "DW"
+    },
+    {
+      "id": "context7",
+      "name": "Context7",
+      "publisher": "Upstash",
+      "category": "research",
+      "description": "Fetch current documentation and code examples for programming libraries and frameworks.",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": { "Authorization": "Bearer {apiKey}" },
+      "auth": "none",
+      "fields": [
+        {
+          "key": "apiKey",
+          "label": "API key",
+          "secret": true,
+          "hint": "Raises the rate limits.",
+          "hintUrl": "https://context7.com/dashboard"
+        }
+      ],
+      "website": "https://context7.com",
+      "docs": "https://github.com/upstash/context7",
+      "color": "#00C98D",
+      "monogram": "C7"
+    },
+    {
+      "id": "exa",
+      "name": "Exa",
+      "publisher": "Exa",
+      "category": "research",
+      "description": "Search the web and read pages with Exa, a search engine built for AI.",
+      "url": "https://mcp.exa.ai/mcp",
+      "headers": { "x-api-key": "{apiKey}" },
+      "auth": "none",
+      "fields": [
+        {
+          "key": "apiKey",
+          "label": "API key",
+          "secret": true,
+          "hint": "Raises the free limits.",
+          "hintUrl": "https://dashboard.exa.ai/api-keys"
+        }
+      ],
+      "website": "https://exa.ai",
+      "docs": "https://exa.ai/docs/get-started/exa-mcp",
+      "color": "#1F40ED"
+    },
+    {
+      "id": "microsoft-learn",
+      "name": "Microsoft Learn",
+      "publisher": "Microsoft",
+      "category": "research",
+      "description": "Search and read Microsoft's official documentation and code samples.",
+      "url": "https://learn.microsoft.com/api/mcp",
+      "auth": "none",
+      "website": "https://learn.microsoft.com",
+      "docs": "https://learn.microsoft.com/en-us/training/support/mcp",
+      "color": "#0078D4",
+      "monogram": "ML"
+    },
+    {
+      "id": "aws-knowledge",
+      "name": "AWS Knowledge",
+      "publisher": "Amazon Web Services",
+      "category": "research",
+      "description": "Search and read AWS documentation and check which services are available in each Region.",
+      "url": "https://knowledge-mcp.global.api.aws",
+      "auth": "none",
+      "website": "https://aws.amazon.com",
+      "docs": "https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server",
+      "color": "#232F3E",
+      "monogram": "AK"
+    },
+    {
+      "id": "cloudflare-docs",
+      "name": "Cloudflare Docs",
+      "publisher": "Cloudflare",
+      "category": "research",
+      "description": "Search Cloudflare's developer documentation for current answers about its products.",
+      "url": "https://docs.mcp.cloudflare.com/mcp",
+      "auth": "none",
+      "website": "https://developers.cloudflare.com",
+      "docs": "https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/",
+      "color": "#F38020",
+      "monogram": "CD"
+    }
+  ]
+}

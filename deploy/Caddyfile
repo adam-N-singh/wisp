@@ -1,0 +1,8 @@
+# HTTPS for the box server. Caddy fetches and renews the certificate for
+# BOX_DOMAIN and forwards everything to the box, flushing at once so the
+# gateway's Server-Sent Events streams aren't buffered.
+{$BOX_DOMAIN} {
+	reverse_proxy box:8787 {
+		flush_interval -1
+	}
+}

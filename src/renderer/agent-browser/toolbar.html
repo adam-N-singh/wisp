@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'" />
+    <title>Agent browser</title>
+  </head>
+  <body>
+    <div class="bar">
+      <button type="button" class="icon" id="back" title="Back" aria-label="Back" disabled>&#x2190;</button>
+      <button type="button" class="icon" id="forward" title="Forward" aria-label="Forward" disabled>&#x2192;</button>
+      <button type="button" class="icon" id="reload" title="Reload" aria-label="Reload" disabled>&#x21bb;</button>
+      <input id="address" type="text" spellcheck="false" aria-label="Address" readonly />
+      <span id="status" class="status" role="status"></span>
+      <button type="button" id="chat" class="secondary" hidden>Open the chat</button>
+      <button type="button" id="control" class="primary"></button>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Tabs" id="tabs"></div>
+    <script type="module" src="./toolbar.ts"></script>
+  </body>
+</html>

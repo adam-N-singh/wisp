@@ -1,0 +1,6 @@
+# Store text with LF line endings so checkouts work on Windows, macOS and Linux.
+* text=auto
+*.png binary
+*.ico binary
+*.icns binary
+*.wasm binary
