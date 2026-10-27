@@ -1,7 +1,7 @@
 // Settings: General, Box, Models, Cloud computer, Permissions, MCP servers, About.
 import { useEffect, useState, type ReactNode } from "react";
 import { siteLabel } from "../../shared/agent-browser";
-import type { AppInfo, BoxLocationState, BoxServerStatus, NotificationPreferences, ThemeState } from "../../shared/edges";
+import type { AppInfo, BoxLocationState, BoxServerStatus, NotificationPreferences, ThemeState, UpdateStatus } from "../../shared/edges";
 import {
   CHATGPT_USAGE_URL,
   DEFAULT_XAI_BASE_URL,
@@ -954,6 +954,8 @@ function About() {
       <Row title={info.name} description="A desktop app for personal AI agents.">
         <span className="mono">v{info.version}</span>
       </Row>
+      <Updates />
+      <h3>App</h3>
       <Row title="Electron">
         <span className="mono">{info.electron}</span>
       </Row>
@@ -968,5 +970,68 @@ function About() {
         </button>
       </Row>
     </div>
+  );
+}
+
+const checkedAtText = (at: number | null) => (at == null ? "" : ` Checked ${new Date(at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}.`);
+
+/** What the update status says: a headline and a line under it. */
+function updateText(status: UpdateStatus): { title: string; detail: string } {
+  switch (status.state) {
+    case "unsupported":
+      return { title: "Not available in this build", detail: "The installed app gets updates from Wisp's releases on GitHub." };
+    case "idle":
+      return { title: "Not checked yet", detail: status.automatic ? "Wisp checks shortly after it starts." : "Automatic updates are off." };
+    case "checking":
+      return { title: "Checking for updates…", detail: "" };
+    case "up-to-date":
+      return { title: "Wisp is up to date", detail: checkedAtText(status.checkedAt).trim() };
+    case "downloading":
+      return { title: `Downloading version ${status.version}`, detail: `${status.percent ?? 0}%` };
+    case "ready":
+      return { title: `Version ${status.version} is ready`, detail: "It installs the next time Wisp quits, or restart now." };
+    case "error":
+      return { title: "Couldn’t check for updates", detail: `${status.error ?? ""}${checkedAtText(status.checkedAt)}` };
+  }
+}
+
+function Updates() {
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const off = main.subscribe({ "update-status-changed": (next) => setStatus(next) });
+    void main.getUpdateStatus().then(setStatus);
+    return off;
+  }, []);
+  if (status == null) return null;
+  const unsupported = status.state === "unsupported";
+  const busy = status.state === "checking" || status.state === "downloading";
+  const text = updateText(status);
+  const run = async (action: () => Promise<unknown>) => {
+    setError(null);
+    try {
+      await action();
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  };
+  return (
+    <>
+      <h3>Updates</h3>
+      <Row title={text.title} description={error ?? (text.detail || undefined)}>
+        {status.state === "ready" ? (
+          <button type="button" className="button button--primary" onClick={() => void run(() => main.installUpdate())}>
+            Restart to update
+          </button>
+        ) : (
+          <button type="button" className="button" disabled={unsupported || busy} onClick={() => void run(async () => setStatus(await main.checkForUpdates()))}>
+            Check for updates
+          </button>
+        )}
+      </Row>
+      <Row title="Automatic updates" description="Check every few hours and download new versions in the background. They install the next time Wisp quits.">
+        <Toggle checked={status.automatic} disabled={unsupported} label="Automatic updates" onChange={(value) => void run(async () => setStatus(await main.changeAutomaticUpdates({ enabled: value })))} />
+      </Row>
+    </>
   );
 }

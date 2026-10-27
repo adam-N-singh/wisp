@@ -2,6 +2,7 @@
 import { writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { app, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, nativeTheme, protocol, screen, session, shell } from "electron";
+import { autoUpdater } from "electron-updater";
 import { BOT_TEMPLATE_EXTENSION, botTemplateFileName } from "../shared/bot-template";
 import { serveEdge } from "../shared/rpc/runtime";
 import { ipcServerTransport, type PortPeer } from "../shared/rpc/transports";
@@ -19,12 +20,13 @@ import { detectClaudeCode, openClaudeCodeSignIn } from "./claude-code-cli";
 import { ClientPersistence } from "./client-persistence";
 import { DesktopMount } from "./desktop-mount";
 import { McpAuth } from "./mcp-auth";
-import { notifyActivity } from "./notifications";
+import { notifyActivity, notifyUpdateReady } from "./notifications";
 import { ProcessHost } from "./processes";
 import { normalizeBoxUrl, probeBox, type RemoteBoxAddress, RemoteBoxClient } from "./remote-box";
 import { type SecretName, SecretStore } from "./secrets";
 import { SettingsStore } from "./settings";
 import { TrayController } from "./tray";
+import { Updater } from "./updater";
 import { handleVisualizationProtocol, VISUALIZATION_SCHEME } from "./visualizations";
 import { installWebPermissions } from "./web-permissions";
 import { createMainWindow, overlayColors, resolvedDark } from "./windows";
@@ -355,10 +357,31 @@ async function main(): Promise<void> {
       showMainWindow();
       deliverDeepLink({ route: "new-agent" });
     },
+    installUpdate: () => updater.install(),
     quit: () => {
       quitting = true;
       app.quit();
     },
+  });
+
+  // ---- updates: the installed app checks the releases on GitHub (src/main/updater.ts) --------
+  const updater = new Updater({
+    engine: app.isPackaged && process.platform === "win32" ? autoUpdater : null,
+    currentVersion: app.getVersion(),
+    automatic: settings.get().updates.automatic,
+    onChange: (status) => {
+      emitMain?.("update-status-changed", status);
+      tray.setUpdate(status.state === "ready" ? status.version : null);
+    },
+    onReady: (version) =>
+      notifyUpdateReady(version, {
+        prefs: settings.get().notifications,
+        assetsDir,
+        onClick: () => {
+          showMainWindow();
+          deliverDeepLink({ route: "settings", section: "about" });
+        },
+      }),
   });
 
   const refreshRoster = async () => {
@@ -575,6 +598,13 @@ async function main(): Promise<void> {
         quitting = true;
         app.relaunch();
         app.exit(0);
+      },
+      getUpdateStatus: () => updater.get(),
+      checkForUpdates: () => updater.check(),
+      installUpdate: () => updater.install(),
+      changeAutomaticUpdates: ({ enabled }) => {
+        settings.update({ updates: { automatic: enabled } });
+        return updater.setAutomatic(enabled);
       },
       readOnboardingSeen: () => settings.get().onboardingSeen,
       changeOnboardingSeen: ({ seen }) => {
@@ -807,12 +837,15 @@ async function main(): Promise<void> {
   tray.create();
   desktopMount.install();
   handleArgv(process.argv);
+  updater.start();
 
   app.on("activate", () => showMainWindow());
+  // Also how an update's quitAndInstall gets past the window's hide-to-tray on close.
   app.on("before-quit", () => {
     quitting = true;
   });
   app.on("will-quit", () => {
+    updater.stop();
     globalShortcut.unregisterAll();
     tray.destroy();
     processes.stop();

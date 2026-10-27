@@ -8,6 +8,7 @@ export interface TrayActions {
   showMain(): void;
   openAgent(agentId: string): void;
   newAgent(): void;
+  installUpdate(): void;
   quit(): void;
 }
 
@@ -15,6 +16,7 @@ export class TrayController {
   private tray: Tray | null = null;
   private state: "idle" | "working" | "attention" = "idle";
   private agents: AgentSummary[] = [];
+  private updateVersion: string | null = null;
 
   constructor(
     private readonly assetsDir: string,
@@ -46,6 +48,13 @@ export class TrayController {
     this.rebuildMenu();
   }
 
+  /** A downloaded update waiting to install, or null. */
+  setUpdate(version: string | null): void {
+    if (version === this.updateVersion) return;
+    this.updateVersion = version;
+    this.rebuildMenu();
+  }
+
   private icon(state: "idle" | "working" | "attention") {
     const file = state === "idle" ? "tray.png" : state === "working" ? "tray-working.png" : "tray-attention.png";
     return nativeImage.createFromPath(join(this.assetsDir, file));
@@ -65,6 +74,7 @@ export class TrayController {
         ...(rows.length > 0 ? rows.map((agent) => ({ label: label(agent), click: () => this.actions.openAgent(agent.id) })) : [{ label: "No agents yet", enabled: false }]),
         { type: "separator" },
         { label: "New agent…", click: () => this.actions.newAgent() },
+        ...(this.updateVersion != null ? [{ label: `Restart to update to ${this.updateVersion}`, click: () => this.actions.installUpdate() }] : []),
         { label: "Quit", click: () => this.actions.quit() },
       ]),
     );

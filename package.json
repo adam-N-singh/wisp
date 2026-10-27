@@ -20,12 +20,14 @@
     "test": "node scripts/test.mjs",
     "test:e2e": "node scripts/build.mjs && node test/e2e/run.mjs",
     "test:e2e:remote": "node scripts/build.mjs && node test/e2e/remote-box.mjs",
-    "package": "node scripts/build.mjs --production && electron-builder --win --x64"
+    "package": "node scripts/build.mjs --production && electron-builder --win --x64 --publish never",
+    "release": "node scripts/build.mjs --production && electron-builder --win --x64 --publish always"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "1.2.0",
     "@e2b/desktop": "2.5.0",
     "e2b": "2.58.0",
+    "electron-updater": "6.6.2",
     "highlight.js": "11.11.1",
     "katex": "0.19.0",
     "mermaid": "12.2.0",
@@ -69,6 +71,14 @@
       "target": "nsis",
       "icon": "assets/app-icon-512.png"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "adam-N-singh",
+        "repo": "wisp",
+        "releaseType": "draft"
+      }
+    ],
     "protocols": [
       {
         "name": "Wisp",
