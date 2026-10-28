@@ -48,6 +48,8 @@ export const documents = new Store<Record<string, LoadedDocument>>({});
 export const drafts = new Store<Record<string, Draft | undefined>>({});
 /** Each agent's documents, newest first. */
 export const library = new Store<Record<string, LibraryPage[] | undefined>>({});
+/** Every agent's documents (`libraryPages`), newest first, once the palette has asked; null until then. */
+export const allPages = new Store<LibraryPage[] | null>(null);
 
 /** A gateway error's failure code and its message for the user. */
 export function pageFailure(cause: unknown): { code: string | null; message: string } {
@@ -203,13 +205,26 @@ export async function loadLibrary(agentId: string): Promise<void> {
   }
 }
 
+export async function loadAllPages(): Promise<void> {
+  try {
+    allPages.set(await gateway.libraryPages({ includeDocuments: true }));
+  } catch {
+    // offline; what was read before stays
+  }
+}
+
+/** A list of pages with this one put in (newest first), changed or taken out. */
+function withPage(list: readonly LibraryPage[], page: LibraryPage, deleted: boolean): LibraryPage[] {
+  const rest = list.filter((item) => item.page.storeId !== page.page.storeId || item.page.documentId !== page.page.documentId);
+  return deleted ? rest : [page, ...rest].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
 function applyPageChanged(event: PageChangedEvent): void {
   const { agentId, page } = event;
   const known = library.get()[agentId];
-  if (known != null) {
-    const rest = known.filter((item) => item.page.documentId !== page.page.documentId);
-    library.set((state) => ({ ...state, [agentId]: event.change === "deleted" ? rest : [page, ...rest].sort((a, b) => b.updatedAt - a.updatedAt) }));
-  }
+  if (known != null) library.set((state) => ({ ...state, [agentId]: withPage(known, page, event.change === "deleted") }));
+  const every = allPages.get();
+  if (every != null) allPages.set(withPage(every, page, event.change === "deleted"));
   const key = pageKey(agentId, page.page.documentId);
   if (event.change === "deleted") putDraft(agentId, page.page.documentId, undefined);
   const loaded = documents.get()[key];
@@ -252,6 +267,8 @@ export function startPages(): void {
   gateway.subscribe({
     "page-changed": applyPageChanged,
     "agent-deleted": ({ ids }) => {
+      const every = allPages.get();
+      if (every != null) allPages.set(every.filter((item) => !ids.includes(item.page.storeId)));
       for (const key of Object.keys(drafts.get())) {
         const [agentId, documentId] = key.split("\u0000");
         if (ids.includes(agentId)) putDraft(agentId, documentId, undefined);
@@ -264,6 +281,7 @@ export function startPages(): void {
         void loadDocument(agentId, documentId);
       }
       for (const agentId of Object.keys(library.get())) void loadLibrary(agentId);
+      if (allPages.get() != null) void loadAllPages();
     },
   });
 }

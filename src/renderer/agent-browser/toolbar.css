@@ -34,7 +34,7 @@
 html,
 body {
   margin: 0;
-  height: 80px;
+  height: 100%;
   overflow: hidden;
   background: var(--bg);
   color: var(--fg);
@@ -181,4 +181,32 @@ body.asking .status {
 .tab__close:hover,
 .tab__new:hover {
   background: var(--tab);
+}
+
+/* A page's alert or confirm, while the user has the browser. */
+.dialog {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 10px;
+  box-sizing: border-box;
+  border-top: 1px solid var(--border);
+  background: var(--tab-active);
+}
+.dialog[hidden] {
+  display: none;
+}
+.dialog__from {
+  flex: none;
+  color: var(--ask);
+  font-weight: 500;
+}
+.dialog__text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  user-select: text;
 }

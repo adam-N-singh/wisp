@@ -753,6 +753,7 @@ export class Harness {
         let told = false;
         let approval: ToolApproval | null = null;
         let answer: string | null = null;
+        let approvalsAfterAnswer = 0;
         try {
           for (;;) {
             const result = await this.deps.callLocalTool(
@@ -771,7 +772,8 @@ export class Harness {
               signal,
             );
             if (result.kind === "needs-approval") {
-              if (approval != null) return finish("failed", "", "The tool asked for approval twice.");
+              // Once, or once more after the user's answer when the daemon doesn't carry the first approval over.
+              if (approval != null && (answer == null || approvalsAfterAnswer++ > 0)) return finish("failed", "", "The tool asked for approval twice.");
               // The card carries the daemon's approval id, which it checks when the call comes back.
               const resolution = await this.requestPermission(agentId, run, turn, step, entry, result.ask, result.approvalId);
               if (resolution === "deny") return finish("failed", "", "The user denied this action.");
@@ -783,7 +785,7 @@ export class Harness {
               // An ask_user card in the chat (browser_wait_for_user has handed the user the agent browser meanwhile).
               answer = await this.askUser(agentId, run, turn, step, result.question, result.options.map((label) => ({ label, value: label })), true);
               this.patchAgent(agentId, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
-              approval = null;
+              // The resend keeps the approval: the daemon honors it once more, for the same call on the same page.
               continue;
             }
             if (result.kind === "blocked" && approval?.resolution === "never") return finish("failed", "", "The user denied this action and asked not to be asked again.");

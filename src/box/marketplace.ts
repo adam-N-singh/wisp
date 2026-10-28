@@ -13,7 +13,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { cpSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, posix, relative } from "node:path";
 import { visibleText } from "../shared/bot-template";
-import { isPluginName, type PluginOption, type PluginServerSpec } from "../shared/marketplace";
+import { isPluginName, type PluginOption, type PluginServerSpec, type PluginSkillChange } from "../shared/marketplace";
 import { isSecureEndpoint } from "../shared/mcp-oauth";
 import { BASIC_ENV } from "./mcp";
 import { fetchLimitedText, parseSkillFile, skillFromMarkdown } from "./skills";
@@ -642,6 +642,65 @@ export function folderHash(dir: string): string {
   };
   walk(dir);
   return hash.digest("hex").slice(0, 32);
+}
+
+/** Each file in a folder (its path with "/") and a hash of its contents; an empty map for a folder that isn't there. */
+function fileHashes(dir: string): Map<string, string> {
+  const hashes = new Map<string, string>();
+  const walk = (folder: string) => {
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+      const path = join(folder, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (entry.isFile()) hashes.set(relative(dir, path).replace(/\\/g, "/"), createHash("sha256").update(readFileSync(path)).digest("hex"));
+    }
+  };
+  if (isDirectory(dir)) walk(dir);
+  return hashes;
+}
+
+/** A skill's SKILL.md as agents read it, or null when it can't be read. */
+function readSkillText(root: string, skill: IndexedSkill): { text: string; removed: number } | null {
+  try {
+    return skillText(readFileSync(join(root, ...skill.path.split("/")), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+const MAX_CHANGED_FILES = 200;
+
+/** A plugin's folder and the skills read from it. */
+export type PluginFiles = { root: string; skills: IndexedSkill[] };
+
+/** The skills an update from the files in `before` to those in `after` adds, removes and changes (by name; changed when its text, as agents read it, differs). */
+export function skillChanges(before: PluginFiles, after: PluginFiles): PluginSkillChange[] {
+  const skills: PluginSkillChange[] = [];
+  for (const skill of after.skills) {
+    const now = readSkillText(after.root, skill);
+    const old = before.skills.find((candidate) => candidate.name === skill.name);
+    const was = old != null ? readSkillText(before.root, old) : null;
+    if (old != null && was?.text === now?.text) continue;
+    skills.push({ name: skill.name, change: old == null ? "added" : "changed", before: was?.text ?? null, after: now?.text ?? null, ...(now != null && now.removed > 0 ? { hiddenCharacters: now.removed } : {}) });
+  }
+  for (const skill of before.skills) {
+    if (!after.skills.some((candidate) => candidate.name === skill.name)) skills.push({ name: skill.name, change: "removed", before: readSkillText(before.root, skill)?.text ?? null, after: null });
+  }
+  const order = { changed: 0, added: 1, removed: 2 };
+  return skills.sort((a, b) => order[a.change] - order[b.change] || a.name.localeCompare(b.name));
+}
+
+/** The files besides the skills' SKILL.md that the update adds, removes and changes, by path (at most 200, and how many more). */
+export function fileChanges(before: PluginFiles, after: PluginFiles): { files: Array<{ path: string; change: "added" | "removed" | "changed" }>; moreFiles: number } {
+  const skillFiles = new Set([...before.skills, ...after.skills].map((skill) => skill.path));
+  const old = fileHashes(before.root);
+  const now = fileHashes(after.root);
+  const files: Array<{ path: string; change: "added" | "removed" | "changed" }> = [];
+  for (const path of [...new Set([...old.keys(), ...now.keys()])].sort()) {
+    if (skillFiles.has(path)) continue;
+    const change = !old.has(path) ? "added" : !now.has(path) ? "removed" : old.get(path) !== now.get(path) ? "changed" : null;
+    if (change != null) files.push({ path, change });
+  }
+  return { files: files.slice(0, MAX_CHANGED_FILES), moreFiles: Math.max(0, files.length - MAX_CHANGED_FILES) };
 }
 
 /** Stands for the plugin's commit and its servers exactly as written. */

@@ -428,6 +428,40 @@ export interface AsyncTaskOutput {
   note?: string;
 }
 
+/**
+ * A background task that ended (`getEndedAsyncTasks`; `readAsyncTasks` lists only running ones). The box keeps
+ * them for a week.
+ */
+export interface EndedAsyncTask {
+  id: string;
+  kind: AsyncTaskInfo["kind"];
+  label: string;
+  labelKind?: AsyncTaskInfo["labelKind"];
+  labelParams?: { id: string };
+  command: string;
+  computer: "local" | "cloud";
+  computerLabel: string;
+  outputPath: string;
+  status: Exclude<AsyncTaskOutput["status"], "running">;
+  exitCode: number | null;
+  startedAtMs: number;
+  endedAtMs: number;
+  /** Who stopped it, when it was stopped. */
+  stoppedBy?: "agent" | "user" | null;
+  /** Why it was lost, or how it was stopped. */
+  detail?: string;
+  /** The last lines of its output, as the box kept them. */
+  tail?: string;
+  /** Its log is still on the PC, to open; a cloud command's stays on the cloud computer. */
+  logExists: boolean;
+}
+
+/** What `cancelAllAsyncTasks` stopped (task ids), and those it couldn't reach. */
+export interface StopAllAsyncTasksResult {
+  stopped: string[];
+  failed: Array<{ id: string; error: string }>;
+}
+
 // ---- todos, automations ---------------------------------------------------------
 
 export interface AgentTodo {

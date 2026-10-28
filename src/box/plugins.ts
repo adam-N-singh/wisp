@@ -18,8 +18,10 @@ import {
   parsePluginId,
   pluginIdOf,
   type PluginOption,
+  type PluginSkillChange,
   type PluginSkillInfo,
   type PluginSyncStatus,
+  type PluginUpdate,
   type SkillCatalogEntry,
 } from "../shared/marketplace";
 import type { McpCatalogEntry, McpServerConfig, McpServerSummary } from "../shared/model";
@@ -34,6 +36,9 @@ import {
   type MarketplaceRecord,
   moveFolderSync,
   parseMarketplaceSource,
+  fileChanges,
+  type PluginFiles,
+  skillChanges,
   resolveServer,
   sameSource,
   serversKeyOf,
@@ -323,6 +328,8 @@ export class PluginHost {
 
   private installedView(installed: InstalledPlugin, listed: boolean): InstalledPluginView {
     const update = this.updateOf(installed);
+    // Only the skills here: every catalog read comes through, and the other files are hashed when the review asks.
+    const skills = update != null ? skillChanges(...this.filesOf(installed, update.plugin)) : null;
     const paths = { root: this.store.pluginFolder(installed.marketplaceId, installed.name, installed.commit), data: this.store.pluginDataFolder(installed.marketplaceId, installed.name) };
     return {
       commit: installed.commit,
@@ -332,10 +339,38 @@ export class PluginHost {
       serverIds: Object.values(installed.serverIds),
       values: shownValues(installed),
       configuredKeys: Object.entries(installed.values).filter(([, value]) => value.length > 0).map(([key]) => key),
+      version: installed.plugin.version,
       updateAvailable: update != null,
       serversChanged: update?.serversChanged ?? false,
+      skillChanges: skills != null ? { added: names(skills, "added"), removed: names(skills, "removed"), changed: names(skills, "changed") } : null,
       delisted: !listed,
     };
+  }
+
+  /** What updating to the last refresh's files changes: the version, the skills with their texts, the servers and the other files. */
+  pluginUpdate(pluginId: string): PluginUpdate {
+    const installed = this.store.getInstalledPlugin(pluginId);
+    if (installed == null) throw new PluginError("not-found", "That plugin isn’t installed.");
+    const update = this.updateOf(installed);
+    if (update == null) throw new PluginError("conflict", "There’s no newer version of it. Refresh its marketplace to look for one.");
+    return {
+      pluginId,
+      fromCommit: installed.commit,
+      toCommit: update.plugin.files.commit,
+      fromVersion: installed.plugin.version,
+      toVersion: update.plugin.version,
+      serversChanged: update.serversChanged,
+      skills: skillChanges(...this.filesOf(installed, update.plugin)),
+      ...fileChanges(...this.filesOf(installed, update.plugin)),
+    };
+  }
+
+  /** The installed files, and the newer ones the marketplace read. */
+  private filesOf(installed: InstalledPlugin, newer: IndexedPlugin & { files: NonNullable<IndexedPlugin["files"]> }): [PluginFiles, PluginFiles] {
+    return [
+      { root: this.store.pluginFolder(installed.marketplaceId, installed.name, installed.commit), skills: installed.plugin.skills },
+      { root: join(this.store.marketplaceDir(installed.marketplaceId), ...newer.files.folder.split("/")), skills: newer.skills },
+    ];
   }
 
   /** The marketplace's newer read of an installed plugin, when its files changed. */
@@ -643,6 +678,9 @@ export class PluginHost {
     return github != null && /^[0-9a-f]{40}$/.test(installed.commit) ? `https://github.com/${github.repo}/blob/${installed.commit}/${github.path !== "" ? `${github.path}/` : ""}${path}` : null;
   }
 }
+
+/** The names of the skills an update changes this way. */
+const names = (skills: PluginSkillChange[], change: PluginSkillChange["change"]) => skills.filter((skill) => skill.change === change).map((skill) => skill.name);
 
 /** The values an installed plugin's options took, secrets left out: what replies may show. */
 function shownValues(installed: InstalledPlugin): Record<string, string> {

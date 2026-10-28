@@ -385,3 +385,72 @@ test("harness: a browser call while the PC isn't connected says so", async () =>
   await until(() => toolCall()?.status === "failed" && !store.getAgent("a1")!.isRunning);
   assert.match(toolCall()?.detail?.error ?? "", /The agent browser runs on the user's PC, which isn't connected right now/);
 });
+
+test("an approval carries over once to the call resent with the user's answer, for the same call on the same page", async () => {
+  const approvals = new IssuedApprovals(async () => "allow-once");
+  const call = { agentId: "a1", tool: "browser_wait_for_user", args: { reason: "Sign in" } };
+  const subject = "read-only\nsite:https://shop.test\nshop.test";
+  const approval = { resolution: "allow-once" as const, entryId: "t1", requestId: "card-1" };
+  assert.equal(approvals.resume({ ...call, approval }, subject), false, "nothing carried over yet");
+  approvals.issue("card-1", call, subject);
+  assert.equal(await approvals.confirm({ ...call, approval }, subject), true);
+  approvals.carryOver("card-1", call, subject);
+  assert.equal(await approvals.confirm({ ...call, approval }, subject), false, "the card itself stays one-shot");
+  assert.equal(approvals.resume({ ...call, approval }, subject), true);
+  assert.equal(approvals.resume({ ...call, approval }, subject), false, "and so does the carry-over");
+
+  for (const [resend, at, why] of [
+    [{ ...call, args: { reason: "Something else" } }, subject, "another call"],
+    [{ ...call, agentId: "a2" }, subject, "another agent's call"],
+    [call, "read-only\nsite:https://other.test\nother.test", "the page on another site"],
+  ] as const) {
+    approvals.carryOver("card-2", call, subject);
+    assert.equal(approvals.resume({ ...resend, approval: { ...approval, requestId: "card-2" } }, at), false, why);
+    assert.equal(approvals.resume({ ...call, approval: { ...approval, requestId: "card-2" } }, subject), false, `${why}: the try used it up`);
+  }
+});
+
+test("harness: the call resent after the user's answer keeps its approval, so the user isn't asked again", async () => {
+  const calls: LocalToolCall[] = [];
+  let carried = true;
+  const { store, harness, send, toolCall } = harnessWith(
+    () => [descriptor("browser_wait_for_user")],
+    async (call) => {
+      calls.push(call);
+      if (call.approval == null) return { kind: "needs-approval", approvalId: `card-${calls.length}`, ask: { action: "use-app", target: "shop.test", title: "Hand you the agent browser", risk: "read-only", reasons: [] } };
+      if (call.answer == null) return { kind: "ask-user", question: "Sign in to the shop.", options: ["Done"] };
+      // The daemon decides whether the approval carries over; when it doesn't, it asks again.
+      if (!carried && call.approval.requestId === "card-1") return { kind: "needs-approval", approvalId: "card-3", ask: { action: "use-app", target: "other.test", title: "Hand you the agent browser", risk: "read-only", reasons: [] } };
+      return { kind: "ok", output: `The user answered “${call.answer}”.` };
+    },
+  );
+  const cards = () => store.entries("a1").filter((entry): entry is SendMessageEntry => entry.kind === "send-message" && entry.message.type === "local-tool-permission");
+  const question = () => store.entries("a1").find((entry): entry is SendMessageEntry => entry.kind === "send-message" && entry.message.type === "widget" && entry.respondedValue == null);
+  const allow = (card: SendMessageEntry) => harness.resolvePermission("a1", card.id, card.requestId!, "allow-once");
+
+  send('/tool browser_wait_for_user {"reason":"Sign in to the shop"}');
+  await until(() => cards().length === 1);
+  allow(cards()[0]);
+  await until(() => question() != null);
+  assert.equal(harness.answerCard("a1", question()!.id, "Done"), true);
+  await until(() => !store.getAgent("a1")!.isRunning);
+  assert.equal(toolCall()?.status, "done");
+  assert.equal(cards().length, 1, "one approval card");
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].answer, "Done");
+  assert.equal(calls[2].approval?.requestId, "card-1", "the resend carries the approval it ran on");
+
+  // When the daemon doesn't carry it over (the page moved to another site), one new card is asked for.
+  carried = false;
+  calls.length = 0;
+  send('/tool browser_wait_for_user {"reason":"Sign in to the shop"}');
+  await until(() => cards().length === 2);
+  allow(cards()[1]);
+  await until(() => question() != null);
+  harness.answerCard("a1", question()!.id, "Done");
+  await until(() => cards().length === 3);
+  allow(cards()[2]);
+  await until(() => !store.getAgent("a1")!.isRunning);
+  assert.equal(store.entries("a1").filter((entry): entry is ToolCallEntry => entry.kind === "tool-call").at(-1)?.status, "done");
+  assert.equal(calls.at(-1)?.approval?.requestId, "card-3");
+});

@@ -16,6 +16,15 @@
 // The window's toolbar (src/renderer/agent-browser/) shows who drives, with Take over / Hand back.
 // Page permission prompts are refused, downloads go to the agent's workspace, popups become tabs,
 // and only http(s) pages open. fillByRef is the seam for a trusted filler (a future vault).
+//
+// A page's alert and confirm come here instead of Electron's native message box, which isn't tied
+// to the agent's window and stays on screen when the dialog is answered some other way: while the
+// agent drives they're answered at once (alert accepted, confirm dismissed) and the agent is told;
+// while the user drives they show in the toolbar, to answer there. Electron has no public hook for
+// this; its WebContents emits "-run-dialog" (info, callback) and "-cancel-dialogs" for its own
+// listener, which each tab replaces. Without that event (another Electron), the native box stays
+// and the agent's turn answers over the DevTools protocol, as before. (window.prompt never comes:
+// Electron throws in the page.)
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { BaseWindow, type IpcMain, type Session, session as sessions, type WebContents, WebContentsView } from "electron";
@@ -27,6 +36,8 @@ import { type AgentBrowserState, agentBrowserToolbarEdge, type AgentBrowserToolb
 import { type AXNode, type FieldInfo, needsFieldInfo, RefTable, renderSnapshot } from "./agent-browser-snapshot";
 
 const TOOLBAR_HEIGHT = 80;
+/** The toolbar's extra row while it shows a page's dialog. */
+const DIALOG_ROW_HEIGHT = 48;
 const MAX_TABS = 12;
 const DOWNLOAD_LIMIT = 1024 ** 3;
 const LOAD_TIMEOUT_MS = 30_000;
@@ -53,6 +64,17 @@ interface Tab {
   world: number | null;
   /** Counts documents, so a call can tell whether it navigated. */
   documents: number;
+  /** This tab's alerts and confirms come to us (see the top of this file). */
+  ownsDialogs: boolean;
+  /** A dialog the page waits on while the user has the browser. */
+  dialog: PendingDialog | null;
+}
+
+interface PendingDialog {
+  kind: "alert" | "confirm" | "prompt";
+  message: string;
+  /** Answers the page, once; a no-op once Electron cancelled the dialog (navigation, a crash). */
+  answer(accept: boolean): void;
 }
 
 interface AgentWindow {
@@ -171,6 +193,11 @@ export class AgentBrowsers {
       agentBrowserToolbarEdge,
       {
         read: (_args, { caller }) => this.toolbarView(fromToolbar(caller)),
+        answerDialog: ({ tabId, accept }, { caller }) => {
+          const tab = fromToolbar(caller).tabs.find((candidate) => candidate.id === tabId);
+          if (tab?.dialog == null) throw new Error("That dialog is gone.");
+          tab.dialog.answer(accept);
+        },
         takeOver: (_args, { caller }) => this.takeOver(fromToolbar(caller)),
         returnControl: (_args, { caller }) => this.returnControl(fromToolbar(caller)),
         showChat: (_args, { caller }) => this.deps.showChat(fromToolbar(caller).agentId),
@@ -352,11 +379,12 @@ export class AgentBrowsers {
 
   private layout(win: AgentWindow): void {
     const [width, height] = win.window.getContentSize();
-    win.toolbar.setBounds({ x: 0, y: 0, width, height: TOOLBAR_HEIGHT });
+    const top = TOOLBAR_HEIGHT + (this.activeTab(win)?.dialog != null ? DIALOG_ROW_HEIGHT : 0);
+    win.toolbar.setBounds({ x: 0, y: 0, width, height: top });
     for (const tab of win.tabs) {
       const active = tab.id === win.activeId;
       tab.view.setVisible(active);
-      if (active) tab.view.setBounds({ x: 0, y: TOOLBAR_HEIGHT, width, height: Math.max(0, height - TOOLBAR_HEIGHT) });
+      if (active) tab.view.setBounds({ x: 0, y: top, width, height: Math.max(0, height - top) });
     }
   }
 
@@ -405,7 +433,7 @@ export class AgentBrowsers {
       adopt != null
         ? new WebContentsView({ webContents: adopt })
         : new WebContentsView({ webPreferences: { partition: AGENT_BROWSER_PARTITION, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false, spellcheck: false, safeDialogs: true } });
-    const tab: Tab = { id: win.nextTabId++, view, contents: view.webContents, refs: new RefTable(), world: null, documents: 0 };
+    const tab: Tab = { id: win.nextTabId++, view, contents: view.webContents, refs: new RefTable(), world: null, documents: 0, ownsDialogs: false, dialog: null };
     win.tabs.push(tab);
     win.window.contentView.addChildView(view);
     this.wire(win, tab);
@@ -466,8 +494,9 @@ export class AgentBrowsers {
     contents.debugger.on("detach", () => {
       tab.world = null;
     });
+    this.takeDialogs(win, tab);
     contents.debugger.on("message", (_event, method, params) => {
-      if (method !== "Page.javascriptDialogOpening" || win.control === "user") return;
+      if (method !== "Page.javascriptDialogOpening" || tab.ownsDialogs || win.control === "user") return;
       // A confirm guards something the user should decide; the agent's turn dismisses it and says so.
       const accept = params.type === "alert" || params.type === "beforeunload";
       void contents.debugger.sendCommand("Page.handleJavaScriptDialog", { accept }).catch(() => undefined);
@@ -477,6 +506,56 @@ export class AgentBrowsers {
           : `The page showed a message: “${clean(params.message).slice(0, 300)}”.`,
       );
     });
+  }
+
+  /** Replaces Electron's native alert and confirm boxes for this tab with ours (see the top of this file). */
+  private takeDialogs(win: AgentWindow, tab: Tab): void {
+    const events = tab.contents as unknown as NodeJS.EventEmitter;
+    if (events.listenerCount("-run-dialog") === 0) return;
+    events.removeAllListeners("-run-dialog");
+    events.removeAllListeners("-cancel-dialogs");
+    tab.ownsDialogs = true;
+    let current: { settled: boolean } | null = null;
+    events.on("-run-dialog", (info: { dialogType?: string; messageText?: string }, callback: (accept: boolean, text: string) => void) => {
+      const state = { settled: false };
+      current = state;
+      const kind = info.dialogType === "confirm" || info.dialogType === "prompt" ? info.dialogType : "alert";
+      const message = String(info.messageText ?? "").slice(0, 2_000);
+      const answer = (accept: boolean) => {
+        // Electron's callback after it cancelled the dialog (or twice) takes the app down.
+        if (state.settled || tab.contents.isDestroyed()) return;
+        state.settled = true;
+        if (tab.dialog?.answer === answer) tab.dialog = null;
+        callback(accept, "");
+        this.layout(win);
+        this.changed(win);
+      };
+      if (win.control === "agent") return this.answerForAgent(win, { kind, message, answer });
+      tab.dialog = { kind, message, answer };
+      // The user sees it at once: its tab comes forward, and the window flashes if it's behind.
+      if (win.activeId !== tab.id) win.activeId = tab.id;
+      if (!win.window.isFocused()) win.window.flashFrame(true);
+      this.layout(win);
+      this.changed(win);
+    });
+    events.on("-cancel-dialogs", () => {
+      if (current != null) current.settled = true;
+      if (tab.dialog == null) return;
+      tab.dialog = null;
+      this.layout(win);
+      this.changed(win);
+    });
+  }
+
+  /** The agent's turn: an alert is accepted, a confirm dismissed (the user decides those), and the agent is told. */
+  private answerForAgent(win: AgentWindow, dialog: PendingDialog, when = ""): void {
+    const message = clean(dialog.message).slice(0, 300);
+    win.notes.push(
+      dialog.kind === "alert"
+        ? `The page showed a message${when}: “${message}”.`
+        : `The page asked (a ${dialog.kind} dialog)${when}: “${message}”. It was dismissed; if it should be accepted, ask the user to do it with browser_wait_for_user.`,
+    );
+    dialog.answer(dialog.kind === "alert");
   }
 
   private ownerOf(contents: WebContents): AgentWindow | null {
@@ -495,6 +574,7 @@ export class AgentBrowsers {
     const tab = this.activeTab(win);
     return {
       ...this.state(win.agentId),
+      dialog: tab?.dialog != null ? { tabId: tab.id, kind: tab.dialog.kind, message: tab.dialog.message } : null,
       agentName: this.deps.agentName(win.agentId),
       canGoBack: tab?.contents.navigationHistory.canGoBack() ?? false,
       canGoForward: tab?.contents.navigationHistory.canGoForward() ?? false,
@@ -512,6 +592,8 @@ export class AgentBrowsers {
 
   private returnControl(win: AgentWindow): void {
     if (win.control === "user") win.notes.push("The user had the browser and handed it back; the page may have changed. Take a snapshot.");
+    // A dialog the user left open would hold up the agent's page: it's answered as the agent's turn would.
+    for (const tab of win.tabs) if (tab.dialog != null) this.answerForAgent(win, tab.dialog, " while the user had the browser");
     win.control = "agent";
     win.request = null;
     for (const wake of win.waiters) wake();

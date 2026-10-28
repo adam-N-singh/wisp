@@ -154,7 +154,7 @@ try {
     await panel.waitFor({ state: "hidden" });
   });
 
-  await step("pages: a document opens on the stage beside the chat; the user's edit is a new revision the next message tells the agent about", async () => {
+  await step("pages: a document opens on the stage beside the chat, and from Ctrl+K; the user's edit is a new revision the next message tells the agent about", async () => {
     const markdown = "# Trip plan\n\nTwo days in Portugal.\n\n- Day 1: Lisbon\n- Day 2: Sintra\n\n| Day | Train |\n|---|---|\n| 1 | 09:10 |";
     await send(`/tool create_document ${JSON.stringify({ title: "Trip plan", markdown })}`);
     const card = page.getByRole("button", { name: "Open Trip plan" });
@@ -180,6 +180,19 @@ try {
     await page.keyboard.press("Escape");
     await stage.waitFor({ state: "hidden" });
     await page.getByRole("button", { name: "Open Trip plan" }).getByText("revision 2, edited by you", { exact: false }).waitFor();
+    // Ctrl+K finds it by its title and opens it on the stage again; the agent's browser is an action there too.
+    const palette = page.getByRole("dialog", { name: "Jump to" });
+    await page.keyboard.press("Control+k");
+    await palette.getByRole("combobox", { name: "Jump to" }).fill("trip");
+    await palette.getByRole("group", { name: "Pages" }).getByRole("option", { name: /^Trip plan/ }).click();
+    await stage.getByRole("heading", { name: "Trip plan", level: 1 }).waitFor({ timeout: 10_000 });
+    await page.keyboard.press("Escape");
+    await stage.waitFor({ state: "hidden" });
+    await page.keyboard.press("Control+k");
+    await palette.getByRole("combobox", { name: "Jump to" }).fill("browser");
+    await palette.getByRole("option", { name: "Wisp: Show agent browser" }).waitFor({ timeout: 10_000 });
+    await page.keyboard.press("Escape");
+    await palette.waitFor({ state: "hidden" });
     await send("What did I change?");
     await page.getByText("Page you changed:").waitFor({ timeout: 20_000 });
     await page.getByLabel("Conversation with Wisp").getByText('You said: "What did I change?"', { exact: false }).waitFor({ timeout: 20_000 });
@@ -202,6 +215,13 @@ try {
     await page.screenshot({ path: join(shots, "05c-async-tasks.png") });
     await panel.getByRole("button", { name: /^Stop Background command \d+$/ }).click();
     await panel.getByText("Wisp has nothing running in the background.").waitFor({ timeout: 20_000 });
+    // It moves to the Ended section, which says who stopped it and keeps its log and last output.
+    const ended = panel.getByRole("region", { name: "Ended" });
+    await ended.getByText("Stopped by you").waitFor({ timeout: 10_000 });
+    await ended.getByRole("button", { name: "Open log" }).waitFor();
+    await ended.getByRole("button", { name: "Last output" }).click();
+    await ended.getByLabel(/^Last output of Background command \d+$/).getByText("bg ready", { exact: false }).waitFor();
+    await page.screenshot({ path: join(shots, "05d-async-tasks-ended.png") });
     await page.keyboard.press("Escape");
     await panel.waitFor({ state: "hidden" });
     await pill.waitFor({ state: "hidden", timeout: 10_000 });
@@ -215,6 +235,9 @@ try {
     await page.getByRole("button", { name: "Wisp actions" }).click();
     await page.getByRole("menuitem", { name: /^Async tasks/ }).click();
     await panel.getByText("Wisp has nothing running in the background.").waitFor({ timeout: 10_000 });
+    // Newest first: the one that finished, then the one stopped.
+    await ended.locator(".async-task").first().getByText("Finished · exit code 0").waitFor({ timeout: 10_000 });
+    if ((await ended.locator(".async-task").count()) !== 2) throw new Error("the Ended section should list both commands");
     await panel.getByRole("button", { name: "Close" }).click();
     await panel.waitFor({ state: "hidden" });
   });
@@ -222,7 +245,7 @@ try {
   await step("agent browser: a local test page is read, typed into (asked once for the site), clicked, downloaded from; prompts, overlays and files are refused; calls wait while the user has it; a purchase asks; the user is handed the browser", async () => {
     const site = await startTestSite();
     try {
-      await driveAgentBrowser({ app, page, send, site, conversation: () => page.getByLabel("Conversation with Wisp"), screenshot: (name) => page.screenshot({ path: join(shots, name) }) });
+      await driveAgentBrowser({ app, page, send, site, conversation: () => page.getByLabel("Conversation with Wisp"), screenshot: async (name, options) => (options?.png != null ? writeFileSync(join(shots, name), options.png) : await page.screenshot({ path: join(shots, name) })) });
       await page.getByRole("tab", { name: "Computer" }).click();
       await page.getByRole("region", { name: "Agent browser" }).getByRole("button", { name: "Show agent browser" }).waitFor({ timeout: 10_000 });
       await page.getByRole("tab", { name: "Overview" }).click();

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { AsyncTasks } from "../../src/box/async-tasks";
+import { AsyncTaskError, AsyncTasks } from "../../src/box/async-tasks";
 import { CLOUD_PID_PLACEHOLDER, type CloudComputer } from "../../src/box/cloud-computer";
 import { CLOUD_TOOLS } from "../../src/box/cloud-tools";
 import { Harness } from "../../src/box/harness";
@@ -18,7 +18,7 @@ import { LOCAL_TOOLS, type ToolContext } from "../../src/local-exec/tools";
 import { type BackgroundShellStatus, headerLength, logFooter, logHeader, readLogView } from "../../src/shared/background-shell";
 import type { BoxModelConfig } from "../../src/shared/edges";
 import { readSse, type ToolResult } from "../../src/shared/gateway-protocol";
-import type { AgentSummary, AsyncTaskInfo, CloudComputerStatus, MessageEntry, TranscriptEntry } from "../../src/shared/model";
+import type { AgentSummary, AsyncTaskInfo, CloudComputerStatus, EndedAsyncTask, MessageEntry, TranscriptEntry } from "../../src/shared/model";
 
 const cleanup: Array<() => void> = [];
 after(() => {
@@ -357,6 +357,111 @@ test("async tasks: after a restart of the box or the PC, lost tasks are marked l
   await until(() => !store.getAgent("a1")!.isRunning);
 });
 
+test("async tasks: the Ended list says how each ended, newest first, beside the running list", async () => {
+  const base = Date.now() - 600_000;
+  const { store, tasks } = setupBox(undefined, { controlLocal: (request) => ({ kind: "ok", output: "", task: shell(request.shellId, "aborted", { startedAt: base, endedAt: base + 240_000 }) }) });
+  const run = (id: number) => tasks.noteShell("local", shell(id, "running", { startedAt: base }), "TESTPC");
+  run(7001);
+  tasks.noteShell("local", shell(7001, "succeeded", { startedAt: base, endedAt: base + 60_000, tail: "built" }), "TESTPC");
+  run(7002);
+  tasks.noteShell("local", shell(7002, "failed", { startedAt: base, endedAt: base + 120_000, exitCode: 2 }), "TESTPC");
+  run(7003);
+  tasks.noteShell("local", shell(7003, "aborted", { startedAt: base, endedAt: base + 180_000 }), "TESTPC", { stoppedBy: "agent" });
+  run(7004);
+  await tasks.cancel("a1", "local:7004");
+  run(7005);
+  tasks.noteShell("local", shell(7005, "lost", { startedAt: base, endedAt: base + 300_000, detail: "It stopped when the app's local tools restarted." }), "TESTPC");
+  run(7006);
+
+  assert.deepEqual(tasks.info("a1").map((task) => task.id), ["local:7006"], "readAsyncTasks still lists only what runs");
+  const ended = tasks.ended("a1");
+  assert.deepEqual(
+    ended.map((task) => [task.id, task.status, task.exitCode, task.stoppedBy ?? null, task.endedAtMs - task.startedAtMs]),
+    [
+      ["local:7005", "lost", null, null, 300_000],
+      ["local:7004", "stopped", null, "user", 240_000],
+      ["local:7003", "stopped", null, "agent", 180_000],
+      ["local:7002", "failed", 2, null, 120_000],
+      ["local:7001", "succeeded", 0, null, 60_000],
+    ],
+  );
+  assert.deepEqual(
+    { ...ended[4], endedAtMs: 0, startedAtMs: 0 },
+    {
+      id: "local:7001", kind: "shell", label: "npm run build", labelKind: "shell_command", labelParams: { id: "7001" }, command: "npm run build", computer: "local", computerLabel: "TESTPC",
+      outputPath: "C:\\app\\local-exec\\terminals\\7001.txt", status: "succeeded", exitCode: 0, startedAtMs: 0, endedAtMs: 0, tail: "built", logExists: true,
+    } satisfies EndedAsyncTask,
+  );
+  assert.equal(ended[0].detail, "It stopped when the app's local tools restarted.");
+  assert.equal(tasks.ended("a1", 2).length, 2);
+
+  // The daemon drops ended commands with their logs: those missing from its list have none to open.
+  tasks.reconcileLocal("TESTPC", [7003, 7004, 7005].map((id) => shell(id, "aborted", { startedAt: base, endedAt: base })).concat(shell(7006, "running", { startedAt: base })));
+  assert.deepEqual(
+    tasks.ended("a1").map((task) => [task.id, task.logExists]),
+    [
+      ["local:7005", true],
+      ["local:7004", true],
+      ["local:7003", true],
+      ["local:7002", false],
+      ["local:7001", false],
+    ],
+  );
+  assert.deepEqual(tasks.info("a1").map((task) => task.id), ["local:7006"]);
+  await until(() => !store.getAgent("a1")!.isRunning);
+});
+
+test("async tasks: Stop all stops each running one on the PC and the cloud computer, tells the agent of each without waking it, and reports what it can't reach", async () => {
+  const fake = new FakeCloud();
+  const cloud = fake as unknown as CloudComputer;
+  const offline = new Set<number>();
+  const { store, tasks, controls, quiet, replies } = setupBox(undefined, {
+    cloud,
+    cloudPollMs: 200,
+    controlLocal: (request) => {
+      if (offline.has(request.shellId)) throw new AsyncTaskError("offline", "TESTPC isn’t connected, so its command can’t be reached now.");
+      return { kind: "ok", output: "", task: shell(request.shellId, "aborted") };
+    },
+  });
+  tasks.noteShell("local", shell(8001, "running"), "TESTPC");
+  tasks.noteShell("local", shell(8002, "running"), "TESTPC");
+  const started = await CLOUD_TOOLS.run_shell.run({ command: "npm run watch", background: true }, { agentId: "a1", cloud, signal: new AbortController().signal, progress: () => undefined, shells: tasks });
+  const cloudId = `cloud:${/background command (\d+)/.exec(started.output)?.[1]}`;
+  assert.equal(store.getAgent("a1")!.asyncTaskCount, 3);
+
+  const result = await tasks.cancelAll("a1");
+  assert.deepEqual([...result.stopped].sort(), [cloudId, "local:8001", "local:8002"].sort());
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(tasks.info("a1"), []);
+  assert.equal(store.getAgent("a1")!.asyncTaskCount, 0);
+  assert.deepEqual(controls.map((control) => [control.action, control.shellId]).sort(), [["stop", 8001], ["stop", 8002]]);
+  assert.equal(quiet().length, 3);
+  for (const message of quiet()) assert.match(message.content, /^\[Background command \d+ was stopped by the user after /);
+  await sleep(300);
+  assert.equal(store.getAgent("a1")!.isRunning, false, "a stop wakes no one");
+  assert.equal(replies().length, 0);
+  assert.deepEqual(
+    tasks.ended("a1").map((task) => task.stoppedBy),
+    ["user", "user", "user"],
+  );
+
+  // One the box can't reach is reported and goes on running, not taken for stopped.
+  tasks.noteShell("local", shell(8003, "running"), "TESTPC");
+  tasks.noteShell("local", shell(8004, "running"), "TESTPC");
+  offline.add(8004);
+  const partial = await tasks.cancelAll("a1");
+  assert.deepEqual(partial.stopped, ["local:8003"]);
+  assert.deepEqual(partial.failed.map((failure) => failure.id), ["local:8004"]);
+  assert.match(partial.failed[0].error, /isn’t connected/);
+  assert.deepEqual(tasks.info("a1").map((task) => task.id), ["local:8004"]);
+  assert.equal(tasks.record("local:8004")?.stoppedBy ?? null, null);
+  // When it ends on its own, the agent hears that it finished, and is woken.
+  tasks.noteShell("local", shell(8004, "succeeded"), "TESTPC");
+  assert.match(quiet().at(-1)!.content, /^\[Background command 8004 finished: exit code 0/);
+  await until(() => !store.getAgent("a1")!.isRunning && replies().length === 1);
+  assert.deepEqual(await tasks.cancelAll("a1"), { stopped: [], failed: [] });
+});
+
 /** A cloud computer whose background commands are files in memory. */
 class FakeCloud {
   logs = new Map<string, string>();
@@ -441,6 +546,11 @@ test("async tasks on the cloud computer: started, awaited for a line, stopped, a
   assert.match(stopped.output, /^Background command \d+ was stopped after/);
   assert.equal(tasks.record(`cloud:${id}`)?.status, "stopped");
   assert.equal(quiet().length, 0, "the agent stopped it itself");
+  // Ended, it is listed; its log stays on the cloud computer, so there's none to open here.
+  assert.deepEqual(
+    tasks.ended("a1").map((task) => [task.id, task.computer, task.computerLabel, task.status, task.stoppedBy, task.logExists]),
+    [[`cloud:${id}`, "cloud", "Cloud computer", "stopped", "agent", false]],
+  );
 
   // One that ends on its own is noticed by the box's checks, and the agent is told.
   const next = await CLOUD_TOOLS.run_shell.run({ command: "pytest", background: true }, context);
@@ -598,6 +708,15 @@ test("box gateway: a PC's background commands survive its connection dropping, a
   assert.deepEqual(await api("readAsyncTasks", { id }), []);
   await until(async () => (await entries()).some((entry) => entry.kind === "message" && entry.suppressed != null && /^\[Background command 6000 was stopped by the user/.test(entry.content)));
   assert.equal((await call("/api/cancelAsyncTask", { id, taskId: "local:1" })).status, 404);
+  // Both are listed as ended, newest first; Stop all has nothing left to stop.
+  assert.deepEqual(
+    (await api<EndedAsyncTask[]>("getEndedAsyncTasks", { id })).map((ended) => [ended.id, ended.status, ended.stoppedBy ?? null]),
+    [
+      ["local:6000", "stopped", "user"],
+      ["local:5150", "succeeded", null],
+    ],
+  );
+  assert.deepEqual(await api("cancelAllAsyncTasks", { id }), { stopped: [], failed: [] });
   await until(async () => (await api<AgentSummary[]>("rosterAgents", {})).find((row) => row.id === id)?.isRunning === false);
   second.drop();
 });

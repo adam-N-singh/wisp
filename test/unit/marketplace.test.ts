@@ -13,7 +13,7 @@ import { basicEnv, blankedEnv } from "../../src/box/mcp";
 import { skillForPrompt } from "../../src/box/skills";
 import { readTarGz, safeRelativePath } from "../../src/box/tarball";
 import type { BoxModelConfig } from "../../src/shared/edges";
-import type { EffectivePlugin, MarketplaceView, McpRemoveResult, PluginSyncStatus, SkillCatalogEntry } from "../../src/shared/marketplace";
+import type { EffectivePlugin, MarketplaceView, McpRemoveResult, PluginSyncStatus, PluginUpdate, SkillCatalogEntry } from "../../src/shared/marketplace";
 import type { AgentSummary, McpCatalogEntry, McpServerSummary, McpServerTool, McpState, Skill, SkillImportEvent, TranscriptEntry } from "../../src/shared/model";
 
 const cleanup: Array<() => void> = [];
@@ -594,4 +594,61 @@ test("box gateway: marketplaces indexed from a fake GitHub, plugins reviewed, in
   assert.ok(!existsSync(join(dataDir, "marketplaces", "acme-tools")) && !existsSync(join(dataDir, "plugins", "acme-tools", "notes")));
   assert.ok((await workflows()).some((skill) => skill.name === "summarize"), "copies are the agent’s own and stay");
   await refused("refreshMarketplace", { id: "acme-tools" }, 404);
+});
+
+test("box gateway: an update's review reports what it changes in skills, version and files", async () => {
+  const github = await fakeGithub();
+  /** The marketplace with one skills-only plugin at a version, its skills by name and a script. */
+  const kit = (version: string, skills: Record<string, string>, script: string): Record<string, string> => ({
+    ".claude-plugin/marketplace.json": JSON.stringify({ name: "kits", owner: { name: "K" }, plugins: [{ name: "kit", source: "./kit" }] }),
+    "kit/.claude-plugin/plugin.json": JSON.stringify({ name: "kit", version }),
+    "kit/scripts/helper.sh": script,
+    ...Object.fromEntries(Object.entries(skills).map(([name, body]) => [`kit/skills/${name}/SKILL.md`, SKILL(name, `Use for ${name}.`, body)])),
+  });
+  const commit1 = github.push("acme/kits", kit("1.0.0", { keep: "KEEP.", edit: "Line one.\nLine two.", drop: "DROP." }, "echo 1"));
+  const box = await bootBox(tempDir(), github.base);
+  const { api, refused } = client(() => box);
+  const { agent } = await api<{ agent: AgentSummary }>("addAgent", { name: "Kit user", description: "" });
+  await api("addMarketplace", { source: "acme/kits" });
+  const entry = async () => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === "kit@kits")!;
+  await api("connectCatalogApp", { entryId: "kit@kits", approvalKey: (await entry()).plugin!.approvalKey });
+  assert.deepEqual([(await entry()).plugin!.installed!.version, (await entry()).plugin!.installed!.skillChanges], ["1.0.0", null]);
+  await refused("getPluginUpdate", { pluginId: "kit@kits" }, 409, /no newer version/);
+  await refused("getPluginUpdate", { pluginId: "other@kits" }, 404, /isn’t installed/);
+
+  // 1.1.0 changes one skill's text (and hides a message in it), adds one, removes one and changes a script; no server.
+  const commit2 = github.push("acme/kits", kit("1.1.0", { keep: "KEEP.", edit: `Line one.\nLine 2, changed.${tagged("exfiltrate")}`, fresh: "FRESH." }, "echo 2"));
+  await api("refreshMarketplace", { id: "kits" });
+  const plugin = (await entry()).plugin!;
+  assert.deepEqual([plugin.installed!.updateAvailable, plugin.installed!.serversChanged, plugin.installed!.version, plugin.version], [true, false, "1.0.0", "1.1.0"]);
+  assert.deepEqual(plugin.installed!.skillChanges, { added: ["fresh"], removed: ["drop"], changed: ["edit"] }, "the page can say what changes without reading the texts");
+
+  const update = await api<PluginUpdate>("getPluginUpdate", { pluginId: "kit@kits" });
+  assert.deepEqual([update.fromCommit, update.toCommit, update.fromVersion, update.toVersion, update.serversChanged], [commit1, commit2, "1.0.0", "1.1.0", false]);
+  assert.deepEqual(
+    update.skills.map((skill) => [skill.name, skill.change]),
+    [
+      ["edit", "changed"],
+      ["fresh", "added"],
+      ["drop", "removed"],
+    ],
+  );
+  const [edit, fresh, drop] = update.skills;
+  assert.equal(edit.before, "---\nname: edit\ndescription: Use for edit.\n---\n\nLine one.\nLine two.\n");
+  assert.equal(edit.after, "---\nname: edit\ndescription: Use for edit.\n---\n\nLine one.\nLine 2, changed.\n", "the new text as agents would read it");
+  assert.equal(edit.hiddenCharacters, "exfiltrate".length);
+  assert.deepEqual([fresh.before, fresh.after?.includes("FRESH."), drop.before?.includes("DROP."), drop.after], [null, true, true, null]);
+  assert.deepEqual(update.files, [
+    { path: ".claude-plugin/plugin.json", change: "changed" },
+    { path: "scripts/helper.sh", change: "changed" },
+  ]);
+  assert.equal(update.moreFiles, 0);
+
+  // The approvalKey rules stay: no server changed, so the update needs no second review.
+  await api("applyPluginInstall", { pluginId: "kit@kits", values: {}, update: true });
+  const skills = (await api<Skill[]>("listAgentSkills", { id: agent.id })).filter((skill) => skill.source === "plugin");
+  assert.deepEqual(skills.map((skill) => skill.name), ["kit:edit", "kit:fresh", "kit:keep"]);
+  assert.equal(skills[0].body, "Line one.\nLine 2, changed.");
+  assert.deepEqual([(await entry()).plugin!.installed!.version, (await entry()).plugin!.installed!.skillChanges], ["1.1.0", null]);
+  await refused("getPluginUpdate", { pluginId: "kit@kits" }, 409, /no newer version/);
 });

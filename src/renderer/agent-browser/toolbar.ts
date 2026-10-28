@@ -1,7 +1,8 @@
 // The agent browser's toolbar: who drives (the agent, or the user while the agent waits), Take
 // over / Hand back, the address and the tabs. Navigation and tabs work only while the user has
 // the browser; while the agent asks for something (browser_wait_for_user) it says what, and points
-// to the chat, where the user answers.
+// to the chat, where the user answers. A page's alert or confirm, while the user has the browser,
+// shows in a row below the tabs; its text is the page's, shown as text only.
 import type { EdgeClient } from "../../shared/rpc/edge";
 import type { agentBrowserToolbarEdge, AgentBrowserToolbarView } from "../../shared/edges";
 import "./toolbar.css";
@@ -22,6 +23,11 @@ const status = $<HTMLSpanElement>("status");
 const chat = $<HTMLButtonElement>("chat");
 const control = $<HTMLButtonElement>("control");
 const tabs = $<HTMLDivElement>("tabs");
+const dialog = $<HTMLDivElement>("dialog");
+const dialogFrom = $<HTMLSpanElement>("dialog-from");
+const dialogText = $<HTMLSpanElement>("dialog-text");
+const dialogOk = $<HTMLButtonElement>("dialog-ok");
+const dialogCancel = $<HTMLButtonElement>("dialog-cancel");
 
 let view: AgentBrowserToolbarView | null = null;
 let editing = false;
@@ -41,6 +47,16 @@ function render(next: AgentBrowserToolbarView): void {
   status.textContent = next.request != null ? `${next.agentName} asks: ${next.request}` : user ? `You're in control. ${next.agentName} waits.` : `${next.agentName} is browsing${next.loading ? "…" : ""}`;
   chat.hidden = next.request == null;
   control.textContent = user ? `Hand back to ${next.agentName}` : "Take over";
+
+  const wasOpen = !dialog.hidden;
+  dialog.hidden = next.dialog == null;
+  if (next.dialog != null) {
+    dialogFrom.textContent = next.dialog.kind === "alert" ? "The page says:" : "The page asks:";
+    dialogText.textContent = next.dialog.message;
+    dialogText.title = next.dialog.message;
+    dialogCancel.hidden = next.dialog.kind === "alert";
+    if (!wasOpen) dialogOk.focus();
+  }
 
   tabs.replaceChildren(
     ...next.tabs.map((tab) => {
@@ -83,6 +99,14 @@ back.addEventListener("click", () => void toolbar.historyBack());
 forward.addEventListener("click", () => void toolbar.goForward());
 reload.addEventListener("click", () => void toolbar.reload());
 chat.addEventListener("click", () => void toolbar.showChat());
+const answerDialog = (accept: boolean) => {
+  if (view?.dialog != null) void toolbar.answerDialog({ tabId: view.dialog.tabId, accept });
+};
+dialogOk.addEventListener("click", () => answerDialog(true));
+dialogCancel.addEventListener("click", () => answerDialog(false));
+dialog.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") answerDialog(view?.dialog?.kind === "alert");
+});
 control.addEventListener("click", () => void (view?.control === "user" ? toolbar.returnControl() : toolbar.takeOver()));
 address.addEventListener("focus", () => {
   editing = !address.readOnly;
