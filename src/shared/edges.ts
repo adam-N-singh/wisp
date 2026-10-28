@@ -7,7 +7,7 @@ import { type BotMarketplace, botTemplateInclude, botTemplateSchema, type BotTem
 import { defineEdge, event, method } from "./rpc/edge";
 import type { PermissionAsk } from "./gateway-protocol";
 import { DOCUMENT_ID_PATTERN, type DocumentEditRight, type LibraryPage, MAX_PAGE_SOURCE, type PageChangedEvent, type PageDocument, type PageRevisionInfo } from "./pages";
-import type { EffectivePlugin, MarketplaceView, McpRemoveResult, PluginSkillInfo, PluginSyncStatus, SkillCatalogEntry } from "./marketplace";
+import type { EffectivePlugin, MarketplaceView, McpRemoveResult, PluginSkillInfo, PluginSyncStatus, PluginUpdate, SkillCatalogEntry } from "./marketplace";
 import {
   AVATAR_COLORS,
   AVATAR_SHAPES,
@@ -19,6 +19,8 @@ import {
   type AsyncTaskInfo,
   type AsyncTaskOutput,
   type AsyncTasksEvent,
+  type EndedAsyncTask,
+  type StopAllAsyncTasksResult,
   type Automation,
   type ClaudeCodeStatus,
   type CloudComputerStatus,
@@ -460,6 +462,10 @@ export const gatewayEdge = defineEdge("gateway", {
     cancelAsyncTask: method<null>().args(z.object({ id: agentId, taskId: asyncTaskId })),
     /** The end of one's output so far. */
     readAsyncTaskOutput: method<AsyncTaskOutput>().args(z.object({ id: agentId, taskId: asyncTaskId, tailChars: z.number().int().min(100).max(200_000).optional() })),
+    /** Its tasks that ended in the last week, newest first, beside `readAsyncTasks`' running ones. */
+    getEndedAsyncTasks: method<EndedAsyncTask[]>().args(z.object({ id: agentId, limit: z.number().int().min(1).max(50).optional() })),
+    /** Stops every one of its running tasks, each told to the agent as one Stop is (without waking it). */
+    cancelAllAsyncTasks: method<StopAllAsyncTasksResult>().args(z.object({ id: agentId })),
     listAgentAutomations: method<Automation[]>().args(z.object({ id: agentId })),
     addAgentAutomation: method<Automation[]>().args(z.object({ id: agentId, spec: automationSpec })),
     editAgentAutomation: method<Automation[]>().args(z.object({ id: agentId, automationId: z.string().min(1), spec: automationSpec })),
@@ -570,6 +576,12 @@ export const gatewayEdge = defineEdge("gateway", {
      * refresh read; when its servers changed, it needs the `approvalKey` of what the user reviewed.
      */
     applyPluginInstall: method<McpState>().args(z.object({ pluginId, values: optionValues, update: z.boolean().optional(), approvalKey: approvalKey.optional() })),
+    /**
+     * What updating an installed plugin to the last refresh's files changes, for its review:
+     * the version, each skill added, removed or changed with its text before and after (as agents
+     * read it), whether its servers changed, and its other files.
+     */
+    getPluginUpdate: method<PluginUpdate>().args(z.object({ pluginId })),
     dropPlugin: method<McpRemoveResult>().args(z.object({ pluginId })),
     /** A plugin's skill as one of the agent's own, to change it. */
     copyPluginSkill: method<SkillImportEvent>().args(z.object({ id: agentId, skillId })),
@@ -866,6 +878,8 @@ export interface AgentBrowserToolbarView extends AgentBrowserState {
   canGoBack: boolean;
   canGoForward: boolean;
   loading: boolean;
+  /** A page's alert or confirm the user answers in the toolbar (while they have the browser). */
+  dialog: { tabId: number; kind: "alert" | "confirm" | "prompt"; message: string } | null;
 }
 
 const tabId = z.number().int().min(1);
@@ -875,6 +889,8 @@ export const agentBrowserToolbarEdge = defineEdge("agent-browser-toolbar", {
     /** The calling toolbar's own window. */
     read: method<AgentBrowserToolbarView>().noArgs,
     takeOver: method<void>().noArgs,
+    /** The user's answer to the page's dialog the toolbar shows: OK (accept) or Cancel. */
+    answerDialog: method<void>().args(z.object({ tabId, accept: z.boolean() })),
     returnControl: method<void>().noArgs,
     /** Opens the agent's conversation in the main window. */
     showChat: method<void>().noArgs,

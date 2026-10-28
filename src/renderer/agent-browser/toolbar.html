@@ -16,6 +16,12 @@
       <button type="button" id="control" class="primary"></button>
     </div>
     <div class="tabs" role="tablist" aria-label="Tabs" id="tabs"></div>
+    <div class="dialog" id="dialog" role="alertdialog" aria-labelledby="dialog-text" hidden>
+      <span class="dialog__from" id="dialog-from"></span>
+      <span class="dialog__text" id="dialog-text"></span>
+      <button type="button" id="dialog-cancel" class="secondary">Cancel</button>
+      <button type="button" id="dialog-ok" class="primary">OK</button>
+    </div>
     <script type="module" src="./toolbar.ts"></script>
   </body>
 </html>

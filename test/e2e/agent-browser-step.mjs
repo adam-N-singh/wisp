@@ -1,7 +1,8 @@
 // The agent browser step of the end-to-end test (run.mjs): on the offline mock model, an agent
 // opens a local test page in its agent browser, reads it, types (after an approval, remembered for
 // the site), clicks, picks a dropdown option, is refused a covered button, a location prompt and a
-// file:// page, downloads a file into its workspace and gets a page's new window as a tab; its call
+// file:// page, downloads a file into its workspace and gets a page's new window as a tab; a
+// page's confirm is dismissed on the agent's turn and shows in the toolbar on the user's; its call
 // waits while the user has taken over and runs when they hand back; a purchase-like click asks
 // and is denied; and browser_wait_for_user asks in the chat and goes on with the answer. Only
 // pages this test serves on this computer are opened.
@@ -20,6 +21,8 @@ const PAGE = `<!doctype html>
   <a href="/notes.txt" download>Download the notes</a>
   <button type="button" id="popup">Open a window</button>
   <button type="button" id="locate">Where am I?</button>
+  <button type="button" id="ask">Keep the draft?</button>
+  <p id="kept" role="status"></p>
   <p id="where" role="status"></p>
   <div style="position:relative;display:inline-block"><button type="button">Hidden behind</button><div style="position:absolute;inset:0;background:rgba(0,0,0,.05)"></div></div>
   <form action="/order" method="post"><button>Buy now</button></form>
@@ -28,6 +31,7 @@ const PAGE = `<!doctype html>
     const $ = (id) => document.getElementById(id);
     $("greet").addEventListener("click", () => ($("out").textContent = "Hello, " + $("name").value + "!"));
     $("popup").addEventListener("click", () => window.open("/second", "_blank"));
+    $("ask").addEventListener("click", () => ($("kept").textContent = "Kept: " + confirm("Keep the draft?")));
     $("locate").addEventListener("click", () =>
       navigator.geolocation.getCurrentPosition(() => ($("where").textContent = "Located"), (error) => ($("where").textContent = "Location refused (" + error.code + ")")),
     );
@@ -53,31 +57,69 @@ export async function startTestSite() {
 }
 
 /**
+ * The latest tool output in the conversation that contains `mustContain`, read once the mock has
+ * finished streaming it (its reply is the output, word by word).
+ */
+export async function toolOutput(page, conversation, mustContain) {
+  const block = conversation.locator("pre").filter({ hasText: mustContain }).last();
+  await block.waitFor({ timeout: 30_000 });
+  let text = "";
+  for (let previous = null; text !== previous; ) {
+    previous = text;
+    await page.waitForTimeout(400);
+    text = (await block.textContent()) ?? "";
+  }
+  return text;
+}
+
+/**
  * Runs the step; `send` posts a message to the agent, `conversation` is its transcript region,
- * `app` the Electron app (the user's clicks on the agent browser's toolbar go through it).
+ * `app` the Electron app (the user's clicks on the agent browser's toolbar go through it). `screenshot(name, {png})`
+ * saves a capture of the app's window, or the given image.
  */
 export async function driveAgentBrowser({ app, page, send, conversation, site, screenshot }) {
-  // The mock streams its reply (the tool's output) word by word: read it once it stops growing.
-  const lastOutput = async (mustContain) => {
-    const block = conversation().locator("pre").filter({ hasText: mustContain }).last();
-    await block.waitFor({ timeout: 30_000 });
-    let text = "";
-    for (let previous = null; text !== previous; ) {
-      previous = text;
-      await page.waitForTimeout(400);
-      text = (await block.textContent()) ?? "";
-    }
-    return text;
-  };
+  // Playwright, attached to every page of the app, dismisses a page's dialogs itself unless the test
+  // listens for them; the agent browser answers its own, so the test only listens.
+  const leaveDialogs = (anyPage) => anyPage.on("dialog", () => undefined);
+  app.context().pages().forEach(leaveDialogs);
+  app.context().on("page", leaveDialogs);
+  const lastOutput = (mustContain) => toolOutput(page, conversation(), mustContain);
+  // Runs a script in the agent browser's toolbar (the user's clicks there) or in its page at
+  // `pageUrl` (the user's clicks on the page; not waited for, as a dialog holds the page up).
+  const inBrowser = (where, script) =>
+    app.evaluate(
+      async ({ webContents }, { where, script }) => {
+        const all = webContents.getAllWebContents();
+        const target = where === "toolbar" ? all.find((contents) => contents.getURL().endsWith("/agent-browser/toolbar.html")) : all.find((contents) => contents.getURL() === where);
+        if (target == null) throw new Error(`no agent browser contents at ${where}`);
+        if (where !== "toolbar") return void target.executeJavaScript(`setTimeout(() => { ${script} }, 0)`, true);
+        const result = await target.executeJavaScript(script, true);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return result;
+      },
+      { where, script },
+    );
+  // The agent browser's own window as the user sees it (null if the screen can't be captured).
+  const agentWindowPng = () =>
+    app
+      .evaluate(async ({ desktopCapturer }) => {
+        const sources = await desktopCapturer.getSources({ types: ["window"], thumbnailSize: { width: 1200, height: 860 } });
+        return sources.find((source) => source.name.includes("Agent browser"))?.thumbnail.toPNG().toString("base64") ?? null;
+      })
+      .then((png) => (png != null ? Buffer.from(png, "base64") : null))
+      .catch(() => null);
+  // The page's dialog the toolbar shows ("The page asks: …"), or null.
+  const toolbarDialog = () =>
+    inBrowser(
+      "toolbar",
+      '(() => { const $ = (id) => document.getElementById(id); return $("dialog").hidden ? null : `${$("dialog-from").textContent} ${$("dialog-text").textContent}${$("dialog-cancel").hidden ? "" : " [Cancel]"} [OK]`; })()',
+    );
+  const toolbarText = (id) => inBrowser("toolbar", `document.getElementById("${id}").hidden ? null : document.getElementById("${id}").textContent`);
   // The user's click on the toolbar's Take over / Hand back button; returns what the button says next.
-  const clickControl = () =>
-    app.evaluate(async ({ webContents }) => {
-      const toolbar = webContents.getAllWebContents().find((contents) => contents.getURL().endsWith("/agent-browser/toolbar.html"));
-      if (toolbar == null) throw new Error("no agent browser toolbar");
-      await toolbar.executeJavaScript('document.getElementById("control").click()');
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      return toolbar.executeJavaScript('document.getElementById("control").textContent');
-    });
+  const clickControl = async () => {
+    await inBrowser("toolbar", 'document.getElementById("control").click()');
+    return toolbarText("control");
+  };
   const refOf = (text, pattern) => {
     const match = new RegExp(`${pattern} \\[ref=(e\\d+)\\]`).exec(text);
     if (match == null) throw new Error(`no ref for ${pattern} in:\n${text}`);
@@ -145,8 +187,29 @@ export async function driveAgentBrowser({ app, page, send, conversation, site, s
   await send('/tool browser_tabs {"action":"close","tab":2}');
   await lastOutput("Closed tab 2.");
 
+  // On the agent's turn a page's confirm is dismissed at once and the agent is told.
+  const ask = refOf(opened, 'button "Keep the draft\\?"');
+  await send(`/tool browser_click ${JSON.stringify({ ref: ask })}`);
+  const asked = await lastOutput(`Clicked ${ask}`);
+  if (!asked.includes("The page asked (a confirm dialog): “Keep the draft?”. It was dismissed")) throw new Error(`the agent wasn't told about the dialog:\n${asked}`);
+  await send("/tool browser_snapshot {}");
+  await lastOutput("Kept: false");
+
   // While the user has the browser, the agent's call waits; handing back lets it run.
   if ((await clickControl()) !== "Hand back to Wisp") throw new Error("Take over didn't give the user the browser");
+  // The user's own click on the page: its confirm shows in the toolbar, and their OK reaches the page.
+  await inBrowser(site.url, 'document.getElementById("ask").click()');
+  let shown = null;
+  for (let tries = 0; shown == null && tries < 20; tries++) shown = await toolbarDialog();
+  if (shown !== "The page asks: Keep the draft? [Cancel] [OK]") throw new Error(`the toolbar didn't show the page's dialog: ${shown}`);
+  await screenshot("11c-agent-browser-dialog.png", { png: await agentWindowPng() });
+  await inBrowser("toolbar", 'document.getElementById("dialog-ok").click()');
+  const readKept = () =>
+    app.evaluate(({ webContents }, url) => webContents.getAllWebContents().find((contents) => contents.getURL() === url)?.executeJavaScript('document.getElementById("kept").textContent'), site.url);
+  let open = shown;
+  for (let tries = 0; open != null && tries < 10; tries++) open = await toolbarDialog();
+  const kept = await Promise.race([readKept(), new Promise((resolve) => setTimeout(() => resolve("(the page is still held up)"), 3_000))]);
+  if (open != null || kept !== "Kept: true") throw new Error(`OK in the toolbar: the dialog ${open != null ? "stayed" : "went"}, the page has ${kept}`);
   const before = await conversation().locator("pre").count();
   await send("/tool browser_snapshot {}");
   await page.waitForTimeout(2500);

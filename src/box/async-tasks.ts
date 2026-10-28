@@ -18,6 +18,10 @@
 // is woken unless the task was stopped. An await_command waiting on the task reports its end
 // instead. The agent's roster row counts its running tasks (`asyncTaskCount`), so it shows as
 // working meanwhile.
+//
+// Beside the running list, the box lists the tasks that ended in the last week
+// (`getEndedAsyncTasks`, the panel's Ended section) and stops all of an agent's at once
+// (`cancelAllAsyncTasks`), each told to the agent as one Stop is.
 import {
   type AwaitOutcome,
   type BackgroundShellStatus,
@@ -34,7 +38,7 @@ import {
   type ShellState,
 } from "../shared/background-shell";
 import type { ToolResult } from "../shared/gateway-protocol";
-import type { AgentSummary, AsyncTaskInfo, AsyncTaskOutput, CloudComputerStatus } from "../shared/model";
+import type { AgentSummary, AsyncTaskInfo, AsyncTaskOutput, CloudComputerStatus, EndedAsyncTask, StopAllAsyncTasksResult } from "../shared/model";
 import { CLOUD_PID_PLACEHOLDER, CLOUD_TERMINALS, type CloudComputer } from "./cloud-computer";
 import type { CloudShells } from "./cloud-tools";
 import type { BoxStore } from "./store";
@@ -70,6 +74,8 @@ export interface AsyncTaskRecord {
   stoppedBy?: "agent" | "user" | null;
   /** The agent knows how it ended: it waited for it, stopped it, or was told. */
   notified: boolean;
+  /** The PC's daemon no longer keeps its log (it dropped the command from its list). */
+  logGone?: boolean;
 }
 
 export class AsyncTaskError extends Error {
@@ -193,6 +199,33 @@ export class AsyncTasks implements CloudShells {
     });
   }
 
+  /** The agent's tasks that ended (in the last week, as the box keeps them), newest first. */
+  ended(agentId: string, limit = 10): EndedAsyncTask[] {
+    return [...this.records.values()]
+      .filter((record) => record.agentId === agentId && record.status !== "running")
+      .sort((a, b) => (b.endedAtMs ?? 0) - (a.endedAtMs ?? 0))
+      .slice(0, limit)
+      .map((record) => ({
+        id: record.key,
+        kind: record.kind,
+        label: commandTitle(record.command),
+        labelKind: "shell_command",
+        labelParams: { id: String(record.shellId) },
+        command: record.command,
+        computer: record.computer,
+        computerLabel: record.computer === "cloud" ? "Cloud computer" : (record.machine ?? "This PC"),
+        outputPath: record.outputPath,
+        status: record.status as EndedAsyncTask["status"],
+        exitCode: record.exitCode,
+        startedAtMs: record.startedAtMs,
+        endedAtMs: record.endedAtMs ?? record.startedAtMs,
+        ...(record.stoppedBy != null ? { stoppedBy: record.stoppedBy } : {}),
+        ...(record.detail != null ? { detail: record.detail } : {}),
+        ...(record.tail != null && record.tail.length > 0 ? { tail: record.tail } : {}),
+        logExists: record.computer === "local" && record.logGone !== true,
+      }));
+  }
+
   record(key: string): AsyncTaskRecord | undefined {
     return this.records.get(key);
   }
@@ -252,7 +285,8 @@ export class AsyncTasks implements CloudShells {
 
   /**
    * A daemon registered with its list. Each command in it counts as news; a running command of
-   * that PC's that isn't in it is lost (the daemon's own list was cleared).
+   * that PC's that isn't in it is lost (the daemon's own list was cleared). The daemon drops an
+   * ended command with its log, so one missing from the list has no log to open any more.
    */
   reconcileLocal(machine: string | null, list: BackgroundShellStatus[]): void {
     const listed = new Set(list.map((status) => `local:${status.id}`));
@@ -261,11 +295,15 @@ export class AsyncTasks implements CloudShells {
       if (!this.records.has(`local:${status.id}`) && status.state !== "running" && Date.now() - (status.endedAt ?? 0) > LATE_NEWS_MS) continue;
       this.noteShell("local", status, machine);
     }
-    for (const record of this.runningRecords()) {
-      if (record.computer !== "local" || listed.has(record.key)) continue;
+    let logsGone = false;
+    for (const record of [...this.records.values()]) {
+      if (record.computer !== "local" || listed.has(record.key) || record.logGone === true) continue;
       if (machine != null && record.machine != null && record.machine !== machine) continue; // another PC's
-      this.end(record, record.stoppedBy != null ? "stopped" : "lost", null, Date.now(), "The PC's local tools have no record of it any more.", null, false);
+      record.logGone = true;
+      logsGone = true;
+      if (record.status === "running") this.end(record, record.stoppedBy != null ? "stopped" : "lost", null, Date.now(), "The PC's local tools have no record of it any more.", null, false);
     }
+    if (logsGone) this.save();
   }
 
   /** The cloud computer changed: deleted, its commands are lost; running, they're checked on. */
@@ -310,11 +348,37 @@ export class AsyncTasks implements CloudShells {
       await this.stopCloud(agentId, record.shellId, "user");
       return;
     }
+    const before = record.stoppedBy ?? null;
     record.stoppedBy ??= "user";
     this.save();
-    const result = await this.deps.controlLocal({ agentId, shellId: record.shellId, action: "stop" });
-    if (result.kind !== "ok") throw new AsyncTaskError("failed", "message" in result ? result.message : "The command couldn't be stopped.");
-    if (result.task != null) this.noteShell("local", result.task, record.machine);
+    try {
+      const result = await this.deps.controlLocal({ agentId, shellId: record.shellId, action: "stop" });
+      if (result.kind !== "ok") throw new AsyncTaskError("failed", "message" in result ? result.message : "The command couldn't be stopped.");
+      if (result.task != null) this.noteShell("local", result.task, record.machine);
+    } catch (error) {
+      this.unstop(record, before);
+      throw error;
+    }
+  }
+
+  /** Stops each of the agent's running tasks as `cancel` does; those that can't be reached are reported, not thrown. */
+  async cancelAll(agentId: string): Promise<StopAllAsyncTasksResult> {
+    const running = this.runningRecords(agentId);
+    const outcomes = await Promise.allSettled(running.map((record) => this.cancel(agentId, record.key)));
+    const result: StopAllAsyncTasksResult = { stopped: [], failed: [] };
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === "fulfilled") result.stopped.push(running[index].key);
+      else result.failed.push({ id: running[index].key, error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason) });
+    });
+    return result;
+  }
+
+  /** A stop that never reached the command: it may still end on its own, and should be told as that. */
+  private unstop(record: AsyncTaskRecord, before: AsyncTaskRecord["stoppedBy"], notified = record.notified): void {
+    if (record.status !== "running") return;
+    record.stoppedBy = before;
+    record.notified = notified;
+    this.save();
   }
 
   /** The end of the task's output so far. */
@@ -396,11 +460,18 @@ export class AsyncTasks implements CloudShells {
   async stopCloud(agentId: string, shellId: number, by: "agent" | "user"): Promise<BackgroundShellStatus> {
     const record = this.ownShell(agentId, "cloud", shellId);
     if (record.status !== "running") return this.statusOf(record);
+    const before = record.stoppedBy ?? null;
+    const notified = record.notified;
     record.stoppedBy ??= by;
     if (by === "agent") record.notified = true;
     this.save();
     const cloud = this.requireCloud();
-    if (record.pid != null) await cloud.stopBackground(record.pid);
+    try {
+      if (record.pid != null) await cloud.stopBackground(record.pid);
+    } catch (error) {
+      this.unstop(record, before, notified);
+      throw error;
+    }
     const view = await this.cloudView(record, 4_000).catch(() => null);
     const now = Date.now();
     // Its wrapper writes the footer when it gets to; one stopped outright gets one here.

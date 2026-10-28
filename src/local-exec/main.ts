@@ -152,14 +152,18 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
       const recipient = plan != null ? grantRecipient(permissionId, plan.scope, plan.risk) : null;
       // What the call would act on now; an approval for something else doesn't carry over (a page that changed).
       const subject = plan != null ? `${plan.risk}\n${plan.scope}\n${plan.target}` : "";
-      const changed = request.approval?.requestId != null && approvals.changed(request.approval.requestId, subject);
-      const approved = request.approval != null && (await approvals.confirm(request, subject));
+      // A resend with the user's answer to the call's question carries the approval it ran on: once, for
+      // the same call on the same subject (approvals.ts). Otherwise it has none, and the policy decides again.
+      const resumed = request.answer != null && approvals.resume(request, subject);
+      const approval = request.answer == null || resumed ? request.approval : null;
+      const changed = !resumed && approval?.requestId != null && approvals.changed(approval.requestId, subject);
+      const approved = resumed || (approval != null && (await approvals.confirm({ ...request, approval }, subject)));
 
       if (plan == null || verdict == null) {
         result = await run();
-      } else if (request.approval != null && !approved) {
+      } else if (approval != null && !approved) {
         result = { kind: "error", message: changed ? "What this would act on changed after you were asked (the page moved on), so nothing was done." : "That approval wasn't given in the app on this computer." };
-      } else if (request.approval?.resolution === "never") {
+      } else if (approval?.resolution === "never") {
         if (recipient != null) {
           await host.rememberGrant({ toolId: permissionId, scope: `deny:${plan.scope}` });
           grants = [...grants, { toolId: permissionId, scope: `deny:${plan.scope}` }];
@@ -167,7 +171,7 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
         result = { kind: "blocked", message: "Denied; you won't be asked again for this." };
       } else if (verdict.decision === "block") {
         result = { kind: "blocked", message: `This action is blocked by your settings for “${permissionId}”.` };
-      } else if (verdict.decision === "ask" && request.approval == null) {
+      } else if (verdict.decision === "ask" && approval == null) {
         const ask = {
           action: plan.action,
           target: plan.target,
@@ -184,11 +188,12 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
         approvals.issue(approvalId, request, subject);
         result = { kind: "needs-approval", ask, approvalId };
       } else {
-        if (request.approval?.resolution === "always" && recipient != null) {
+        if (approval?.resolution === "always" && recipient != null && !resumed) {
           await host.rememberGrant({ toolId: permissionId, scope: plan.scope });
           grants = [...grants, { toolId: permissionId, scope: plan.scope }];
         }
         result = await run();
+        if (result.kind === "ask-user" && approved && approval?.requestId != null) approvals.carryOver(approval.requestId, request, subject);
       }
     } catch (error) {
       result = { kind: "error", message: controller.signal.aborted ? "interrupted" : error instanceof Error ? error.message : String(error) };

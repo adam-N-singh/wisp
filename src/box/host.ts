@@ -719,6 +719,14 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       requireAgent(id);
       return taskCall(() => asyncTasks.readOutput(id, taskId, tailChars ?? 4_000));
     },
+    getEndedAsyncTasks: ({ id, limit }) => {
+      requireAgent(id);
+      return asyncTasks.ended(id, limit ?? 10);
+    },
+    cancelAllAsyncTasks: ({ id }) => {
+      requireAgent(id);
+      return asyncTasks.cancelAll(id);
+    },
     listAgentAutomations: ({ id }) => store.listAutomations(id),
     addAgentAutomation: ({ id, spec }) => {
       requireAgent(id);
@@ -956,6 +964,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         plugins.update(pluginId, values, update === true, approvalKey);
         return mcpState();
       }),
+    getPluginUpdate: ({ pluginId }) => pluginCall(() => plugins.pluginUpdate(pluginId)),
     dropPlugin: ({ pluginId }) => ({ removed: plugins.uninstall(pluginId), reason: null, state: mcpState() }),
     dropMcpServer: ({ serverId }) => {
       refusePluginServer(serverId);

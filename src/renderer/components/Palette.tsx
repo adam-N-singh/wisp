@@ -1,13 +1,18 @@
-// Command palette. Ctrl+K ("Jump to") lists agents, actions and messages; Ctrl+Shift+F ("Search
-// agents") lists agents and messages. Messages come from the box's `findAcrossAgents`, across every
-// conversation. Arrows move, Enter or a click picks, Ctrl+1–9 picks that row, Esc closes.
+// Command palette. Ctrl+K ("Jump to") lists agents, the pages agents wrote, actions and messages;
+// Ctrl+Shift+F ("Search agents") lists agents and messages. Pages come from the box's
+// `libraryPages` and messages from its `findAcrossAgents`, across every conversation; what matches
+// is decided in palette-match.ts. Arrows move, Enter or a click picks, Ctrl+1–9 picks that row, Esc
+// closes.
 import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { type AgentSummary, isAgentWorking, type MessageMatch } from "../../shared/model";
+import type { LibraryPage } from "../../shared/pages";
 import { gateway, main } from "../bridge";
+import { agentScore, canHaveAgentBrowser, pageMatches } from "../palette-match";
 import { isModKey, MOD_LABEL, openPalette, shortcutKey, SHORTCUTS } from "../shortcuts";
 import { app, closeDialog, closeSettings, openAsyncTasks, openConnectApps, openDialog, openOutline, openSettings, type PaletteMode, selectAgent, setShowHidden, type SettingsSection } from "../store/app";
 import { openFind } from "../store/find";
 import { openInfoTab, updateLayout } from "../store/layout";
+import { allPages, drafts, loadAllPages, openPage, pageKey } from "../store/pages";
 import { allAgents, roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { Avatar } from "./Avatar";
@@ -29,6 +34,7 @@ interface Action {
 
 type Row =
   | { kind: "agent"; key: string; agent: AgentSummary }
+  | { kind: "page"; key: string; page: LibraryPage; agent: AgentSummary }
   | { kind: "action"; key: string; action: Action }
   | { kind: "message"; key: string; hit: MessageMatch; agent: AgentSummary | undefined };
 
@@ -54,6 +60,9 @@ function paletteActions(agent: AgentSummary | undefined, hiddenCount: number): A
       { id: "find", label: `Find in chat with ${agent.name}`, icon: "search", keywords: "search conversation", shortcut: "findInChat", run: () => (closeSettings(), openFind(agent.id)) },
       { id: "outline", label: `${agent.name}: Show full conversation`, icon: "outline", keywords: "outline thinking tool calls reasoning", run: () => openOutline(agent.id) },
       { id: "background-work", label: `${agent.name}: Async tasks`, icon: "terminal", keywords: "background commands running jobs stop", run: () => openAsyncTasks(agent.id) },
+      ...(canHaveAgentBrowser(agent)
+        ? [{ id: "agent-browser", label: `${agent.name}: Show agent browser`, icon: "globe", keywords: "web browsing window tabs sites sign in", run: () => void main.showAgentBrowser({ agentId: agent.id }).catch(() => undefined) } satisfies Action]
+        : []),
       { id: "skills", label: `${agent.name}: Skills`, icon: "bolt", keywords: "workflows commands", shortcut: "openSkills", run: () => (closeSettings(), openInfoTab("skills")) },
       { id: "automations", label: `${agent.name}: Automations`, icon: "clock", keywords: "schedule cron routines", run: () => (closeSettings(), openInfoTab("automations")) },
       { id: "edit-agent", label: `${agent.name}: Edit agent`, icon: "edit", keywords: "rename instructions model settings", shortcut: "agentSettings", run: () => openDialog({ kind: "edit-agent", agentId: agent.id }) },
@@ -104,15 +113,6 @@ function paletteActions(agent: AgentSummary | undefined, hiddenCount: number): A
   return actions;
 }
 
-/** How well an agent matches: its name's start, a word's start, anywhere in the name, then its role. */
-function agentScore(agent: AgentSummary, needle: string): number {
-  const name = agent.name.toLowerCase();
-  if (name.startsWith(needle)) return 4;
-  if (name.split(/[^\p{L}\p{N}]+/u).some((word) => word.startsWith(needle))) return 3;
-  if (name.includes(needle)) return 2;
-  return `${agent.title ?? ""} ${agent.description}`.toLowerCase().includes(needle) ? 1 : 0;
-}
-
 /** Messages that contain the query, searched a moment after typing stops. */
 function useMessageSearch(query: string): { status: "idle" | "searching" | "ready" | "error"; hits: MessageMatch[] } {
   const [state, setState] = useState<{ status: "idle" | "searching" | "ready" | "error"; hits: MessageMatch[] }>({ status: "idle", hits: [] });
@@ -153,12 +153,18 @@ export function Palette({ mode }: { mode: PaletteMode }) {
   const rosterState = useStore(roster);
   const currentId = useStore(app, (state) => state.agentId);
   const messages = useMessageSearch(query);
+  const pages = useStore(allPages);
+  const unsaved = useStore(drafts);
   const listId = useId();
   const needle = query.trim().toLowerCase();
 
   useEffect(() => {
     dialog.current?.showModal();
   }, []);
+  // Read again each time "Jump to" opens; "page-changed" keeps it current meanwhile.
+  useEffect(() => {
+    if (mode === "jump") void loadAllPages();
+  }, [mode]);
 
   const groups = useMemo(() => {
     const everyone = allAgents(rosterState);
@@ -174,8 +180,10 @@ export function Palette({ mode }: { mode: PaletteMode }) {
         .map((item) => item.agent);
     const words = needle.split(/\s+/).filter((word) => word.length > 0);
     const actions = mode === "jump" ? paletteActions(current, rosterState.hidden.length).filter((action) => words.every((word) => `${action.label} ${action.keywords ?? ""}`.toLowerCase().includes(word))) : [];
+    const found = mode === "jump" ? pageMatches(pages ?? [], { visible: rosterState.agents, hidden: rosterState.hidden }, needle, needle.length === 0 ? 4 : 8) : [];
     const result: Array<{ title: string; rows: Row[]; note?: string }> = [];
     if (agents.length > 0) result.push({ title: "Agents", rows: agents.map((agent) => ({ kind: "agent", key: `agent:${agent.id}`, agent })) });
+    if (found.length > 0) result.push({ title: "Pages", rows: found.map(({ page, agent }) => ({ kind: "page", key: `page:${agent.id}:${page.page.documentId}`, page, agent })) });
     if (actions.length > 0) result.push({ title: "Actions", rows: actions.map((action) => ({ kind: "action", key: `action:${action.id}`, action })) });
     if (messages.status !== "idle") {
       const rows: Row[] = messages.hits.map((hit) => ({ kind: "message", key: `message:${hit.agentId}:${hit.entryId}`, hit, agent: everyone.find((agent) => agent.id === hit.agentId) }));
@@ -183,7 +191,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
       result.push({ title: "Messages", rows, note });
     }
     return result;
-  }, [rosterState, currentId, needle, mode, messages]);
+  }, [rosterState, currentId, needle, mode, messages, pages]);
 
   const rows = useMemo(() => groups.flatMap((group) => group.rows), [groups]);
   const selected = Math.min(active, rows.length - 1);
@@ -202,10 +210,89 @@ export function Palette({ mode }: { mode: PaletteMode }) {
     if (row.kind === "agent") {
       selectAgent(row.agent.id);
       setTimeout(focusComposer, 0);
+    } else if (row.kind === "page") {
+      // Its agent's conversation first: the stage belongs to it.
+      selectAgent(row.agent.id);
+      openPage(row.agent.id, row.page.page.documentId);
     } else if (row.kind === "action") row.action.run();
     else {
       selectAgent(row.hit.agentId);
       openFind(row.hit.agentId, { query: query.trim(), entryId: row.hit.entryId });
+    }
+  };
+
+  /** What a row shows. */
+  const rowContent = (row: Row): ReactNode => {
+    switch (row.kind) {
+      case "agent":
+        return (
+          <>
+            <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} busy={isAgentWorking(row.agent)} />
+            <span className="palette__text">
+              <span className="palette__title">
+                <Highlighted text={row.agent.name} query={needle} />
+              </span>
+              <span className="palette__detail">{statusLine(row.agent).text}</span>
+            </span>
+            {row.agent.isHiddenFromSidebar === true ? <span className="pill">Hidden</span> : null}
+          </>
+        );
+      case "page":
+        return (
+          <>
+            <span className="palette__icon">
+              <Icon name="file" size={16} />
+            </span>
+            <span className="palette__text">
+              <span className="palette__title">
+                <Highlighted text={row.page.title} query={needle} />
+              </span>
+              <span className="palette__detail">
+                {row.agent.name}
+                {row.page.updatedBy === "user" ? " · edited by you" : ""} · {relativeTime(row.page.updatedAt)}
+                {unsaved[pageKey(row.agent.id, row.page.page.documentId)] != null ? <span className="page-card__unsaved"> · unsaved changes</span> : null}
+              </span>
+            </span>
+            {row.agent.isHiddenFromSidebar === true ? <span className="pill">Hidden</span> : null}
+          </>
+        );
+      case "action":
+        return (
+          <>
+            <span className="palette__icon">
+              <Icon name={row.action.icon} size={16} />
+            </span>
+            <span className="palette__text">
+              <span className="palette__title">
+                <Highlighted text={row.action.label} query={needle} />
+              </span>
+            </span>
+            {row.action.shortcut != null && !modHeld ? <Keys keys={SHORTCUTS.find((shortcut) => shortcut.id === row.action.shortcut)?.keys ?? []} /> : null}
+          </>
+        );
+      case "message":
+        return (
+          <>
+            {row.agent != null ? (
+              <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} />
+            ) : (
+              <span className="palette__icon">
+                <Icon name="message" size={16} />
+              </span>
+            )}
+            <span className="palette__text">
+              <span className="palette__title">
+                {row.agent?.name ?? "Deleted agent"}
+                <span className="palette__meta">
+                  {row.hit.role === "user" ? "You" : "Agent"} · {relativeTime(row.hit.timestampMs)}
+                </span>
+              </span>
+              <span className="palette__detail palette__snippet">
+                <Highlighted text={row.hit.snippet} query={query.trim()} />
+              </span>
+            </span>
+          </>
+        );
     }
   };
 
@@ -255,7 +342,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
         <input
           autoFocus
           value={query}
-          placeholder={mode === "jump" ? "Jump to an agent, action or message…" : "Search agents and messages…"}
+          placeholder={mode === "jump" ? "Jump to an agent, page, action or message…" : "Search agents and messages…"}
           aria-label={mode === "jump" ? "Jump to" : "Search agents"}
           role="combobox"
           aria-expanded
@@ -294,54 +381,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
             <div className="palette__group-title" role="presentation">
               {group.title}
             </div>
-            {group.rows.map((row) =>
-              row.kind === "agent"
-                ? option(
-                    row,
-                    <>
-                      <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} busy={isAgentWorking(row.agent)} />
-                      <span className="palette__text">
-                        <span className="palette__title">
-                          <Highlighted text={row.agent.name} query={needle} />
-                        </span>
-                        <span className="palette__detail">{statusLine(row.agent).text}</span>
-                      </span>
-                      {row.agent.isHiddenFromSidebar === true ? <span className="pill">Hidden</span> : null}
-                    </>,
-                  )
-                : row.kind === "action"
-                  ? option(
-                      row,
-                      <>
-                        <span className="palette__icon">
-                          <Icon name={row.action.icon} size={16} />
-                        </span>
-                        <span className="palette__text">
-                          <span className="palette__title">
-                            <Highlighted text={row.action.label} query={needle} />
-                          </span>
-                        </span>
-                        {row.action.shortcut != null && !modHeld ? <Keys keys={SHORTCUTS.find((shortcut) => shortcut.id === row.action.shortcut)?.keys ?? []} /> : null}
-                      </>,
-                    )
-                  : option(
-                      row,
-                      <>
-                        {row.agent != null ? <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} /> : <span className="palette__icon"><Icon name="message" size={16} /></span>}
-                        <span className="palette__text">
-                          <span className="palette__title">
-                            {row.agent?.name ?? "Deleted agent"}
-                            <span className="palette__meta">
-                              {row.hit.role === "user" ? "You" : "Agent"} · {relativeTime(row.hit.timestampMs)}
-                            </span>
-                          </span>
-                          <span className="palette__detail palette__snippet">
-                            <Highlighted text={row.hit.snippet} query={query.trim()} />
-                          </span>
-                        </span>
-                      </>,
-                    ),
-            )}
+            {group.rows.map((row) => option(row, rowContent(row)))}
             {group.note != null ? <div className={`palette__note${messages.status === "error" ? " palette__note--error" : ""}`}>{group.note}</div> : null}
           </div>
         ))}

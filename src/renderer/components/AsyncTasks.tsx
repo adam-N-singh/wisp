@@ -2,16 +2,20 @@
 // still running, opened from the info pane, the agent menu and the palette. Each background
 // command shows what it runs, on which computer, for how long, and the end of its output (read
 // every 2 s while the panel is open), with Stop for its whole process tree. A task leaves the list
-// when it ends; the agent hears how in a message of its own.
+// when it ends; the agent hears how in a message of its own. Stop all stops every one of them.
+//
+// Below, an Ended section lists the agent's tasks that ended lately, newest first, with
+// how each ended, how long it ran, its last output and its log while the PC still keeps it.
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { AgentSummary, AsyncTaskInfo, AsyncTaskOutput } from "../../shared/model";
+import type { AgentSummary, AsyncTaskInfo, AsyncTaskOutput, EndedAsyncTask } from "../../shared/model";
 import { gateway, main } from "../bridge";
 import { closeDialog } from "../store/app";
-import { asyncTasks, loadAsyncTasks, stopAsyncTask } from "../store/async-tasks";
+import { asyncTasks, endedAsyncTasks, loadAsyncTasks, stopAllAsyncTasks, stopAsyncTask, watchEndedAsyncTasks } from "../store/async-tasks";
 import { allAgents, roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { Avatar } from "./Avatar";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
+import { timestampLabel } from "./time";
 
 const OUTPUT_POLL_MS = 2_000;
 const OUTPUT_TAIL_CHARS = 4_000;
@@ -28,7 +32,7 @@ function elapsed(ms: number): string {
 }
 
 /** A task's label kind, in words. */
-function taskName(task: AsyncTaskInfo): string {
+function taskName(task: Pick<AsyncTaskInfo, "kind" | "labelKind" | "labelParams" | "subagentType">): string {
   if (task.labelKind === "shell_command") return `Background command ${task.labelParams?.id ?? ""}`.trim();
   if (task.labelKind === "remote_agent") return "Cloud agent";
   return task.kind === "subagent" ? `Subagent${task.subagentType ? ` (${task.subagentType})` : ""}` : "Background task";
@@ -48,7 +52,10 @@ function Panel({ agent }: { agent: AgentSummary }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const state = useStore(asyncTasks, (all) => all[agent.id]);
   const tasks = state?.tasks ?? [];
+  const ended = useStore(endedAsyncTasks, (all) => all[agent.id]) ?? [];
   const [now, setNow] = useState(Date.now());
+  const [stoppingAll, setStoppingAll] = useState(false);
+  const [stopAllError, setStopAllError] = useState<string | null>(null);
 
   useEffect(() => {
     dialog.current?.showModal();
@@ -57,7 +64,21 @@ function Panel({ agent }: { agent: AgentSummary }) {
   }, []);
   useEffect(() => {
     void loadAsyncTasks(agent.id);
+    return watchEndedAsyncTasks(agent.id);
   }, [agent.id]);
+
+  const stopAll = async () => {
+    setStoppingAll(true);
+    setStopAllError(null);
+    try {
+      // The rows go as their commands end (the "background-work" events); the agent is told of each.
+      const result = await stopAllAsyncTasks(agent.id);
+      if (result.failed.length > 0) setStopAllError(`Couldn’t stop ${result.failed.length} of ${result.failed.length + result.stopped.length}: ${result.failed[0].error}`);
+    } catch (cause) {
+      setStopAllError(errorText(cause));
+    }
+    setStoppingAll(false);
+  };
 
   const title = `Async tasks: ${agent.name}`;
   return (
@@ -81,19 +102,42 @@ function Panel({ agent }: { agent: AgentSummary }) {
         </button>
       </header>
       <div className="async-tasks__body">
-        {state?.status === "error" && tasks.length === 0 ? (
-          <div className="outline__empty outline__empty--error">
-            <Icon name="alert" size={14} /> {state.error ?? "The tasks couldn’t be loaded."}
+        <section className="async-tasks__section" aria-label="Running">
+          <div className="async-tasks__section-head">
+            <h3>Running</h3>
+            {tasks.length > 1 ? (
+              <button type="button" className="button button--small" disabled={stoppingAll} onClick={() => void stopAll()}>
+                <Icon name="stop" size={12} /> {stoppingAll ? "Stopping…" : "Stop all"}
+              </button>
+            ) : null}
           </div>
-        ) : tasks.length === 0 ? (
-          <div className="outline__empty async-tasks__empty">{state?.status === "ready" ? `${agent.name} has nothing running in the background.` : "Loading…"}</div>
-        ) : (
-          <ul className="async-tasks__list">
-            {tasks.map((task) => (
-              <TaskRow key={task.id} agentId={agent.id} task={task} now={now} />
-            ))}
-          </ul>
-        )}
+          {stopAllError != null ? <p className="async-task__error">{stopAllError}</p> : null}
+          {state?.status === "error" && tasks.length === 0 ? (
+            <div className="outline__empty outline__empty--error">
+              <Icon name="alert" size={14} /> {state.error ?? "The tasks couldn’t be loaded."}
+            </div>
+          ) : tasks.length === 0 ? (
+            <div className="outline__empty async-tasks__empty">{state?.status === "ready" ? `${agent.name} has nothing running in the background.` : "Loading…"}</div>
+          ) : (
+            <ul className="async-tasks__list">
+              {tasks.map((task) => (
+                <TaskRow key={task.id} agentId={agent.id} task={task} now={now} />
+              ))}
+            </ul>
+          )}
+        </section>
+        {ended.length > 0 ? (
+          <section className="async-tasks__section" aria-label="Ended">
+            <div className="async-tasks__section-head">
+              <h3>Ended</h3>
+            </div>
+            <ul className="async-tasks__list">
+              {ended.map((task) => (
+                <EndedRow key={task.id} task={task} />
+              ))}
+            </ul>
+          </section>
+        ) : null}
       </div>
     </dialog>
   );
@@ -186,6 +230,72 @@ function TaskRow({ agentId, task, now }: { agentId: string; task: AsyncTaskInfo;
         {output?.truncated === true ? "…\n" : ""}
         {text}
       </pre>
+    </li>
+  );
+}
+
+const ENDED_ICON: Record<EndedAsyncTask["status"], IconName> = { succeeded: "check", failed: "xCircle", stopped: "stop", lost: "alert" };
+
+/** How it ended, in a few words. */
+function endedText(task: EndedAsyncTask): string {
+  switch (task.status) {
+    case "succeeded":
+      return "Finished · exit code 0";
+    case "failed":
+      return `Failed · exit code ${task.exitCode ?? "unknown"}`;
+    case "stopped":
+      return task.stoppedBy === "user" ? "Stopped by you" : task.stoppedBy === "agent" ? "Stopped by the agent" : "Stopped";
+    case "lost":
+      return "Lost";
+  }
+}
+
+function EndedRow({ task }: { task: EndedAsyncTask }) {
+  const [open, setOpen] = useState(false);
+  const [logError, setLogError] = useState<string | null>(null);
+  const name = taskName(task);
+  const outcome = endedText(task);
+  return (
+    <li className={`async-task async-task--ended async-task--${task.status}`}>
+      <div className="async-task__head">
+        <span className="async-task__icon" title={outcome}>
+          <Icon name={ENDED_ICON[task.status]} size={14} />
+        </span>
+        <div className="async-task__title">
+          <code className="async-task__label" title={`${name}: ${task.command}`}>
+            {task.label}
+          </code>
+          <span className="async-task__meta">
+            <span className="async-task__outcome">{outcome}</span> · ran {elapsed(task.endedAtMs - task.startedAtMs)} · {task.computerLabel} ·{" "}
+            <time dateTime={new Date(task.endedAtMs).toISOString()}>{timestampLabel(task.endedAtMs)}</time>
+          </span>
+        </div>
+        {task.tail != null ? (
+          <button type="button" className="button button--ghost button--small" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+            Last output
+          </button>
+        ) : null}
+        {task.logExists ? (
+          <button
+            type="button"
+            className="button button--ghost button--small"
+            title={task.outputPath}
+            onClick={() => {
+              setLogError(null);
+              void main.openWithDefaultApp({ path: task.outputPath }).catch((cause: unknown) => setLogError(`The log couldn’t be opened: ${errorText(cause)}`));
+            }}
+          >
+            Open log
+          </button>
+        ) : null}
+      </div>
+      {task.status === "lost" && task.detail != null ? <p className="async-task__detail">{task.detail}</p> : null}
+      {logError != null ? <p className="async-task__error">{logError}</p> : null}
+      {open && task.tail != null ? (
+        <pre className="async-task__output" aria-label={`Last output of ${name}`}>
+          {task.tail}
+        </pre>
+      ) : null}
     </li>
   );
 }

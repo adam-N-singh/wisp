@@ -101,12 +101,45 @@ export interface InstalledPluginView {
   /** Options the user filled in; sensitive ones are listed but their values aren't. */
   values: Record<string, string>;
   configuredKeys: string[];
+  /** Its plugin.json's version when it was installed (the catalog's `version` is the newest read). */
+  version: string | null;
   /** The last refresh read another commit of its files. */
   updateAvailable: boolean;
   /** …whose servers run or reach something else: updating asks again. */
   serversChanged: boolean;
+  /** …and the skills it adds, removes and changes, by name; null without an update. getPluginUpdate has their texts. */
+  skillChanges: { added: string[]; removed: string[]; changed: string[] } | null;
   /** The marketplace no longer lists it; it stays installed until it's uninstalled. */
   delisted: boolean;
+}
+
+/** One of a plugin's skills an update adds, removes or changes, as agents read it (characters that don't show taken out). */
+export interface PluginSkillChange {
+  name: string;
+  change: "added" | "removed" | "changed";
+  /** Its SKILL.md now and after the update; null on the side it isn't on. */
+  before: string | null;
+  after: string | null;
+  /** Characters that don't show, taken out of the text after the update. */
+  hiddenCharacters?: number;
+}
+
+/** What updating an installed plugin to the last refresh's files changes (getPluginUpdate). */
+export interface PluginUpdate {
+  pluginId: string;
+  fromCommit: string;
+  toCommit: string;
+  /** From plugin.json, when it gives one. */
+  fromVersion: string | null;
+  toVersion: string | null;
+  /** Its servers run or reach something else: updating needs the review's approvalKey. */
+  serversChanged: boolean;
+  /** Skills added, removed and changed, by name. */
+  skills: PluginSkillChange[];
+  /** Its other files added, removed and changed (scripts its servers run, a skill's references), at most 200. */
+  files: Array<{ path: string; change: "added" | "removed" | "changed" }>;
+  /** Changed files past those 200. */
+  moreFiles: number;
 }
 
 /** A marketplace the user added. Its id is its name. */

@@ -3,8 +3,10 @@
 // isolated user-data folder, and switches Settings → Box to the server. The
 // coordinator and the local-exec daemon must then use it: a prompt
 // round-trips through the server, a tool the server calls runs on this PC
-// (after an approval given here, for a risky one), and an attached image is
-// uploaded to the server and shown back here.
+// (after an approval given here, for a risky one), an attached image is
+// uploaded to the server and shown back here, a background command runs on
+// this PC and is stopped from the Async tasks panel through the server, and
+// the agent browser opens a local test page on this PC for a remote agent.
 // Usage: node test/e2e/remote-box.mjs   (after `node scripts/build.mjs`)
 import { _electron as electron } from "playwright";
 import { spawn } from "node:child_process";
@@ -13,6 +15,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { startTestSite, toolOutput } from "./agent-browser-step.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const userData = mkdtempSync(join(tmpdir(), "wisp-e2e-remote-"));
@@ -180,6 +183,46 @@ try {
     const uploads = readdirSync(join(boxData, "attachments"), { recursive: true }).map(String);
     if (!uploads.some((name) => name.endsWith("dot.png"))) throw new Error(`no upload on the box: ${uploads.join(", ")}`);
     await page.screenshot({ path: join(shots, "12-remote-chat.png") });
+  });
+
+  await step("a background command runs on this PC for the remote agent, shows in Async tasks, and is stopped from there through the box", async () => {
+    const powershell = process.platform === "win32";
+    await send(`/tool run_shell ${JSON.stringify({ command: powershell ? "Write-Output 'bg remote ready'; Start-Sleep -Seconds 120" : "echo bg remote ready; sleep 120", background: true })}`);
+    // The card is this PC's, as for any command.
+    const allow = page.getByRole("button", { name: "Allow once" });
+    await allow.waitFor({ timeout: 20_000 });
+    await page.locator(".permission-card__machine", { hasText: hostname() }).last().waitFor({ timeout: 5_000 });
+    await allow.click();
+    const pill = page.getByRole("button", { name: "1 running" });
+    await pill.waitFor({ timeout: 20_000 });
+    await page.getByRole("tab", { name: "Overview" }).click();
+    await page.getByRole("button", { name: "Async tasks", exact: true }).click();
+    const panel = page.getByRole("dialog", { name: "Async tasks: Remote Wisp" });
+    // Its output is read from this PC through the box (shell-control "output").
+    await panel.locator(".async-task__output", { hasText: "bg remote ready" }).waitFor({ timeout: 20_000 });
+    await page.screenshot({ path: join(shots, "13-remote-async-tasks.png") });
+    // Stop goes to the box, which sends shell-control "stop" to this PC's daemon.
+    await panel.getByRole("button", { name: /^Stop Background command \d+$/ }).click();
+    await panel.getByText("Remote Wisp has nothing running in the background.").waitFor({ timeout: 20_000 });
+    await page.keyboard.press("Escape");
+    await panel.waitFor({ state: "hidden" });
+    await pill.waitFor({ state: "hidden", timeout: 10_000 });
+  });
+
+  await step("the agent browser opens a local test page on this PC for the remote agent", async () => {
+    const site = await startTestSite();
+    try {
+      await send(`/tool browser_navigate ${JSON.stringify({ url: site.url })}`);
+      const opened = await toolOutput(page, conversation("Remote Wisp"), `Opened ${site.url}`);
+      if (!opened.includes(`<untrusted-page-content url="${site.url}" title="Agent browser test page">`) || !/textbox "Your name" \[ref=e\d+\]/.test(opened)) {
+        throw new Error(`the page didn't come back to the remote agent:\n${opened}`);
+      }
+      // The window is this PC's, with the page in it.
+      const here = await app.evaluate(({ webContents }, url) => webContents.getAllWebContents().some((contents) => contents.getURL() === url), site.url);
+      if (!here) throw new Error("the agent browser didn't open the page on this PC");
+    } finally {
+      await site.close();
+    }
   });
 
   await step("switching back to This PC brings back this PC's agents", async () => {

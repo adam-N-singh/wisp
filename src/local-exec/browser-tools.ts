@@ -194,7 +194,13 @@ export const BROWSER_TOOLS: Record<BrowserToolName, LocalTool> = {
       permissionId: "browser",
       readOnly: true,
     },
-    plan: (args, context) => readPlan("browser_wait_for_user", args, context, "Hand you the agent browser"),
+    async plan(args, context) {
+      // By site, not address: the call comes back after the user's answer, often on another page of the
+      // site (signed in), and an approval carries over only to a call on the same site.
+      const info = await plan("browser_wait_for_user", args, context);
+      const site = siteOf(info.url);
+      return { risk: "read-only", reasons: [], scope: siteScope(info.url), paths: [], action: "use-app", target: site != null ? siteLabel(site) : "the agent browser", title: "Hand you the agent browser" };
+    },
     execute: (args, context) => run("browser_wait_for_user", args, context),
   },
 };

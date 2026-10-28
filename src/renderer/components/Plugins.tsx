@@ -1,11 +1,11 @@
 // Plugins from marketplaces in Connect Apps: a plugin's page with its skills, its MCP servers and
 // what the app leaves out; the review that comes before anything a plugin brings runs (each
 // server's exact command, arguments and environment, or its address, and the commit they come
-// from), shown again when an update
-// changes them; the Marketplaces tab (add by link, refresh, remove); and the Skills tab, a search
-// over every plugin's skills.
+// from), and for an update what it changes (the version, each skill added, removed or changed
+// with its texts, the servers, other files); the Marketplaces tab (add by link, refresh, remove);
+// and the Skills tab, a search over every plugin's skills.
 import { useEffect, useMemo, useState } from "react";
-import { type CatalogPlugin, type MarketplaceView, type PluginServerSpec, type SkillCatalogEntry, UNSUPPORTED_LABELS } from "../../shared/marketplace";
+import { type CatalogPlugin, type MarketplaceView, type PluginServerSpec, type PluginSkillChange, type PluginUpdate, type SkillCatalogEntry, UNSUPPORTED_LABELS } from "../../shared/marketplace";
 import type { McpCatalogEntry, McpServerSummary } from "../../shared/model";
 import { gateway, main } from "../bridge";
 import { loadMarketplaces, loadMcpCatalog, marketplaces, setMarketplaces, setMcpState } from "../store/agent-data";
@@ -109,6 +109,8 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
   const [error, setError] = useState<string | null>(null);
   const canInstall = plugin.error == null && plugin.commit != null && plugin.nameTakenBy == null;
   const texts = useSkillTexts(plugin.pluginId, plugin.commit, (entry.skills?.length ?? 0) > 0);
+  // An installed plugin is at its installed version until it's updated; the catalog's is the newest read.
+  const version = installed != null ? installed.version : plugin.version;
   const unsupported = plugin.unsupported.map((key) => UNSUPPORTED_LABELS[key] ?? key);
 
   const run = async (label: string, action: () => Promise<unknown>): Promise<boolean> => {
@@ -134,7 +136,7 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
         <AppLogo entry={entry} size={48} />
         <div className="app-page__title">
           <h2>{entry.displayName}</h2>
-          <div className="muted">{[plugin.marketplaceName, plugin.version != null ? `v${plugin.version}` : null, plugin.author].filter(Boolean).join(" · ")}</div>
+          <div className="muted">{[plugin.marketplaceName, version != null ? `v${version}` : null, plugin.author].filter(Boolean).join(" · ")}</div>
         </div>
         {installed != null ? (
           <span className="app-card__state">
@@ -217,7 +219,9 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
           {installed.updateAvailable && plugin.commit != null ? (
             <div className={`plugin-update${installed.serversChanged ? " plugin-update--review" : ""}`}>
               <span>
-                {installed.serversChanged ? `A refresh found a new version (${short(plugin.commit)}) that runs or reaches something else. Review it before updating.` : `A refresh found a new version: ${short(plugin.commit)}.`}
+                A refresh found a new version: {versionChange(installed.version, plugin.version) ?? short(plugin.commit)}.{" "}
+                {installed.skillChanges != null ? skillSummary(installed.skillChanges) : ""}
+                {installed.serversChanged ? " It runs or reaches something else: review it before updating." : ""}
               </span>
               <button type="button" className="button button--small button--primary" onClick={() => setMode("update")}>
                 Review update
@@ -273,7 +277,13 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
       {(entry.skills?.length ?? 0) > 0 && mode !== "install" && mode !== "update" ? (
         <section className="app-section" aria-label="Skills">
           <h3>Skills</h3>
-          <p className="muted">{installed != null ? "Every agent has these, read-only. Copy one to an agent from its Skills tab to change it." : "Once it’s installed, every agent has these, read-only."}</p>
+          <p className="muted">
+            {installed == null
+              ? "Once it’s installed, every agent has these, read-only."
+              : installed.updateAvailable
+                ? "These are the new version’s skills: agents get them once you update. Review update shows what changes."
+                : "Every agent has these, read-only. Copy one to an agent from its Skills tab to change it."}
+          </p>
           <PluginSkills entry={entry} texts={texts} />
         </section>
       ) : null}
@@ -360,7 +370,12 @@ function PluginReview({
       <div className="template-warning" role="note">
         <Icon name="shield" size={16} />
         <div>
-          {runs > 0 ? (
+          {kind === "update" && !changed ? (
+            <>
+              <strong>Read what changes before you update it.</strong> Its skills are instructions every agent reads
+              {runs > 0 ? `, and its ${runs === 1 ? "server restarts" : "servers restart"} from the new files, so check the files that change too` : ""}.
+            </>
+          ) : runs > 0 ? (
             <>
               <strong>Check what it runs before you {kind === "install" ? "install it" : "update it"}.</strong> Each command below runs {where} as soon as you confirm, with the same file and network access as the box, though not its keys and tokens. It’s code from someone’s repository: install only plugins you trust.
             </>
@@ -386,6 +401,7 @@ function PluginReview({
           </>
         ) : null}
       </p>
+      {kind === "update" ? <UpdateChanges plugin={plugin} /> : null}
       {changed && installed != null ? (
         <div className="plugin-review__compare">
           <div>
@@ -402,19 +418,157 @@ function PluginReview({
           {plugin.servers.map((server) => (
             <ServerSpec key={server.name} server={server} where={where} />
           ))}
-          {kind === "update" ? <p className="muted">What it runs and connects to doesn’t change.</p> : null}
         </>
       )}
-      {(entry.skills?.length ?? 0) > 0 ? (
+      {kind === "install" && (entry.skills?.length ?? 0) > 0 ? (
         <div>
-          <div className="plugin-review__heading">
-            {kind === "install" ? "Gives every agent" : "Every agent’s skills from it after the update"}: {plural(entry.skills!.length, "skill")}
-          </div>
+          <div className="plugin-review__heading">Gives every agent: {plural(entry.skills!.length, "skill")}</div>
           <PluginSkills entry={entry} texts={texts} />
         </div>
       ) : null}
       <CatalogFieldsForm entry={kind === "install" ? entry : { ...entry, fields: [] }} submitLabel={label} busy={busy} onSubmit={onConfirm} onCancel={onCancel} />
     </section>
+  );
+}
+
+// ---- what an update changes ------------------------------------------------------------------
+
+/** "v1.0.0 → v1.1.0", or "v1.1.0" when there was none; null when plugin.json gives none or the same one. */
+function versionChange(from: string | null, to: string | null): string | null {
+  if (to == null || to === from) return null;
+  return from != null ? `v${from} → v${to}` : `v${to}`;
+}
+
+/** "Its skills change: 1 changed, 1 added." or "Its skills don’t change." */
+function skillSummary(changes: { added: string[]; removed: string[]; changed: string[] }): string {
+  const parts = [
+    changes.changed.length > 0 ? `${changes.changed.length} changed` : null,
+    changes.added.length > 0 ? `${changes.added.length} added` : null,
+    changes.removed.length > 0 ? `${changes.removed.length} removed` : null,
+  ].filter((part) => part != null);
+  return parts.length > 0 ? `Its skills change: ${parts.join(", ")}.` : "Its skills don’t change.";
+}
+
+/** A line diff of two texts (longest common subsequence); null when they're too long to compare here. */
+function lineDiff(before: string, after: string): Array<{ kind: "same" | "add" | "del"; text: string }> | null {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  if ((a.length + 1) * (b.length + 1) > 1_000_000) return null;
+  // How long the common part of a[i…] and b[j…] is.
+  const common = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) common[i][j] = a[i] === b[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
+  }
+  const lines: Array<{ kind: "same" | "add" | "del"; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) lines.push({ kind: "same", text: a[i++] }), j++;
+    else if (common[i + 1][j] >= common[i][j + 1]) lines.push({ kind: "del", text: a[i++] });
+    else lines.push({ kind: "add", text: b[j++] });
+  }
+  while (i < a.length) lines.push({ kind: "del", text: a[i++] });
+  while (j < b.length) lines.push({ kind: "add", text: b[j++] });
+  return lines;
+}
+
+const CHANGE_LABELS: Record<PluginSkillChange["change"], string> = { changed: "Changed", added: "Added", removed: "Removed" };
+
+/**
+ * What an update changes, read from the box when the review opens: the version and commit, each
+ * skill added, removed or changed (its texts as agents read them, and what changed between them),
+ * whether its servers change, and its other files.
+ */
+function UpdateChanges({ plugin }: { plugin: CatalogPlugin }) {
+  const [update, setUpdate] = useState<PluginUpdate | "error" | null>(null);
+  useEffect(() => {
+    let current = true;
+    setUpdate(null);
+    gateway.getPluginUpdate({ pluginId: plugin.pluginId }).then(
+      (found) => current && setUpdate(found),
+      () => current && setUpdate("error"),
+    );
+    return () => {
+      current = false;
+    };
+  }, [plugin.pluginId, plugin.commit]);
+  if (update == null) return <p className="muted">Reading what changes…</p>;
+  if (update === "error") return <div className="form-error">Couldn’t read what the update changes. Refresh its marketplace and review it again.</div>;
+  const version = versionChange(update.fromVersion, update.toVersion);
+  const byKind = (change: PluginSkillChange["change"]) => update.skills.filter((skill) => skill.change === change).map((skill) => skill.name);
+  const otherFiles = update.files.length + update.moreFiles;
+  return (
+    <div className="plugin-changes" aria-label="What the update changes">
+      <div className="plugin-review__heading">What the update changes</div>
+      <ul className="plugin-changes__summary">
+        <li>
+          {version != null ? `Version ${version}` : "Its version number stays the same"}, commit <span className="mono">{short(update.fromCommit)}</span> → <span className="mono">{short(update.toCommit)}</span>.
+        </li>
+        <li>{skillSummary({ added: byKind("added"), removed: byKind("removed"), changed: byKind("changed") })}</li>
+        <li>{update.serversChanged ? "What it runs or connects to changes: see below." : "What it runs and connects to doesn’t change."}</li>
+        <li>{otherFiles > 0 ? `${plural(otherFiles, "other file")} ${otherFiles === 1 ? "changes" : "change"}.` : "No other file changes."}</li>
+      </ul>
+      {update.skills.length > 0 ? (
+        <ul className="plugin-skills">
+          {update.skills.map((skill) => {
+            const diff = skill.change === "changed" && skill.before != null && skill.after != null ? lineDiff(skill.before, skill.after) : null;
+            return (
+              <li key={`${skill.change}:${skill.name}`}>
+                <span className="plugin-skills__name">
+                  <span className={`pill plugin-change plugin-change--${skill.change}`}>{CHANGE_LABELS[skill.change]}</span>
+                  <span className="skill__command">
+                    /{plugin.name}:{skill.name}
+                  </span>
+                </span>
+                {skill.hiddenCharacters != null ? (
+                  <span className="plugin-skills__hidden">
+                    <Icon name="alert" size={12} /> {skill.hiddenCharacters === 1 ? "A hidden character was" : `${skill.hiddenCharacters} hidden characters were`} taken out of the new text: text a model would read but you wouldn’t see.
+                  </span>
+                ) : null}
+                {diff != null ? (
+                  <details className="plugin-skills__text" open>
+                    <summary>What changed</summary>
+                    <pre className="plugin-command plugin-skills__body plugin-diff">
+                      {diff.map((line, index) => (
+                        <span key={index} className={`plugin-diff__line plugin-diff__line--${line.kind}`}>
+                          {line.kind === "add" ? "+ " : line.kind === "del" ? "- " : "  "}
+                          {line.text}
+                        </span>
+                      ))}
+                    </pre>
+                  </details>
+                ) : null}
+                {skill.before != null ? (
+                  <details className="plugin-skills__text">
+                    <summary>{skill.change === "changed" ? "Now" : "Read it"}</summary>
+                    <pre className="plugin-command plugin-skills__body">{skill.before}</pre>
+                  </details>
+                ) : null}
+                {skill.after != null ? (
+                  <details className="plugin-skills__text">
+                    <summary>{skill.change === "changed" ? "After the update" : "Read it"}</summary>
+                    <pre className="plugin-command plugin-skills__body">{skill.after}</pre>
+                  </details>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {otherFiles > 0 ? (
+        <details className="plugin-problems">
+          <summary className="muted">Its other files</summary>
+          <ul>
+            {update.files.map((file) => (
+              <li key={file.path}>
+                <span className="mono">{file.path}</span> {file.change}
+              </li>
+            ))}
+            {update.moreFiles > 0 ? <li>and {update.moreFiles} more</li> : null}
+          </ul>
+        </details>
+      ) : null}
+    </div>
   );
 }
 
