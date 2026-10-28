@@ -1,5 +1,9 @@
 # Wisp
 
+> [!NOTE]
+> Wisp is still in development, and this isn't the final version. Expect bugs, unfinished features and changes
+> between releases.
+
 A desktop app for personal AI agents. You message your agents ("wisps") like contacts: each one has its own
 conversation, todo list, automations, skills, connected apps, files and memories, and can use tools on your computer
 with your approval.
