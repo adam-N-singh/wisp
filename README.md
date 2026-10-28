@@ -13,7 +13,23 @@ The box runs on this PC by default, or on an always-on server of your own (**rem
 model accounts**: xAI, OpenAI (API key or your ChatGPT plan), Anthropic, your installed Claude Code, or any
 OpenAI-compatible endpoint. Agents work on this PC by default, or on an optional **cloud computer**.
 
-## Run it
+## Install on Windows
+
+For 64-bit Windows 10 or 11. The PC needs nothing else: Git and Node.js are only for [running from source](#run-from-source).
+
+1. Download `Wisp-Setup-<version>.exe` from the **Assets** of the [latest release](https://github.com/adam-N-singh/wisp/releases/latest).
+2. Run it. Wisp installs for your Windows user (no admin rights), adds a Start menu entry and a desktop shortcut,
+   and opens.
+3. The installer isn't code-signed, so Windows may warn about it:
+   - If your browser says the file isn't commonly downloaded, choose **Keep**.
+   - If SmartScreen says "Windows protected your PC", choose **More info → Run anyway**.
+   - Windows 11's Smart App Control, when it's on, blocks unsigned apps outright. Run Wisp from source instead.
+
+The installed app keeps itself up to date from new releases (see [Installer and updates](#installer-and-updates)).
+To remove it, open **Settings → Apps → Installed apps** and choose **Uninstall** in Wisp's **…** menu. Your agents and
+settings in `%APPDATA%\Wisp` are kept.
+
+## Run from source
 
 You need Git and Node.js 22.19 or newer (developed on Node 24). With an older Node.js, `npm install` stops with an
 `EBADENGINE` error.
