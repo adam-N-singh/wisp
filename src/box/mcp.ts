@@ -14,7 +14,7 @@ import type { McpAuthChallenge, McpHttpServerConfig, McpOAuthClientConfig, McpSe
 
 const PROTOCOL_VERSION = "2025-06-18";
 const REQUEST_TIMEOUT_MS = 60_000;
-const CLIENT_INFO = { name: "wisp", version: "0.2.0" };
+const CLIENT_INFO = { name: "wisp", version: "0.3.0" };
 
 export interface McpTool {
   name: string;
