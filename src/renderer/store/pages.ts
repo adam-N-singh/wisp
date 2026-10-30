@@ -1,19 +1,22 @@
-// Pages on the page stage (src/shared/pages.ts): which one is open, the documents read so far, the
-// user's unsaved edits, and each agent's Library, all kept live from "page-changed". Unsaved edits
+// Pages on the page stage (src/shared/pages.ts): which one is open, the documents and canvases read so
+// far, the user's unsaved edits, and each agent's Library, all kept live from "page-changed". A
+// canvas's HTML runs in its frame, which main serves (src/main/canvases.ts); this keeps what the stage
+// says about it: its title, revision and who made it. Unsaved edits
 // outlive the stage and the app: each is a client slice of its own (`page-draft.<agentId>.<documentId>`),
 // so reopening the page, also after a restart, shows them again. An open document without unsaved
 // edits reloads when its page changes; with them, the edits stay and the stage offers Reload or Keep
 // mine, and a save names the revision the edits were made on, so the box refuses one that would
 // write over a change the user hasn't seen. Every "page-changed" says whether the user may edit the
 // page now, so it turns read-only while the agent writes it and editable when that run ends.
-import type { DocumentEditRight, LibraryPage, PageChangedEvent, PageDocument } from "../../shared/pages";
+import { type DocumentEditRight, type LibraryPage, type PageChangedEvent, type PageDocument, pageId, pageKindOf, pageLocatorFor } from "../../shared/pages";
 import { gateway } from "../bridge";
 import { readSlice, readSlices, removeSlice, sliceKey, writeSlice } from "./slices";
 import { Store } from "./store";
 
 export interface OpenPage {
   agentId: string;
-  documentId: string;
+  /** A document's id or a canvas's. */
+  pageId: string;
 }
 
 export interface StageState {
@@ -34,6 +37,14 @@ export interface LoadedDocument {
   editRight?: DocumentEditRight;
 }
 
+/** A canvas, as last read: what its stage says about it (its HTML is its frame's). */
+export interface LoadedCanvas {
+  status: "loading" | "ready" | "missing" | "error";
+  canvas?: LibraryPage;
+  error?: string;
+  editRight?: DocumentEditRight;
+}
+
 /** The user's text, made on `baseRevision`. */
 export interface Draft {
   source: string;
@@ -45,10 +56,11 @@ const locatorOf = (agentId: string, documentId: string) => ({ storeId: agentId, 
 
 export const stage = new Store<StageState>({ open: null, editing: false, viewing: null, showChat: false });
 export const documents = new Store<Record<string, LoadedDocument>>({});
+export const canvases = new Store<Record<string, LoadedCanvas>>({});
 export const drafts = new Store<Record<string, Draft | undefined>>({});
-/** Each agent's documents, newest first. */
+/** Each agent's pages, newest first. */
 export const library = new Store<Record<string, LibraryPage[] | undefined>>({});
-/** Every agent's documents (`libraryPages`), newest first, once the palette has asked; null until then. */
+/** Every agent's pages (`libraryPages`), newest first, once the palette has asked; null until then. */
 export const allPages = new Store<LibraryPage[] | null>(null);
 
 /** A gateway error's failure code and its message for the user. */
@@ -61,6 +73,13 @@ export function pageFailure(cause: unknown): { code: string | null; message: str
 function setDocument(key: string, change: (current: LoadedDocument) => LoadedDocument): void {
   documents.set((state) => ({ ...state, [key]: change(state[key] ?? { status: "loading" }) }));
 }
+
+function setCanvas(key: string, change: (current: LoadedCanvas) => LoadedCanvas): void {
+  canvases.set((state) => ({ ...state, [key]: change(state[key] ?? { status: "loading" }) }));
+}
+
+/** What a page view (`canvasPage`, a restore) says about the page, without its text. */
+const pageOf = ({ page, title, createdAt, updatedAt, revision, updatedBy }: LibraryPage): LibraryPage => ({ page, title, createdAt, updatedAt, revision, updatedBy });
 
 /** A draft as its slice keeps it: the page it belongs to as well. */
 interface StoredDraft extends Draft {
@@ -80,14 +99,19 @@ function putDraft(agentId: string, documentId: string, draft: Draft | undefined)
   else writeSlice<StoredDraft>(draftSlice(agentId, documentId), 1, { agentId, documentId, ...draft });
 }
 
-export function openPage(agentId: string, documentId: string): void {
+export function openPage(agentId: string, pageId: string): void {
   const current = stage.get().open;
-  if (current?.agentId === agentId && current.documentId === documentId) {
+  if (current?.agentId === agentId && current.pageId === pageId) {
     stage.set((state) => ({ ...state, showChat: false }));
     return;
   }
-  stage.set({ open: { agentId, documentId }, editing: drafts.get()[pageKey(agentId, documentId)] != null, viewing: null, showChat: false });
-  void loadDocument(agentId, documentId);
+  stage.set({ open: { agentId, pageId }, editing: drafts.get()[pageKey(agentId, pageId)] != null, viewing: null, showChat: false });
+  void loadPage(agentId, pageId);
+}
+
+/** Reads a document or a canvas, by its id. */
+export function loadPage(agentId: string, pageId: string): Promise<void> {
+  return pageKindOf(pageId) === "canvas" ? loadCanvas(agentId, pageId) : loadDocument(agentId, pageId);
 }
 
 export function closePage(): void {
@@ -124,12 +148,39 @@ export async function loadDocument(agentId: string, documentId: string): Promise
   }
 }
 
-export async function refreshEditRight(agentId: string, documentId: string): Promise<void> {
+/** Reads what the stage says about a canvas, and whether the user may change it now. */
+export async function loadCanvas(agentId: string, canvasId: string): Promise<void> {
+  const key = pageKey(agentId, canvasId);
+  setCanvas(key, (current) => ({ ...current, status: current.canvas != null ? current.status : "loading" }));
+  const locator = { storeId: agentId, canvasId };
   try {
-    const editRight = await gateway.pageEditAccess({ locator: locatorOf(agentId, documentId) });
-    setDocument(pageKey(agentId, documentId), (current) => ({ ...current, editRight }));
+    const [view, editRight] = await Promise.all([gateway.canvasPage({ locator }), gateway.pageEditAccess({ locator })]);
+    setCanvas(key, () => ({ status: "ready", canvas: pageOf(view), editRight }));
+  } catch (cause) {
+    const failure = pageFailure(cause);
+    setCanvas(key, (current) => (failure.code === "page/not-found" ? { status: "missing" } : { ...current, status: current.canvas != null ? "ready" : "error", error: failure.message }));
+  }
+}
+
+export async function refreshEditRight(agentId: string, id: string): Promise<void> {
+  try {
+    const editRight = await gateway.pageEditAccess({ locator: pageLocatorFor(agentId, id) });
+    if (pageKindOf(id) === "canvas") setCanvas(pageKey(agentId, id), (current) => ({ ...current, editRight }));
+    else setDocument(pageKey(agentId, id), (current) => ({ ...current, editRight }));
   } catch {
     // the next change or reload says
+  }
+}
+
+/** The user's title for a canvas; a refusal is for the user. */
+export async function retitleCanvas(agentId: string, canvasId: string, title: string): Promise<string | null> {
+  try {
+    const renamed = await gateway.retitleCanvas({ storeId: agentId, canvasId, title });
+    setCanvas(pageKey(agentId, canvasId), (current) => (current.canvas != null ? { ...current, canvas: { ...current.canvas, title: renamed.title } } : current));
+    return null;
+  } catch (cause) {
+    void loadCanvas(agentId, canvasId);
+    return pageFailure(cause).message;
   }
 }
 
@@ -174,31 +225,36 @@ export async function saveDraft(agentId: string, documentId: string): Promise<st
   }
 }
 
-export async function restorePageRevision(agentId: string, documentId: string, revision: number, baseRevision: number): Promise<string | null> {
+export async function restorePageRevision(agentId: string, id: string, revision: number, baseRevision: number): Promise<string | null> {
   try {
-    const doc = await gateway.restorePageRevision({ locator: locatorOf(agentId, documentId), revision, baseRevision });
-    setDocument(pageKey(agentId, documentId), (current) => ({ ...current, status: "ready", doc }));
+    const doc = await gateway.restorePageRevision({ locator: pageLocatorFor(agentId, id), revision, baseRevision });
+    if (doc.page.kind === "canvas") setCanvas(pageKey(agentId, id), (current) => ({ ...current, status: "ready", canvas: pageOf(doc) }));
+    else setDocument(pageKey(agentId, id), (current) => ({ ...current, status: "ready", doc }));
     return null;
   } catch (cause) {
-    void loadDocument(agentId, documentId);
+    void loadPage(agentId, id);
     return pageFailure(cause).message;
   }
 }
 
-export async function deletePage(agentId: string, documentId: string): Promise<string | null> {
+export async function deletePage(agentId: string, id: string): Promise<string | null> {
   try {
-    await gateway.deletePage({ locator: locatorOf(agentId, documentId) });
-    discardDraft(agentId, documentId);
-    setDocument(pageKey(agentId, documentId), () => ({ status: "missing" }));
+    await gateway.deletePage({ locator: pageLocatorFor(agentId, id) });
+    if (pageKindOf(id) === "canvas") setCanvas(pageKey(agentId, id), () => ({ status: "missing" }));
+    else {
+      discardDraft(agentId, id);
+      setDocument(pageKey(agentId, id), () => ({ status: "missing" }));
+    }
     return null;
   } catch (cause) {
     return pageFailure(cause).message;
   }
 }
 
+/** The agent's documents and canvases, for its Library. */
 export async function loadLibrary(agentId: string): Promise<void> {
   try {
-    const pages = await gateway.libraryDocuments({ agentId });
+    const pages = await gateway.libraryPages({ includeDocuments: true, agentId });
     library.set((state) => ({ ...state, [agentId]: pages }));
   } catch {
     // offline; events fill it in
@@ -215,7 +271,7 @@ export async function loadAllPages(): Promise<void> {
 
 /** A list of pages with this one put in (newest first), changed or taken out. */
 function withPage(list: readonly LibraryPage[], page: LibraryPage, deleted: boolean): LibraryPage[] {
-  const rest = list.filter((item) => item.page.storeId !== page.page.storeId || item.page.documentId !== page.page.documentId);
+  const rest = list.filter((item) => item.page.storeId !== page.page.storeId || pageId(item.page) !== pageId(page.page));
   return deleted ? rest : [page, ...rest].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
@@ -225,16 +281,25 @@ function applyPageChanged(event: PageChangedEvent): void {
   if (known != null) library.set((state) => ({ ...state, [agentId]: withPage(known, page, event.change === "deleted") }));
   const every = allPages.get();
   if (every != null) allPages.set(withPage(every, page, event.change === "deleted"));
-  const key = pageKey(agentId, page.page.documentId);
-  if (event.change === "deleted") putDraft(agentId, page.page.documentId, undefined);
+  const id = pageId(page.page);
+  const key = pageKey(agentId, id);
+  if (page.page.kind === "canvas") {
+    // The event says all the stage shows; the frame reads the new revision itself.
+    if (canvases.get()[key] == null) return;
+    if (event.change === "deleted") return setCanvas(key, () => ({ status: "missing" }));
+    setCanvas(key, (current) => ({ ...current, status: "ready", canvas: page, editRight: event.editRight ?? current.editRight }));
+    if (event.editRight == null) void refreshEditRight(agentId, id);
+    return;
+  }
+  if (event.change === "deleted") putDraft(agentId, id, undefined);
   const loaded = documents.get()[key];
   if (loaded == null) return;
   if (event.change === "deleted") return setDocument(key, () => ({ status: "missing" }));
   if (event.editRight != null) setDocument(key, (current) => ({ ...current, editRight: event.editRight }));
   // A newer revision than the one read: read it (unsaved edits stay as they are).
-  if (loaded.doc == null || loaded.doc.revision !== page.revision) void loadDocument(agentId, page.page.documentId);
+  if (loaded.doc == null || loaded.doc.revision !== page.revision) void loadDocument(agentId, id);
   // A box that doesn't say is asked.
-  else if (event.editRight == null) void refreshEditRight(agentId, page.page.documentId);
+  else if (event.editRight == null) void refreshEditRight(agentId, id);
 }
 
 // The companion chat's width beside the page, per user.
@@ -276,9 +341,9 @@ export function startPages(): void {
     },
     "gateway-link": ({ state }) => {
       if (state !== "connected") return;
-      for (const key of Object.keys(documents.get())) {
-        const [agentId, documentId] = key.split("\u0000");
-        void loadDocument(agentId, documentId);
+      for (const key of [...Object.keys(documents.get()), ...Object.keys(canvases.get())]) {
+        const [agentId, id] = key.split("\u0000");
+        void loadPage(agentId, id);
       }
       for (const agentId of Object.keys(library.get())) void loadLibrary(agentId);
       if (allPages.get() != null) void loadAllPages();

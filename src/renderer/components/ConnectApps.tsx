@@ -321,12 +321,18 @@ function Gallery({
 }
 
 function AppCard({ entry, accounts, onOpen }: { entry: McpCatalogEntry; accounts: McpServerSummary[]; onOpen(): void }) {
+  // An installed plugin with a new version, read by a refresh or seen by the daily check.
+  const installed = entry.plugin?.installed;
+  const update = installed != null && (installed.updateAvailable || installed.updateFound != null);
   return (
     <div className="app-card" role="listitem">
-      <button type="button" className="app-card__main" onClick={onOpen} aria-label={`${entry.displayName}: details`}>
+      <button type="button" className="app-card__main" onClick={onOpen} aria-label={`${entry.displayName}: details${update ? ", a new version is out" : ""}`}>
         <AppLogo entry={entry} size={36} />
         <span className="app-card__text">
-          <span className="app-card__name">{entry.displayName}</span>
+          <span className="app-card__name">
+            {entry.displayName}
+            {update ? <span className="app-card__badge">Update</span> : null}
+          </span>
           <span className="app-card__description">{entry.description}</span>
         </span>
       </button>
@@ -342,7 +348,7 @@ function ConnectButton({ entry, accounts, onSetup }: { entry: McpCatalogEntry; a
   if (entry.plugin != null) {
     // A plugin is installed from its page, after its review.
     const installed = entry.plugin.installed;
-    if (installed == null || installed.updateAvailable) {
+    if (installed == null || installed.updateAvailable || installed.updateFound != null) {
       // One the app can't fetch (an npm package, say) has only details to show.
       const label = installed != null ? "Update" : entry.plugin.error != null ? "Details" : "Review";
       return (
@@ -351,10 +357,12 @@ function ConnectButton({ entry, accounts, onSetup }: { entry: McpCatalogEntry; a
         </button>
       );
     }
-    return (
+    return installed.enabled ? (
       <span className="app-card__state">
         <Icon name="check" size={12} /> Installed
       </span>
+    ) : (
+      <span className="app-card__state">Turned off</span>
     );
   }
   if (accounts.length === 0) {

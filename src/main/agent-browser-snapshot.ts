@@ -3,8 +3,11 @@
 // Elements an agent can act on (and the landmarks it can read on their own) get a ref ("e7"),
 // which stays the element's while its document lives, so refs from an earlier snapshot still work
 // after the page changes around them. Text fields show what's in them, except password, payment
-// card and one-time code fields; frames are named but not read. No HTML: names, roles, states and
-// text only. Pure, so it's unit-tested without a browser.
+// card and one-time code fields and fields filled from the vault. A frame from the page's own
+// origin is read in its place, from its own tree (agent-browser.ts fetches it), and its elements'
+// refs name their frame, so clicks and typing reach them; a frame from anywhere else is named, with
+// where it's from, but not read. No HTML: names, roles, states and text only. Pure, so it's
+// unit-tested without a browser.
 import { sensitiveField } from "../shared/agent-browser";
 
 export interface AXValue {
@@ -37,7 +40,12 @@ export interface SnapshotRef {
   backendNodeId: number;
   role: string;
   name: string;
+  /** The frame the element is in; null for the page's own document. */
+  frameId: string | null;
 }
+
+/** What's inside one of the page's frames: its own accessibility tree (a same-origin frame), or why it isn't read. */
+export type FrameContent = { frameId: string; nodes: AXNode[] } | { unread: string };
 
 export interface SnapshotOptions {
   /** Read only this element and what's inside it. */
@@ -45,7 +53,12 @@ export interface SnapshotOptions {
   maxChars?: number;
   /** The page's address, so links on the same site show as paths. */
   pageUrl?: string;
+  /** By backendDOMNodeId, in the page's tree and its frames' alike. */
   fields?: Map<number, FieldInfo>;
+  /** Fields filled from the vault: they show as filled, never with what's in them. */
+  filled?: ReadonlySet<number>;
+  /** The frames' contents, by their frame element's backendDOMNodeId; a frame not here isn't read. */
+  frames?: Map<number, FrameContent>;
 }
 
 export interface Snapshot {
@@ -95,24 +108,34 @@ export function needsFieldInfo(role: string): boolean {
   return VALUE_ROLES.has(role);
 }
 
-/** Refs for one document: an element keeps its ref across snapshots until the page navigates. */
+/**
+ * Refs for one page: an element keeps its ref across snapshots until the page navigates. Node ids
+ * are the renderer's, one numbering for the page and its same-origin frames, so a ref also says
+ * which frame its element is in.
+ */
 export class RefTable {
   private byNode = new Map<number, string>();
   private byRef = new Map<string, SnapshotRef>();
   private next = 1;
 
-  refFor(backendNodeId: number, role: string, name: string): string {
+  refFor(backendNodeId: number, role: string, name: string, frameId: string | null = null): string {
     let ref = this.byNode.get(backendNodeId);
     if (ref == null) {
       ref = `e${this.next++}`;
       this.byNode.set(backendNodeId, ref);
     }
-    this.byRef.set(ref, { ref, backendNodeId, role, name });
+    this.byRef.set(ref, { ref, backendNodeId, role, name, frameId });
     return ref;
   }
 
   get(ref: string): SnapshotRef | undefined {
     return this.byRef.get(ref.trim().replace(/^\[?(ref=)?/, "").replace(/\]$/, ""));
+  }
+
+  /** The frame of an element a ref was given to; null for the page's own document (or an element with no ref). */
+  frameOf(backendNodeId: number): string | null {
+    const ref = this.byNode.get(backendNodeId);
+    return ref != null ? (this.byRef.get(ref)?.frameId ?? null) : null;
   }
 
   clear(): void {
@@ -129,8 +152,21 @@ const cut = (text: string, limit: number) => (text.length > limit ? `${text.slic
 const quote = (text: string) => `"${cut(text, NAME_LIMIT).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 const property = (node: AXNode, name: string) => node.properties?.find((entry) => entry.name === name)?.value.value;
 
+/** One accessibility tree: the page's (`frameId` null), or a same-origin frame's. Node ids are per tree. */
+interface Tree {
+  byId: Map<string, AXNode>;
+  frameId: string | null;
+}
+
+const treeOf = (nodes: AXNode[], frameId: string | null): Tree => ({ byId: new Map(nodes.map((node) => [node.nodeId, node])), frameId });
+const topOf = (tree: Tree) => [...tree.byId.values()].find((node) => node.parentId == null || !tree.byId.has(node.parentId));
+const isFrame = (role: string) => role === "Iframe" || role === "IframePresentational";
+
 export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: SnapshotOptions = {}): Snapshot {
-  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+  const page = treeOf(nodes, null);
+  const frames = options.frames ?? new Map<number, FrameContent>();
+  const frameTrees = new Map<string, Tree>();
+  for (const content of frames.values()) if ("nodes" in content) frameTrees.set(content.frameId, treeOf(content.nodes, content.frameId));
   const fields = options.fields ?? new Map<number, FieldInfo>();
   let origin: string | null = null;
   try {
@@ -139,32 +175,34 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
     // no same-site shortening
   }
 
-  let root = nodes.find((node) => node.parentId == null || !byId.has(node.parentId));
+  let root = topOf(page);
+  let rootTree: Tree | undefined = page;
   if (options.rootRef != null) {
     const wanted = refs.get(options.rootRef);
-    root = wanted != null ? nodes.find((node) => node.backendDOMNodeId === wanted.backendNodeId) : undefined;
+    rootTree = wanted?.frameId != null ? frameTrees.get(wanted.frameId) : page;
+    root = wanted != null && rootTree != null ? [...rootTree.byId.values()].find((node) => node.backendDOMNodeId === wanted.backendNodeId) : undefined;
     if (root == null) throw new Error(`${options.rootRef} isn't on the page now. Take a new snapshot (browser_snapshot) to get current refs.`);
   }
-  if (root == null) return { text: "(the page is empty)", truncated: false, lines: 0 };
+  if (root == null || rootTree == null) return { text: "(the page is empty)", truncated: false, lines: 0 };
 
-  const children = (node: AXNode): Item[] => (node.childIds ?? []).flatMap((id) => build(byId.get(id)));
-  const descendants = (node: AXNode, role: string): AXNode[] =>
+  const children = (node: AXNode, tree: Tree): Item[] => (node.childIds ?? []).flatMap((id) => build(tree.byId.get(id), tree));
+  const descendants = (node: AXNode, role: string, tree: Tree): AXNode[] =>
     (node.childIds ?? []).flatMap((id) => {
-      const child = byId.get(id);
+      const child = tree.byId.get(id);
       if (child == null) return [];
-      return child.role?.value === role && child.ignored !== true ? [child] : descendants(child, role);
+      return child.role?.value === role && child.ignored !== true ? [child] : descendants(child, role, tree);
     });
 
-  const build = (node: AXNode | undefined): Item[] => {
+  const build = (node: AXNode | undefined, tree: Tree): Item[] => {
     if (node == null) return [];
     const role = String(node.role?.value ?? "");
     if (SKIPPED.has(role)) return [];
-    if (node.ignored === true) return children(node);
+    if (node.ignored === true) return children(node, tree);
     const name = clean(node.name?.value);
     if (role === "StaticText") return name.length > 0 ? [{ kind: "text", text: String(node.name?.value ?? "") }] : [];
-    // The page's title is on the wrapper around the snapshot.
-    if (role === "RootWebArea") return children(node);
-    if (TRANSPARENT.has(role) && name.length === 0) return children(node);
+    // The page's title is on the wrapper around the snapshot; a frame's document reads in its frame's place.
+    if (role === "RootWebArea") return children(node, tree);
+    if (TRANSPARENT.has(role) && name.length === 0) return children(node, tree);
     if (role === "image" && name.length === 0) return [];
 
     const backendNodeId = node.backendDOMNodeId;
@@ -192,15 +230,24 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
       const secret = sensitiveField({ inputType: field?.inputType ?? "", autocomplete: field?.autocomplete ?? "", fieldName: field?.fieldName ?? "", name });
       // A masked value (•••) still tells its length; secrets show as their kind only.
       if (secret != null) attrs.push(secret === "password" ? "password" : secret);
-      else value = cut(clean(node.value?.value), TEXT_LIMIT);
+      if (backendNodeId != null && options.filled?.has(backendNodeId) === true) attrs.push("filled from your vault");
+      else if (secret == null) value = cut(clean(node.value?.value), TEXT_LIMIT);
       if (field?.tag === "select" || role === "combobox") {
-        const options = descendants(node, "option").map((option) => clean(option.name?.value)).filter((text) => text.length > 0);
+        const options = descendants(node, "option", tree).map((option) => clean(option.name?.value)).filter((text) => text.length > 0);
         if (options.length > 0) attrs.push(`options: ${options.slice(0, 25).map((text) => quote(cut(text, 60))).join(", ")}${options.length > 25 ? `, … ${options.length - 25} more` : ""}`);
       }
     }
-    if (role === "Iframe" || role === "IframePresentational") attrs.push("its contents aren't read");
+    // A frame reads from its own tree when it's the page's origin; otherwise only its name shows.
+    let frame: { tree: Tree; root: AXNode } | null = null;
+    if (isFrame(role)) {
+      const content = backendNodeId != null ? frames.get(backendNodeId) : undefined;
+      const inside = content != null && "nodes" in content ? frameTrees.get(content.frameId) : undefined;
+      const top = inside != null ? topOf(inside) : undefined;
+      if (inside != null && top != null) frame = { tree: inside, root: top };
+      else attrs.push(content != null && "unread" in content ? content.unread : "its contents aren't read");
+    }
 
-    const ref = backendNodeId != null && (INTERACTIVE.has(role) || REGIONS.has(role)) ? refs.refFor(backendNodeId, label, name) : null;
+    const ref = backendNodeId != null && (INTERACTIVE.has(role) || REGIONS.has(role)) ? refs.refFor(backendNodeId, label, name, tree.frameId) : null;
     let href = "";
     if (role === "link") {
       const url = String(property(node, "url") ?? "");
@@ -216,7 +263,7 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
       }
     }
 
-    let inner = VALUE_ROLES.has(role) ? [] : children(node);
+    let inner = VALUE_ROLES.has(role) ? [] : isFrame(role) ? (frame != null ? build(frame.root, frame.tree) : []) : children(node, tree);
     const innerText = inner.every((item) => item.kind === "text") ? clean(inner.map((item) => (item.kind === "text" ? item.text : "")).join("")) : null;
     // A button or link that just says its name, and a paragraph that's only text, go on one line.
     let inline: string | null = null;
@@ -246,7 +293,7 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
     });
   };
 
-  const items = tidy(build(root));
+  const items = tidy(build(root, rootTree));
   const limit = options.maxChars ?? SNAPSHOT_MAX_CHARS;
   const out: string[] = [];
   let size = 0;

@@ -1,4 +1,4 @@
-// Settings: General, Box, Models, Cloud computer, Permissions, MCP servers, About.
+// Settings: General, Box, Models, Cloud computer, Permissions, Vault (VaultSettings.tsx), MCP servers, About.
 import { useEffect, useState, type ReactNode } from "react";
 import { siteLabel } from "../../shared/agent-browser";
 import type { AppInfo, BoxLocationState, BoxServerStatus, NotificationPreferences, ThemeState, UpdateStatus } from "../../shared/edges";
@@ -22,6 +22,7 @@ import { useStore } from "../store/store";
 import { AddMcpServer, MCP_STATUS, McpSignIn, McpToolList, serverLabel } from "./ConnectApps";
 import { Icon } from "./icons";
 import { ModelPicker } from "./ModelPicker";
+import { VaultSettings } from "./VaultSettings";
 
 const SECTIONS: Array<{ id: SettingsSection; label: string }> = [
   { id: "general", label: "General" },
@@ -29,6 +30,7 @@ const SECTIONS: Array<{ id: SettingsSection; label: string }> = [
   { id: "model", label: "Models" },
   { id: "cloud", label: "Cloud computer" },
   { id: "permissions", label: "Permissions" },
+  { id: "vault", label: "Vault" },
   { id: "mcp", label: "MCP servers" },
   { id: "about", label: "About" },
 ];
@@ -48,7 +50,7 @@ export function SettingsView() {
         ))}
       </nav>
       <div className="settings__content">
-        {section === "general" ? <General /> : section === "box" ? <Box /> : section === "model" ? <Models /> : section === "cloud" ? <Cloud /> : section === "permissions" ? <Permissions /> : section === "mcp" ? <Mcp /> : <About />}
+        {section === "general" ? <General /> : section === "box" ? <Box /> : section === "model" ? <Models /> : section === "cloud" ? <Cloud /> : section === "permissions" ? <Permissions /> : section === "vault" ? <VaultSettings /> : section === "mcp" ? <Mcp /> : <About />}
       </div>
     </section>
   );

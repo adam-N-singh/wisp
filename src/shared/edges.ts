@@ -6,8 +6,9 @@ import { BROWSER_TOOL_NAMES, type BrowserPlanInfo, type BrowserRunReply } from "
 import { type BotMarketplace, botTemplateInclude, botTemplateSchema, type BotTemplateFile, type BotTemplateView, type CreateAgentFromTemplateResult, type FetchedBotTemplate, shareIdSchema } from "./bot-template";
 import { defineEdge, event, method } from "./rpc/edge";
 import type { PermissionAsk } from "./gateway-protocol";
-import { DOCUMENT_ID_PATTERN, type DocumentEditRight, type LibraryPage, MAX_PAGE_SOURCE, type PageChangedEvent, type PageDocument, type PageRevisionInfo } from "./pages";
+import { CANVAS_ID_PATTERN, DOCUMENT_ID_PATTERN, type DocumentEditRight, type LibraryPage, MAX_PAGE_SOURCE, type PageChangedEvent, type PageDocument, type PageRevisionInfo } from "./pages";
 import type { EffectivePlugin, MarketplaceView, McpRemoveResult, PluginSkillInfo, PluginSyncStatus, PluginUpdate, SkillCatalogEntry } from "./marketplace";
+import { VAULT_FILL_KEYS, type VaultFillReply, type VaultImportResult, type VaultItemDraft, type VaultListReply, type VaultPlanInfo, type VaultView } from "./vault";
 import {
   AVATAR_COLORS,
   AVATAR_SHAPES,
@@ -29,6 +30,7 @@ import {
   type ConversationOutlineEvent,
   type ConversationOutlineItem,
   type HostStatus,
+  isSessionId,
   type LocalToolInfo,
   type McpCatalogEntry,
   type McpState,
@@ -57,6 +59,8 @@ const agentId = z.string().min(1).max(200);
 /** An agent's conversation now; a subagent's has an id of its own. */
 const conversationId = z.string().min(1).max(200);
 const entryId = z.string().min(1).max(200);
+/** One of an agent's conversations: "" (or none) is its main one, `group:<roomId>` a group chat's (model.ts). */
+const sessionId = z.string().max(320).refine(isSessionId, { message: "Not a session id." });
 const mcpServerId = z.string().min(1).max(200);
 const mcpAccountKey = z.string().max(40);
 const providerId = z.enum(PROVIDER_IDS);
@@ -103,7 +107,12 @@ const permissionAsk = z.object({
     .optional(),
 });
 /** A document in an agent's store (src/shared/pages.ts). */
-const pageLocator = z.object({ storeId: agentId, documentId: z.string().regex(DOCUMENT_ID_PATTERN) });
+const documentLocator = z.object({ storeId: agentId, documentId: z.string().regex(DOCUMENT_ID_PATTERN) });
+const canvasId = z.string().regex(CANVAS_ID_PATTERN);
+/** A canvas in an agent's store. */
+const canvasLocator = z.object({ storeId: agentId, canvasId });
+/** Either kind of page, for what works on both. */
+const pageLocator = z.union([documentLocator, canvasLocator]);
 const pageRevision = z.number().int().min(1);
 const agentProfile = z.object({
   name: z.string().min(1).max(80),
@@ -324,8 +333,14 @@ export const mainEdge = defineEdge("main", {
     openBotTemplateFile: method<FetchedBotTemplate | null>().noArgs,
     /** Writes a template where the user picks; the path, or null when they cancel. */
     saveBotTemplateFile: method<string | null>().args(z.object({ template: botTemplateSchema })),
-    /** Writes a document's Markdown to a .md file where the user picks (Save as Markdown); the path, or null when they cancel. */
-    savePageFile: method<string | null>().args(z.object({ title: z.string().max(400), source: z.string().max(MAX_PAGE_SOURCE + 1024) })),
+    /** Writes a document's Markdown to a .md file (or a canvas's HTML to an .html file) where the user picks; the path, or null when they cancel. */
+    savePageFile: method<string | null>().args(z.object({ title: z.string().max(400), source: z.string().max(MAX_PAGE_SOURCE + 1024), kind: z.enum(["document", "canvas"]).optional() })),
+    /**
+     * A link a canvas frame asked to open (its `window.open`, or a click on a link): opened in the
+     * browser or the system's handler only for http, https, mailto and tel, while a canvas is on the
+     * page, and within a second of a real click or key press. Whether it opened.
+     */
+    openLinkFromCanvas: method<boolean>().args(z.object({ url: z.string().max(8192) })),
 
     getMountState: method<MountState>().noArgs,
     mountAgent: method<MountState>().args(z.object({ agentId })),
@@ -335,6 +350,24 @@ export const mainEdge = defineEdge("main", {
     getAgentBrowser: method<AgentBrowserState>().args(z.object({ agentId })),
     /** Brings the agent's browser window up, opening an empty one (to sign in to sites ahead) if it has none. */
     showAgentBrowser: method<AgentBrowserState>().args(z.object({ agentId })),
+
+    /** The vault on this PC (Settings → Vault, src/main/vault.ts): items without values, and the audit log's state. */
+    readVault: method<VaultView>().noArgs,
+    /** An item for its edit form: every value but the password, which never leaves main. */
+    readVaultItem: method<VaultItemDraft>().args(z.object({ id: z.string().min(1).max(100) })),
+    /** Adds an item (no id) or changes one; an empty password keeps the saved one. */
+    saveVaultItem: method<VaultView>().args(
+      z.object({
+        id: z.string().min(1).max(100).nullable(),
+        kind: z.enum(["login", "contact"]),
+        title: z.string().max(200),
+        site: z.string().max(2048),
+        values: z.record(z.string().max(40), z.string().max(10_000)),
+      }),
+    ),
+    deleteVaultItem: method<VaultView>().args(z.object({ id: z.string().min(1).max(100) })),
+    /** Imports a Chrome, Edge or Firefox password export the user picks (read on this PC); null when they cancel. */
+    importVaultCsv: method<VaultImportResult | null>().noArgs,
   },
   events: {
     "theme-updated": event<ThemeState>(),
@@ -346,6 +379,7 @@ export const mainEdge = defineEdge("main", {
     "box-location-changed": event<BoxLocationState>(),
     "agent-browser-changed": event<AgentBrowserState>(),
     "update-status-changed": event<UpdateStatus>(),
+    "vault-changed": event<VaultView>(),
   },
 });
 
@@ -374,6 +408,8 @@ export const sendPromptArgs = z.object({
   /** A reply: the entry it answers and the text it quotes from it. */
   replyToId: entryId.optional(),
   replyQuote: z.string().max(4000).optional(),
+  /** The session it goes to; the agent's main one without. */
+  sessionId: sessionId.optional(),
 });
 export type SendPromptArgs = z.infer<typeof sendPromptArgs>;
 
@@ -411,22 +447,41 @@ export const gatewayEdge = defineEdge("gateway", {
         memoryReview: z.boolean().optional(),
       }),
     ),
+    /**
+     * A group chat of bots (two to eight): a roster row with `isGroup` and `memberIds` whose
+     * conversation the members take turns in. An empty name is made from the members'.
+     * People can't join (`humanMemberUserIds` is refused), and every route is the box's.
+     */
+    makeGroupChat: method<{ agent: AgentSummary; transcript: TranscriptEntry[] }>().args(
+      z.object({
+        name: z.string().trim().max(80),
+        description: z.string().max(2000).optional(),
+        memberAgentIds: z.array(agentId).max(50),
+        humanMemberUserIds: z.array(z.number()).max(50).optional(),
+        namedBy: z.enum(["app", "user"]).nullable().optional(),
+        creationRoute: z.object({ kind: z.literal("box") }).optional(),
+        clientNonce: z.string().max(100).optional(),
+      }),
+    ),
+    /** The group chat's bots now; those who leave stop their turn. Deleting a group chat never deletes its members. */
+    changeGroupMembers: method<AgentSummary | null>().args(z.object({ id: agentId, memberAgentIds: z.array(agentId).max(50), requesterAgentId: agentId.optional() })),
     removeAgents: method<{ transcript: TranscriptEntry[]; failedAgentIds?: string[] }>().args(z.object({ ids: z.array(agentId).min(1) })),
     copyAgent: method<{ agent: AgentSummary; transcript: TranscriptEntry[] }>().args(z.object({ id: agentId })),
     markAgentUnread: method<null>().args(z.object({ id: agentId, isUnread: z.boolean(), atMs: z.number().optional() })),
     changeAgentHidden: method<null>().args(z.object({ id: agentId, isHidden: z.boolean() })),
     changeAgentNotifications: method<null>().args(z.object({ id: agentId, isEnabled: z.boolean() })),
 
-    followTranscript: method<TranscriptPage>().args(z.object({ id: agentId, limit: z.number().int().min(1).max(500), unreadBoundaryAt: z.number().optional() })),
-    readTranscriptEnd: method<TranscriptPage>().args(z.object({ id: agentId, beforeSeq: z.number().int().optional(), limit: z.number().int().min(1).max(500) })),
+    // `sessionId` names one of the agent's conversations; without it, the main one.
+    followTranscript: method<TranscriptPage>().args(z.object({ id: agentId, limit: z.number().int().min(1).max(500), unreadBoundaryAt: z.number().optional(), sessionId: sessionId.optional() })),
+    readTranscriptEnd: method<TranscriptPage>().args(z.object({ id: agentId, beforeSeq: z.number().int().optional(), limit: z.number().int().min(1).max(500), sessionId: sessionId.optional() })),
     deliverMessage: method<{ accepted?: boolean | null } | null>().args(sendPromptArgs),
-    stopAgentRun: method<{ hadActiveRun: boolean }>().args(z.object({ id: agentId })),
-    resetConversation: method<null>().args(z.object({ id: agentId })),
-    answerCard: method<{ accepted: boolean } | null>().args(z.object({ agentId, entryId, value: z.string().max(20000) })),
-    closeCard: method<{ accepted: boolean }>().args(z.object({ agentId, entryId })),
-    answerToolApproval: method<null>().args(z.object({ agentId, entryId, requestId: z.string().min(1), resolution: permissionResolution })),
+    stopAgentRun: method<{ hadActiveRun: boolean }>().args(z.object({ id: agentId, sessionId: sessionId.optional() })),
+    resetConversation: method<null>().args(z.object({ id: agentId, sessionId: sessionId.optional() })),
+    answerCard: method<{ accepted: boolean } | null>().args(z.object({ agentId, entryId, value: z.string().max(20000), sessionId: sessionId.optional() })),
+    closeCard: method<{ accepted: boolean }>().args(z.object({ agentId, entryId, sessionId: sessionId.optional() })),
+    answerToolApproval: method<null>().args(z.object({ agentId, entryId, requestId: z.string().min(1), resolution: permissionResolution, sessionId: sessionId.optional() })),
     /** Adds the emoji to a message, or takes it back if the user already put it there; replicas get the entry as `updated`. */
-    setReaction: method<null>().args(z.object({ agentId, entryId, emoji: z.string().min(1).max(64), sessionId: z.string().max(200).optional() })),
+    setReaction: method<null>().args(z.object({ agentId, entryId, emoji: z.string().min(1).max(64), sessionId: sessionId.optional() })),
     /**
      * Good ("up") or Bad ("down") on an assistant reply; Bad then waits for "submit" with its reasons
      * (FEEDBACK_CATEGORIES) and an optional comment; "revert" takes the vote back.
@@ -438,7 +493,7 @@ export const gatewayEdge = defineEdge("gateway", {
         action: z.enum(["up", "down", "submit", "revert"]),
         categories: z.array(z.string().max(100)).max(10).optional(),
         comment: z.string().max(4000).optional(),
-        sessionId: z.string().max(200).optional(),
+        sessionId: sessionId.optional(),
       }),
     ),
     /** One agent's messages that contain the query, newest first; `beforeSeq` pages back past the last match returned. */
@@ -455,7 +510,8 @@ export const gatewayEdge = defineEdge("gateway", {
     /** A tool call's arguments and output, which outline items leave out; `entryId` is the item's id. */
     getToolCallDetail: method<ToolCallDetail | null>().args(z.object({ id: conversationId, entryId })),
 
-    readAgentTodos: method<AgentTodo[]>().args(z.object({ id: agentId })),
+    /** `sessionId` gives another session's (each keeps its own). */
+    readAgentTodos: method<AgentTodo[]>().args(z.object({ id: agentId, sessionId: sessionId.optional() })),
     /** The agent's background work that is still running ("Async tasks"); "background-work" events keep it live. */
     readAsyncTasks: method<AsyncTaskInfo[]>().args(z.object({ id: agentId })),
     /** Stops one of them (a background command, with every process it started). */
@@ -583,6 +639,16 @@ export const gatewayEdge = defineEdge("gateway", {
      */
     getPluginUpdate: method<PluginUpdate>().args(z.object({ pluginId })),
     dropPlugin: method<McpRemoveResult>().args(z.object({ pluginId })),
+    /**
+     * Turns an installed plugin off (its servers stop and agents don't get its skills; its
+     * values, its servers' settings and sign-ins stay) or back on. `listInstalledPlugins` says which.
+     */
+    setMcpPluginEnabled: method<McpState>().args(z.object({ pluginId, enabled: z.boolean() })),
+    /**
+     * Uninstalls plugins a marketplace with `forceRemoveDeletedPlugins` no longer lists, once
+     * the user confirmed them (`removedPlugins` on its view); others stay.
+     */
+    removeDeletedPlugins: method<MarketplaceView[]>().args(z.object({ id: marketplaceName, pluginIds: z.array(pluginId).max(500) })),
     /** A plugin's skill as one of the agent's own, to change it. */
     copyPluginSkill: method<SkillImportEvent>().args(z.object({ id: agentId, skillId })),
 
@@ -609,17 +675,25 @@ export const gatewayEdge = defineEdge("gateway", {
      * newest revision's Markdown, or an older one the page keeps. A document is read-only to
      * the user only while the agent's run is writing it.
      */
-    readPage: method<PageDocument>().args(z.object({ locator: pageLocator, groupChatId: z.string().max(200).optional(), revision: pageRevision.optional() })),
+    readPage: method<PageDocument>().args(z.object({ locator: documentLocator, groupChatId: z.string().max(200).optional(), revision: pageRevision.optional() })),
+    /** A canvas's too (a canvas the agent's run is writing can't be restored or deleted). */
     pageEditAccess: method<DocumentEditRight>().args(z.object({ locator: pageLocator })),
     /** The user's text, made on `baseRevision`: 409 "page/stale" when the page has moved on, "page/agent-writing" while the agent writes it. */
-    writePage: method<PageDocument>().args(z.object({ locator: pageLocator, source: z.string().max(MAX_PAGE_SOURCE + 1024), baseRevision: pageRevision })),
-    /** Every agent's pages, newest first (documents only while `includeDocuments`: there are no canvases yet). */
-    libraryPages: method<LibraryPage[]>().args(z.object({ includeDocuments: z.boolean() })),
+    writePage: method<PageDocument>().args(z.object({ locator: documentLocator, source: z.string().max(MAX_PAGE_SOURCE + 1024), baseRevision: pageRevision })),
+    /**
+     * A canvas (write_canvas) and one revision's HTML, the newest unless another is asked for.
+     * Its frame comes from main's `wisp-canvas://`, which reads the box's GET /pages/<agentId>/<canvasId>.
+     */
+    canvasPage: method<PageDocument>().args(z.object({ locator: canvasLocator, revision: pageRevision.optional() })),
+    /** The user's title for a canvas; it adds no revision. */
+    retitleCanvas: method<{ title: string }>().args(z.object({ storeId: agentId, canvasId, title: z.string().max(1000) })),
+    /** Every agent's pages, newest first: canvases, and documents while `includeDocuments`; one agent's with `agentId`. */
+    libraryPages: method<LibraryPage[]>().args(z.object({ includeDocuments: z.boolean(), agentId: agentId.optional() })),
     /** One agent's documents, newest first. */
     libraryDocuments: method<LibraryPage[]>().args(z.object({ agentId })),
     /** The revisions a page keeps, newest first. */
     listPageRevisions: method<PageRevisionInfo[]>().args(z.object({ locator: pageLocator })),
-    /** An older revision's text, again, as the user's newest revision. */
+    /** An older revision's text (a canvas's HTML), again, as the user's newest revision. */
     restorePageRevision: method<PageDocument>().args(z.object({ locator: pageLocator, revision: pageRevision, baseRevision: pageRevision })),
     /** Deletes the page and its revisions; its card stays, marked deleted. */
     deletePage: method<null>().args(z.object({ locator: pageLocator })),
@@ -631,7 +705,8 @@ export const gatewayEdge = defineEdge("gateway", {
     "agent-deleted": event<{ ids: string[] }>(),
     transcript: event<TranscriptEvent>(),
     outline: event<ConversationOutlineEvent>(),
-    todos: event<{ agentId: string; todos: AgentTodo[] }>(),
+    /** `sessionId` when they're a session's other than the main one. */
+    todos: event<{ agentId: string; sessionId?: string; todos: AgentTodo[] }>(),
     "background-work": event<AsyncTasksEvent>(),
     automations: event<{ agentId: string; automations: Automation[] }>(),
     skills: event<{ agentId: string; skills: Skill[] }>(),
@@ -821,6 +896,14 @@ export const boxAdminEdge = defineEdge("box-admin", {
 // ---------------------------------------------------------------------------
 // local-exec daemon -> main (host capabilities that need Electron APIs)
 
+const vaultFillArgs = z.object({
+  agentId,
+  itemId: z.string().min(1).max(100),
+  /** Fill key → ref; main checks the keys against the item's kind. */
+  fields: z.record(z.string().max(40), z.string().max(100)).refine((fields) => Object.keys(fields).length <= VAULT_FILL_KEYS.length, { message: "Too many fields." }),
+  submit: z.boolean(),
+});
+
 export const localHostEdge = defineEdge("local-host", {
   methods: {
     gatewayAddress: method<GatewayConnectionInfo>().noArgs,
@@ -846,6 +929,17 @@ export const localHostEdge = defineEdge("local-host", {
     ),
     /** The daemon gave up on that call (the agent was interrupted). */
     browserCancel: method<void>().args(z.object({ callId: z.string().min(1).max(100) })),
+    /** vault_list (src/main/vault.ts): labels and sites, never a value. */
+    vaultList: method<VaultListReply>().args(z.object({ agentId })),
+    /** What request_credential would fill where, read from the page and the vault, for the policy and the card. */
+    vaultPlan: method<VaultPlanInfo>().args(vaultFillArgs),
+    /**
+     * Fills, once the user allowed it. Main checks the page is still on `expectSite` and that
+     * `approvalId` is an Allow once given on this PC for this item on this site, and spends it.
+     */
+    vaultFill: method<VaultFillReply>().args(
+      vaultFillArgs.extend({ expectSite: z.string().max(2048).nullable(), approvalId: requestId.nullable(), callId: z.string().min(1).max(100) }),
+    ),
   },
   events: {
     "permissions-changed": event<Record<string, ToolPermission>>(),

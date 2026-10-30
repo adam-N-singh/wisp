@@ -5,10 +5,13 @@
 //
 // A document renders through the chat's own Markdown, so it reads as the agent's replies do. Edit
 // shows its Markdown source beside a live preview (one or the other when the stage is narrow).
-// Saves name the revision the edits were made on (store/pages.ts).
-import { type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useDeferredValue, useEffect, useLayoutEffect, useRef, useState } from "react";
+// Saves name the revision the edits were made on (store/pages.ts). Changes shows what the revision
+// on the stage changed: a line diff against the kept revision before it, unchanged runs folded. A
+// canvas runs in its own frame (CanvasStage.tsx).
+import { type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { foldUnchanged, lineDiff } from "../../shared/line-diff";
 import type { AgentSummary } from "../../shared/model";
-import { MAX_PAGE_SOURCE, type PageDocument, type PageRevisionInfo } from "../../shared/pages";
+import { MAX_PAGE_SOURCE, type PageDocument, pageKindOf, type PageRevisionInfo } from "../../shared/pages";
 import { gateway, main } from "../bridge";
 import {
   CHAT_MIN_WIDTH,
@@ -29,15 +32,22 @@ import {
   stage,
   stageLayout,
 } from "../store/pages";
+import { getAgent, roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { Menu } from "./AgentMenu";
+import { CanvasStage } from "./CanvasStage";
 import { Icon } from "./icons";
 import { Markdown } from "./Markdown";
 import { ThreadView } from "./ThreadView";
 import { timestampLabel } from "./time";
 
-/** The companion chat beside the page; below twice the chat's least width the page takes the stage. */
+/**
+ * The companion chat beside the page; below twice the chat's least width the page takes the stage.
+ * In a group chat the page is a member's: the chat is the room's, and the page says who wrote it.
+ */
 export function PageWorkspace({ agent, open }: { agent: AgentSummary; open: OpenPage }) {
+  useStore(roster); // the writer's name
+  const writer = open.agentId === agent.id ? agent : (getAgent(open.agentId) ?? agent);
   const container = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const chatWidth = useStore(stageLayout, (state) => state.chatWidth);
@@ -101,7 +111,11 @@ export function PageWorkspace({ agent, open }: { agent: AgentSummary; open: Open
         />
       ) : null}
       <div className={`page-workspace__page${narrow && showChat ? " page-workspace__pane--away" : ""}`}>
-        <PageStage key={pageKey(open.agentId, open.documentId)} agent={agent} open={open} narrow={narrow} />
+        {pageKindOf(open.pageId) === "canvas" ? (
+          <CanvasStage key={pageKey(open.agentId, open.pageId)} agent={writer} open={open} narrow={narrow} />
+        ) : (
+          <PageStage key={pageKey(open.agentId, open.pageId)} agent={writer} open={open} narrow={narrow} />
+        )}
       </div>
     </div>
   );
@@ -110,7 +124,8 @@ export function PageWorkspace({ agent, open }: { agent: AgentSummary; open: Open
 const whoWrote = (doc: Pick<PageDocument, "updatedBy">, agent: AgentSummary) => (doc.updatedBy === "user" ? "Edited by you" : `Written by ${agent.name}`);
 
 function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPage; narrow: boolean }) {
-  const key = pageKey(open.agentId, open.documentId);
+  const documentId = open.pageId;
+  const key = pageKey(open.agentId, documentId);
   const loaded = useStore(documents, (state) => state[key]);
   const draft = useStore(drafts, (state) => state[key]);
   const editing = useStore(stage, (state) => state.editing);
@@ -128,14 +143,14 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   useEffect(() => {
     if (viewing == null) return setOlder(null);
     let cancelled = false;
-    void gateway.readPage({ locator: { storeId: open.agentId, documentId: open.documentId }, revision: viewing }).then(
+    void gateway.readPage({ locator: { storeId: open.agentId, documentId }, revision: viewing }).then(
       (doc) => !cancelled && setOlder(doc),
       () => !cancelled && setStage({ viewing: null }),
     );
     return () => {
       cancelled = true;
     };
-  }, [viewing, open.agentId, open.documentId]);
+  }, [viewing, open.agentId, documentId]);
   useEffect(() => {
     if (notice?.tone !== "info") return;
     const timer = setTimeout(() => setNotice(null), 3_000);
@@ -145,7 +160,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   const openHistory = async () => {
     if (menu === "history") return setMenu(null);
     try {
-      setRevisions(await gateway.listPageRevisions({ locator: { storeId: open.agentId, documentId: open.documentId } }));
+      setRevisions(await gateway.listPageRevisions({ locator: { storeId: open.agentId, documentId } }));
       setMenu("history");
     } catch (cause) {
       setNotice({ tone: "error", text: cause instanceof Error ? cause.message.replace(/^[\w/-]+: /, "") : String(cause) });
@@ -156,6 +171,26 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   }, []);
 
   const doc = loaded?.doc;
+  // Changes: the revision on the stage beside the kept one before it (a page keeps its last 50).
+  const [showChanges, setShowChanges] = useState(false);
+  const [previous, setPrevious] = useState<PreviousRevision | "loading" | "error">("loading");
+  const shownRevision = older?.sourceRevision ?? doc?.revision ?? null;
+  useEffect(() => {
+    if (!showChanges || shownRevision == null) return;
+    let cancelled = false;
+    const locator = { storeId: open.agentId, documentId };
+    setPrevious("loading");
+    void (async (): Promise<PreviousRevision> => {
+      const before = (await gateway.listPageRevisions({ locator })).filter((revision) => revision.n < shownRevision).sort((a, b) => b.n - a.n)[0];
+      return before == null ? { of: shownRevision, revision: null, source: null } : { of: shownRevision, revision: before, source: (await gateway.readPage({ locator, revision: before.n })).source };
+    })().then(
+      (found) => !cancelled && setPrevious(found),
+      () => !cancelled && setPrevious("error"),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [showChanges, shownRevision, open.agentId, documentId]);
   const close = (
     <button type="button" className="icon-button" aria-label="Close the page" title="Close (Esc)" onClick={closePage}>
       <Icon name="close" />
@@ -176,7 +211,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
         <div className="page-stage__placeholder">
           <p>{loaded.status === "missing" ? "This page was deleted." : `Couldn’t open this page: ${loaded.error ?? "the box didn’t answer"}`}</p>
           {loaded.status === "error" ? (
-            <button type="button" className="button" onClick={() => void loadDocument(open.agentId, open.documentId)}>
+            <button type="button" className="button" onClick={() => void loadDocument(open.agentId, documentId)}>
               Try again
             </button>
           ) : null}
@@ -196,7 +231,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   const save = async () => {
     if (!canSave) return;
     setBusy(true);
-    const error = await saveDraft(open.agentId, open.documentId);
+    const error = await saveDraft(open.agentId, documentId);
     setBusy(false);
     setNotice(error != null ? { tone: "error", text: error } : { tone: "info", text: "Saved" });
   };
@@ -219,7 +254,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   const restore = async () => {
     if (older == null) return;
     setBusy(true);
-    const error = await restorePageRevision(open.agentId, open.documentId, older.sourceRevision, doc.revision);
+    const error = await restorePageRevision(open.agentId, documentId, older.sourceRevision, doc.revision);
     setBusy(false);
     if (error != null) setNotice({ tone: "error", text: error });
     else {
@@ -229,7 +264,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
   };
   const remove = async () => {
     setBusy(true);
-    const error = await deletePage(open.agentId, open.documentId);
+    const error = await deletePage(open.agentId, documentId);
     setBusy(false);
     setConfirmingDelete(false);
     if (error != null) setNotice({ tone: "error", text: error });
@@ -266,6 +301,18 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
           {draft != null && older == null ? (
             <button type="button" className="button button--small button--primary" disabled={!canSave} onClick={() => void save()} title={conflict ? "Reload the page or keep yours first" : "Save (Ctrl+S)"}>
               {busy ? "Saving…" : "Save"}
+            </button>
+          ) : null}
+          {!(editing && older == null) ? (
+            <button
+              type="button"
+              className={`button button--small button--ghost${showChanges ? " button--pressed" : ""}`}
+              aria-pressed={showChanges}
+              disabled={shownRevision == null || shownRevision <= 1}
+              onClick={() => setShowChanges(!showChanges)}
+              title={showChanges ? "Back to the page" : "What this revision changed"}
+            >
+              Changes
             </button>
           ) : null}
           <div className="menu-anchor">
@@ -316,7 +363,7 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
                     role="menuitem"
                     onClick={() => {
                       setMenu(null);
-                      discardDraft(open.agentId, open.documentId);
+                      discardDraft(open.agentId, documentId);
                     }}
                   >
                     <Icon name="refresh" size={14} /> Discard my changes
@@ -355,10 +402,10 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
       {conflict && older == null ? (
         <div className="page-banner page-banner--warn" role="alert">
           <span>Updated by {doc.updatedBy === "agent" ? agent.name : "you, in another window"} while you were editing.</span>
-          <button type="button" className="button button--small" onClick={() => discardDraft(open.agentId, open.documentId)}>
+          <button type="button" className="button button--small" onClick={() => discardDraft(open.agentId, documentId)}>
             Reload
           </button>
-          <button type="button" className="button button--small button--ghost" onClick={() => keepMine(open.agentId, open.documentId)} title="Keep your text; saving it replaces theirs">
+          <button type="button" className="button button--small button--ghost" onClick={() => keepMine(open.agentId, documentId)} title="Keep your text; saving it replaces theirs">
             Keep mine
           </button>
         </div>
@@ -398,7 +445,11 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
         </div>
       ) : null}
       {editing && older == null ? (
-        <PageEditor value={text} readOnly={!canEdit} tooLong={tooLong} onChange={(source) => setDraft(open.agentId, open.documentId, source)} onSave={() => void save()} />
+        <PageEditor value={text} readOnly={!canEdit} tooLong={tooLong} onChange={(source) => setDraft(open.agentId, documentId, source)} onSave={() => void save()} />
+      ) : showChanges && shownRevision != null ? (
+        <div className="page-stage__scroll">
+          <PageChanges agent={agent} revision={shownRevision} source={older?.source ?? doc.source} previous={previous} />
+        </div>
       ) : (
         <div className="page-stage__scroll">
           <article className="page-stage__doc">
@@ -407,6 +458,57 @@ function PageStage({ agent, open, narrow }: { agent: AgentSummary; open: OpenPag
         </div>
       )}
     </section>
+  );
+}
+
+/** The kept revision before revision `of`, with its Markdown; none when `of` is the oldest kept. */
+interface PreviousRevision {
+  of: number;
+  revision: PageRevisionInfo | null;
+  source: string | null;
+}
+
+/** What a revision changed from the kept one before it, line by line, with long unchanged runs folded. */
+function PageChanges({ agent, revision, source, previous }: { agent: AgentSummary; revision: number; source: string; previous: PreviousRevision | "loading" | "error" }) {
+  const ready = previous !== "loading" && previous !== "error" && previous.of === revision ? previous : null;
+  const diff = useMemo(() => (ready?.source != null ? lineDiff(ready.source, source) : null), [ready?.source, source]);
+  if (previous === "error") return <p className="page-stage__placeholder">Couldn’t read the revision before this one.</p>;
+  if (ready == null) return <p className="page-stage__placeholder">Reading the revision before this one…</p>;
+  if (ready.revision == null) return <p className="page-stage__placeholder">{revision === 1 ? "This is the first revision." : "The revisions before this one aren’t kept any more: a page keeps its last 50."}</p>;
+  if (diff == null) return <p className="page-stage__placeholder">The change is too long to compare here.</p>;
+  const added = diff.filter((line) => line.kind === "add").length;
+  const removed = diff.filter((line) => line.kind === "del").length;
+  const plural = (count: number) => `${count} line${count === 1 ? "" : "s"}`;
+  return (
+    <div className="page-changes" aria-label={`What revision ${revision} changed`}>
+      <p className="page-changes__summary">
+        Revision {revision} beside revision {ready.revision.n}, by {ready.revision.by === "user" ? "you" : agent.name}, {timestampLabel(ready.revision.atMs)}:{" "}
+        {added + removed === 0 ? "the text is the same." : `${plural(added)} added, ${plural(removed)} removed.`}
+      </p>
+      {added + removed > 0 ? (
+        <pre className="page-diff">
+          {foldUnchanged(diff).map((row, index) => {
+            if (row.kind === "skip") {
+              return (
+                <span key={index} className="page-diff__skip">
+                  ⋯ {plural(row.count)} unchanged
+                </span>
+              );
+            }
+            // <ins> and <del>, so a screen reader says which lines went and came.
+            const Line = row.kind === "add" ? "ins" : row.kind === "del" ? "del" : "span";
+            return (
+              <Line key={index} className={`page-diff__line page-diff__line--${row.kind}`}>
+                <span className="page-diff__mark" aria-hidden="true">
+                  {row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "}
+                </span>
+                {row.text.length > 0 ? row.text : " "}
+              </Line>
+            );
+          })}
+        </pre>
+      ) : null}
+    </div>
   );
 }
 

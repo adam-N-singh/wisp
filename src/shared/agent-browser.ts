@@ -222,6 +222,20 @@ export function isMovingKey(chord: KeyChord): boolean {
   return MOVING_KEYS.has(chord.key) && (chord.modifiers & ~8) === 0;
 }
 
+/**
+ * What a chord does with the clipboard: copy (Control or Meta with C or Insert), cut (with X, or
+ * Shift+Delete, Windows' cut) or paste (with V, or Shift+Insert); null for anything else.
+ */
+export function clipboardChord(chord: Pick<KeyChord, "key" | "modifiers">): "copy" | "cut" | "paste" | null {
+  const key = chord.key.length === 1 ? chord.key.toLowerCase() : chord.key;
+  const command = (chord.modifiers & 6) !== 0;
+  const shift = (chord.modifiers & 8) !== 0;
+  if (command && (key === "c" || key === "Insert")) return "copy";
+  if ((command && key === "x") || (shift && !command && key === "Delete")) return "cut";
+  if ((command && key === "v") || (shift && !command && key === "Insert")) return "paste";
+  return null;
+}
+
 // ---- untrusted page content -----------------------------------------------------------------
 
 const PAGE_TAG = "untrusted-page-content";

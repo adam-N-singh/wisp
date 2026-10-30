@@ -10,6 +10,8 @@
 //
 // The agent browser's tools (browser-tools.ts) are planned and checked here like
 // the rest, and run by main, which drives the browser (src/main/agent-browser.ts).
+// So are the vault's (vault-tools.ts): main keeps the vault and fills from it, and
+// checks a fill's approval again itself, so no value ever passes through here.
 //
 // The box may be the user's own server rather than a process on this PC, so
 // the daemon tells it which computer it is (OS, folder of the agents'
@@ -137,6 +139,11 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
             run: (call) => host.browserRun(call),
             cancel: (call) => host.browserCancel(call),
           },
+          vault: {
+            list: (call) => host.vaultList(call),
+            plan: (call) => host.vaultPlan(call),
+            fill: (call) => host.vaultFill(call),
+          },
         },
       };
       const run = async (): Promise<ToolResult> => {
@@ -158,6 +165,7 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
       const approval = request.answer == null || resumed ? request.approval : null;
       const changed = !resumed && approval?.requestId != null && approvals.changed(approval.requestId, subject);
       const approved = resumed || (approval != null && (await approvals.confirm({ ...request, approval }, subject)));
+      if (approved && approval?.requestId != null) context.approvalId = approval.requestId;
 
       if (plan == null || verdict == null) {
         result = await run();
@@ -176,6 +184,7 @@ function start(boot: Bootstrap, hostPort: MessagePortMainLike): void {
           action: plan.action,
           target: plan.target,
           title: plan.title,
+          ...(plan.description != null ? { description: plan.description } : {}),
           machineLabel: machine.hostname,
           toolId: permissionId,
           risk: plan.risk,

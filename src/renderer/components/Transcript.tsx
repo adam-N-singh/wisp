@@ -4,15 +4,21 @@
 // A timestamp row opens the conversation and follows a gap of 15 minutes or a new day; scrolled
 // up, a pill offers the way back down, and says so when new messages arrive.
 // Messages have a hover toolbar (MessageActions.tsx). A document the agent wrote is a
-// card that opens it on the page stage (PageCard.tsx).
+// card that opens it on the page stage (PageCard.tsx). In a group chat each member's post shows its
+// name and avatar, and a member's approval or question is answered in that member's session.
 import { type ReactNode, type RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { AgentSummary, EventEntry, InvokedSkill, LocalToolPermissionAsk, MessageEntry, NoticeEntry, SendMessageEntry, ToolCallEntry, TranscriptEntry, UserAttachmentEntry, WebSource } from "../../shared/model";
+import { type AgentSummary, type EventEntry, type InvokedSkill, isSessionRunning, type LocalToolPermissionAsk, type MessageAuthor, type MessageEntry, type NoticeEntry, type SendMessageEntry, type ToolCallEntry, type TranscriptEntry, type UserAttachmentEntry, type WebSource } from "../../shared/model";
+import { VAULT_PERMISSION_ID } from "../../shared/vault";
 import { desktop, gateway, main } from "../bridge";
 import { find } from "../store/find";
+import { allAgents, roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { discardPending, loadOlder, replicaStore, revealEntry, type PendingSend } from "../store/transcripts";
 import { activityText } from "./activity";
+import { AgentAvatar } from "./AgentAvatar";
 import { Avatar } from "./Avatar";
+import { CredentialCard } from "./CredentialCard";
+import { GroupActivity, namesText } from "./GroupChat";
 import { Icon, type IconName } from "./icons";
 import { Markdown } from "./Markdown";
 import { FeedbackReasons, MessageFooter, MessageToolbar, ReplyQuote } from "./MessageActions";
@@ -289,7 +295,11 @@ export function Transcript({ agent }: { agent: AgentSummary }) {
               </div>
             );
           })}
-          {agent.isRunning && !agent.isComposingMessage && agent.awaitingUserResponse == null ? <Working agent={agent} /> : null}
+          {agent.isGroup ? (
+            agent.isRunning && agent.awaitingUserResponse == null ? <GroupActivity room={agent} /> : null
+          ) : isSessionRunning(agent) && !agent.isComposingMessage && agent.awaitingUserResponse == null ? (
+            <Working agent={agent} />
+          ) : null}
         </div>
       </div>
       {unseen > 0 || away ? (
@@ -305,11 +315,31 @@ export function Transcript({ agent }: { agent: AgentSummary }) {
 function Intro({ agent }: { agent: AgentSummary }) {
   return (
     <div className="intro">
-      <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={56} image={agent.avatarDataUrl} />
+      <AgentAvatar agent={agent} size={56} />
       <h2>{agent.name}</h2>
-      {agent.description ? <p>{agent.description}</p> : <p>Send a message to get started.</p>}
+      {agent.isGroup ? (
+        <p>Send a message to the group. @mention a bot to ask only it, or @everyone.</p>
+      ) : agent.description ? (
+        <p>{agent.description}</p>
+      ) : (
+        <p>Send a message to get started.</p>
+      )}
     </div>
   );
+}
+
+/** Who wrote an entry: the conversation's agent, or in a group chat the member it names (as it is now, if it's still around). */
+function useAuthor(from: MessageAuthor | undefined): AgentSummary | null {
+  const state = useStore(roster);
+  if (from == null) return null;
+  return allAgents(state).find((candidate) => candidate.id === from.id) ?? null;
+}
+
+/** A member's avatar beside its post, or the agent's own. */
+function AuthorAvatar({ agent, from }: { agent: AgentSummary; from: MessageAuthor | undefined }) {
+  const member = useAuthor(from);
+  if (from == null) return <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={24} />;
+  return <Avatar shape={member?.avatarShape} color={member?.avatarColor ?? "gray"} size={24} image={member?.avatarDataUrl ?? null} />;
 }
 
 function Working({ agent }: { agent: AgentSummary }) {
@@ -417,8 +447,9 @@ function AssistantMessage({ at, entry }: { at: Surroundings; entry: MessageEntry
   const settled = !entry.isStreaming && entry.content.length > 0;
   return (
     <div className="message message--assistant" ref={container}>
-      <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={24} />
+      <AuthorAvatar agent={agent} from={entry.fromAgent} />
       <div className="message__body">
+        {entry.fromAgent != null ? <span className="message__author">{entry.fromAgent.name}</span> : null}
         {reasoning.length > 0 ? (
           <button type="button" className="reasoning-toggle" onClick={() => setShowReasoning((open) => !open)}>
             <Icon name={showReasoning ? "chevronDown" : "chevronRight"} size={12} />
@@ -636,13 +667,16 @@ function EventView({ entry }: { entry: EventEntry }) {
   const text =
     event.type === "automation-changed"
       ? `${event.action === "ran" ? "Ran" : event.action === "created" ? "Created" : event.action === "deleted" ? "Deleted" : "Updated"} automation “${event.automationName}”`
-      : `Renamed from “${event.from}” to “${event.to}”`;
+      : event.type === "members-changed"
+        ? [event.added.length > 0 ? `${namesText(event.added)} joined` : "", event.removed.length > 0 ? `${namesText(event.removed)} left` : ""].filter(Boolean).join(" · ")
+        : `Renamed from “${event.from}” to “${event.to}”`;
   return <div className="timeline-event">{text}</div>;
 }
 
 function SendMessageView({ at, entry }: { at: Surroundings; entry: SendMessageEntry }) {
   const container = useRef<HTMLDivElement>(null);
   const agent = at.agent;
+  const author = useAuthor(entry.fromAgent);
   const message = entry.message;
   if (message.type === "text") {
     return (
@@ -659,8 +693,9 @@ function SendMessageView({ at, entry }: { at: Surroundings; entry: SendMessageEn
   if (message.type === "visualization") {
     return (
       <div className="message message--assistant" ref={container}>
-        <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={24} />
+        <AuthorAvatar agent={agent} from={entry.fromAgent} />
         <div className="message__body">
+          {entry.fromAgent != null ? <span className="message__author">{entry.fromAgent.name}</span> : null}
           <VisualizationCard message={message} />
           <MessageFooter agentId={agent.id} entry={entry} />
         </div>
@@ -669,19 +704,43 @@ function SendMessageView({ at, entry }: { at: Surroundings; entry: SendMessageEn
     );
   }
   if (message.type === "page") {
+    // In a group chat, the member that wrote the page: it opens beside the room's chat.
     return (
       <div className="message message--assistant" ref={container}>
-        <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={24} />
+        <AuthorAvatar agent={agent} from={entry.fromAgent} />
         <div className="message__body">
-          <PageCard agent={agent} message={message} />
+          {entry.fromAgent != null ? <span className="message__author">{entry.fromAgent.name}</span> : null}
+          <PageCard agent={author ?? agent} message={message} />
           <MessageFooter agentId={agent.id} entry={entry} />
         </div>
         <MessageToolbar agentId={agent.id} entry={entry} role="assistant" text="" quote={message.title} container={container} />
       </div>
     );
   }
-  if (message.type === "local-tool-permission") return <PermissionCard agentId={agent.id} entry={entry} ask={message.ask} />;
-  return <WidgetCard agentId={agent.id} entry={entry} />;
+  // A group chat member's card is answered in that member's session, on its own entry.
+  const target: CardTarget = entry.forwarded != null ? { agentId: entry.forwarded.agentId, entryId: entry.forwarded.entryId, sessionId: entry.forwarded.sessionId } : { agentId: agent.id, entryId: entry.id };
+  let card: ReactNode;
+  if (message.type === "local-tool-permission" && message.ask.toolId === VAULT_PERMISSION_ID) card = <CredentialCard target={target} ask={message.ask} />;
+  else if (message.type === "local-tool-permission") card = <PermissionCard target={target} ask={message.ask} />;
+  else card = <WidgetCard target={target} entry={entry} />;
+  if (entry.fromAgent == null) return card;
+  return (
+    <div className="message message--assistant message--card">
+      <AuthorAvatar agent={agent} from={entry.fromAgent} />
+      <div className="message__body">
+        <span className="message__author">{entry.fromAgent.name} asks</span>
+        {card}
+      </div>
+    </div>
+  );
+}
+
+/** Where a card's answer goes: the entry it's on, in its agent's session. */
+export interface CardTarget {
+  agentId: string;
+  entryId: string;
+  /** Another session than the main one: a group chat member's. */
+  sessionId?: string;
 }
 
 export const ACTION_LABEL: Record<LocalToolPermissionAsk["action"], string> = {
@@ -692,7 +751,7 @@ export const ACTION_LABEL: Record<LocalToolPermissionAsk["action"], string> = {
   "use-app": "Use your computer",
 };
 
-function PermissionCard({ agentId, entry, ask: fromBox }: { agentId: string; entry: SendMessageEntry; ask: LocalToolPermissionAsk }) {
+function PermissionCard({ target, ask: fromBox }: { target: CardTarget; ask: LocalToolPermissionAsk }) {
   const [busy, setBusy] = useState(false);
   // For tools on this PC, show what the local daemon asked, not the box's copy (the box may be a server elsewhere).
   const [onThisPc, setOnThisPc] = useState<Omit<LocalToolPermissionAsk, "requestId" | "status"> | null>(null);
@@ -703,7 +762,7 @@ function PermissionCard({ agentId, entry, ask: fromBox }: { agentId: string; ent
   const resolve = async (resolution: "allow-once" | "always" | "deny" | "never") => {
     setBusy(true);
     try {
-      await gateway.answerToolApproval({ agentId, entryId: entry.id, requestId: ask.requestId, resolution });
+      await gateway.answerToolApproval({ ...target, requestId: ask.requestId, resolution });
     } finally {
       setBusy(false);
     }
@@ -750,12 +809,12 @@ function PermissionCard({ agentId, entry, ask: fromBox }: { agentId: string; ent
   );
 }
 
-function WidgetCard({ agentId, entry }: { agentId: string; entry: SendMessageEntry }) {
+function WidgetCard({ target, entry }: { target: CardTarget; entry: SendMessageEntry }) {
   const [custom, setCustom] = useState("");
   if (entry.message.type !== "widget") return null;
   const widget = entry.message.widget;
   const answered = entry.respondedValue != null || entry.widgetDismissed === true;
-  const respond = (value: string) => void gateway.answerCard({ agentId, entryId: entry.id, value });
+  const respond = (value: string) => void gateway.answerCard({ ...target, value });
   return (
     <div className={`widget-card${answered ? " widget-card--answered" : ""}`}>
       <div className="widget-card__prompt">
@@ -786,7 +845,7 @@ function WidgetCard({ agentId, entry }: { agentId: string; entry: SendMessageEnt
               <button type="submit" className="button">
                 Reply
               </button>
-              <button type="button" className="button button--ghost" onClick={() => void gateway.closeCard({ agentId, entryId: entry.id })}>
+              <button type="button" className="button button--ghost" onClick={() => void gateway.closeCard(target)}>
                 Skip
               </button>
             </form>

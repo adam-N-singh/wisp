@@ -5,8 +5,10 @@
 // round-trips through the server, a tool the server calls runs on this PC
 // (after an approval given here, for a risky one), an attached image is
 // uploaded to the server and shown back here, a background command runs on
-// this PC and is stopped from the Async tasks panel through the server, and
-// the agent browser opens a local test page on this PC for a remote agent.
+// this PC and is stopped from the Async tasks panel through the server, the
+// agent browser opens a local test page on this PC for a remote agent, the vault
+// fills a login there after an approval here, with no value on the server, and a
+// canvas the agent writes on the server runs on this PC's page stage.
 // Usage: node test/e2e/remote-box.mjs   (after `node scripts/build.mjs`)
 import { _electron as electron } from "playwright";
 import { spawn } from "node:child_process";
@@ -16,6 +18,7 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startTestSite, toolOutput } from "./agent-browser-step.mjs";
+import { driveVault, startLoginSite } from "./vault-step.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const userData = mkdtempSync(join(tmpdir(), "wisp-e2e-remote-"));
@@ -223,6 +226,30 @@ try {
     } finally {
       await site.close();
     }
+  });
+
+  await step("the vault fills a login on this PC for the remote agent; the box only relays ids and keeps no value", async () => {
+    const site = await startLoginSite();
+    try {
+      await driveVault({ app, page, send, site, userData, boxDir: boxData, conversation: () => conversation("Remote Wisp"), screenshot: async () => undefined, brief: true });
+    } finally {
+      await site.close();
+    }
+  });
+
+  await step("a canvas the remote agent writes is kept on the box and runs on this PC's stage, read through the box's GET /pages", async () => {
+    const contents = '<!doctype html><title>Remote counter</title><p id="out">none yet</p><button onclick="document.getElementById(\'out\').textContent = \'clicked here\'">Click</button>';
+    await send(`/tool write_canvas ${JSON.stringify({ contents })}`);
+    const card = page.getByRole("button", { name: "Open Remote counter" });
+    await card.waitFor({ timeout: 20_000 });
+    await card.click();
+    const frame = page.frameLocator('iframe[title="Remote counter"]');
+    await frame.getByRole("button", { name: "Click" }).click({ timeout: 15_000 });
+    await frame.getByText("clicked here").waitFor({ timeout: 5_000 });
+    const agentId = (await boxAgents()).find((agent) => agent.name === "Remote Wisp").id;
+    if (!existsSync(join(boxData, "pages", agentId, "index.json"))) throw new Error("the canvas isn't on the box server");
+    if (existsSync(join(userData, "box", "pages", agentId))) throw new Error("the canvas was kept on this PC");
+    await page.getByRole("region", { name: "Page: Remote counter" }).getByRole("button", { name: "Close the page" }).click();
   });
 
   await step("switching back to This PC brings back this PC's agents", async () => {

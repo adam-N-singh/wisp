@@ -5,7 +5,7 @@
 // origin and can reach neither the app nor the network.
 import { readFile } from "node:fs/promises";
 import { type CustomScheme, net, protocol } from "electron";
-import { VISUALIZATION_CSP, visualizationDocument } from "../shared/visualization";
+import { VISUALIZATION_FRAME_CSP, visualizationDocument } from "../shared/visualization";
 import type { AttachmentStore } from "./attachments";
 
 export const VISUALIZATION_SCHEME: CustomScheme = { scheme: "wisp-visualization", privileges: { standard: true, secure: true } };
@@ -34,8 +34,8 @@ export function handleVisualizationProtocol(store: AttachmentStore, remoteBox: (
     return new Response(visualizationDocument(fragment, theme), {
       headers: {
         "content-type": "text/html; charset=utf-8",
-        // Sandboxed however it is opened, not only in the transcript's frame.
-        "content-security-policy": `${VISUALIZATION_CSP}; sandbox allow-scripts`,
+        // Sandboxed however it is opened, not only in the transcript's frame, with Trusted Types.
+        "content-security-policy": VISUALIZATION_FRAME_CSP,
         "x-content-type-options": "nosniff",
         "cache-control": "no-store",
       },

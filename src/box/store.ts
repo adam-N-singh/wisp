@@ -1,8 +1,13 @@
 // Box host persistence. Layout under <dataDir>:
 //   agents.json                      {schemaVersion, agents: AgentSummary[]}
 //   transcripts/<agentId>.jsonl      one JSON object per line: {epoch, entry} upserts (folded by id)
-//                                    or {epoch, cleared: true}
+//                                    or {epoch, cleared: true}: the agent's main session
 //   todos/<agentId>.json             AgentTodo[]
+//   sessions/<agentId>/<session>.jsonl        another session's transcript (`group:<roomId>`, later
+//                                    `task:<id>`), the same way; the file is the id with ":" as "~"
+//   sessions/<agentId>/<session>.todos.json   its todos
+//   sessions/<agentId>/index.json    {schemaVersion, sessions: {sessionId: SessionState}}: what else a
+//                                    session keeps (its Claude Code session)
 //   automations.json                 {schemaVersion, automations: Automation[]}
 //   skills/<agentId>/<skillId>.md    a SKILL.md: `name` and `description` front matter, then the instructions
 //                                    (a .md file added by hand is picked up on the next start)
@@ -12,20 +17,23 @@
 //                                    their versions, which one is published and who may fetch it
 //   templates/<shareId>/v<N>.json    version N of a template: its content as a template file holds it
 //                                    (src/shared/bot-template.ts), without the publishing fields
-//   pages/<agentId>/index.json       {schemaVersion, pages: PageRecord[]}: the documents the agent wrote
-//                                    (src/box/pages.ts): {id, kind, title, createdAt, updatedAt,
-//                                    revisions: [{n, sha256, by: "agent" | "user", atMs}], cardId}, oldest
-//                                    revision first; each revision's Markdown is a file below, by its hash
+//   pages/<agentId>/index.json       {schemaVersion, pages: PageRecord[]}: the documents and canvases the agent
+//                                    wrote (src/box/pages.ts): {id, kind, title, createdAt, updatedAt,
+//                                    revisions: [{n, sha256, by: "agent" | "user", atMs}], cardId, sessionCards?:
+//                                    {sessionId: cardId}}, oldest revision first; each revision's Markdown or HTML
+//                                    is a file below, by its hash
 //   mcp.json                         {schemaVersion, servers: McpServerConfig[], allowedTools: string[]}
 //   marketplaces.json                {schemaVersion, marketplaces: MarketplaceRecord[]}: plugin marketplaces added by link
-//                                    (src/box/marketplace.ts): the repository and branch or the link, and the last refresh's error
+//                                    (src/box/marketplace.ts): the repository and branch or the link, the last refresh's error,
+//                                    and the updates the daily check last found
 //   marketplaces/<id>/index.json     what the last refresh read (MarketplaceIndex): the commit, and each plugin with its files'
 //                                    commit, skills, MCP servers, options and what the box doesn't support
 //   marketplaces/<id>/<snapshot>/plugins/<name>/   each plugin's files at that commit, unpacked from its repository's archive
 //   plugins.json                     {schemaVersion, plugins: InstalledPlugin[]}: installed plugins, each at the commit the user
-//                                    confirmed, with the values it asked for and its MCP servers' ids (src/box/plugins.ts)
+//                                    confirmed, with the values it asked for, its MCP servers' ids and whether it's turned on
+//                                    (src/box/plugins.ts)
 //   plugins/<marketplace>/<plugin>/<commit>/   an installed plugin's files: its skills, and its servers' ${CLAUDE_PLUGIN_ROOT}
-//   plugin-data/<marketplace>/<plugin>/        its servers' ${CLAUDE_PLUGIN_DATA}, kept across updates
+//   plugin-data/<marketplace>/<plugin>/        its servers' ${CLAUDE_PLUGIN_DATA}, kept across updates; only uninstalling deletes it
 //   engine.json                      {schemaVersion, claudeGrants: {agentId: {grantKey: "always" | "never"}}}
 //   cloud.json                       {schemaVersion, sandboxId, kind, createdAt}: the cloud computer
 //   local-machine.json               {schemaVersion, machine: LocalMachine}: the PC local tools last ran on
@@ -33,23 +41,25 @@
 //                                    (async-tasks.ts), running ones and those ended in the last 7 days
 //   attachments/, workspaces/        user attachments and per-agent working folders
 //   attachments/visualizations/<sha256>.html   HTML fragments agents showed (show_visualization), by content
-//   attachments/pages/<sha256>.md    page revisions' Markdown, by content; a file goes when no revision of any
-//                                    agent's pages names it. Pages stay in the box, never in the agent's
-//                                    workspace, which may be on the PC while the box is remote, or in E2B.
+//   attachments/pages/<sha256>.md    document revisions' Markdown, by content, and canvas revisions' HTML as
+//   attachments/pages/<sha256>.html  <sha256>.html; a file goes when no revision of any agent's pages names it.
+//                                    Pages stay in the box, never in the agent's workspace, which may be on
+//                                    the PC while the box is remote, or in E2B.
 //
-// Ordered replicas: each agent's transcript has an epoch (new on clear or box
+// Ordered replicas: each session's transcript has an epoch (new on clear or box
 // restart) and a sequence that advances once per emitted event, so a reader can
 // apply events whose sequence is last+1 and resync from a page otherwise. An
 // entry changed later (a reaction, a vote, a card answered) is upserted again
 // under its id; the newest line for an id wins when the log is read back.
+// Transcript methods take a session id last; without one they mean the main session.
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type BotTemplate, type BotTemplateVersionInfo, readBotTemplate, SHARE_ID_PATTERN } from "../shared/bot-template";
 import type { LocalMachine } from "../shared/gateway-protocol";
 import { isPluginName, parsePluginId } from "../shared/marketplace";
-import type { AgentMemory, AgentSummary, AgentTodo, Automation, McpServerConfig, OrderedStamp, Skill, TranscriptEntry } from "../shared/model";
-import { DOCUMENT_ID_PATTERN, type PageAuthor } from "../shared/pages";
+import { type AgentMemory, type AgentSummary, type AgentTodo, type Automation, isSessionId, MAIN_SESSION, type McpServerConfig, type OrderedStamp, type Skill, type TranscriptEntry, transcriptReplicaKey } from "../shared/model";
+import { type PageAuthor, type PageKind, pageKindOf } from "../shared/pages";
 import { replaceFileSync } from "../shared/replace-file";
 import type { AsyncTaskRecord } from "./async-tasks";
 import { describeCron } from "./cron";
@@ -73,20 +83,32 @@ export interface TemplateRecord {
   versions: BotTemplateVersionInfo[];
 }
 
-/** A page as the box keeps it (src/box/pages.ts); each revision's Markdown is a file of its own, named by its hash. */
+/** A page as the box keeps it (src/box/pages.ts); each revision's Markdown (a canvas's HTML) is a file of its own, named by its hash. */
 export interface PageRecord {
   id: string;
-  kind: "document";
+  kind: PageKind;
   title: string;
   createdAt: number;
   updatedAt: number;
   /** Oldest first: the last is the page as it is now. */
   revisions: Array<{ n: number; sha256: string; by: PageAuthor; atMs: number }>;
-  /** The transcript entry of the page's card, as last posted (a cleared conversation no longer has it). */
+  /** The transcript entry of the page's card in the main session, as last posted (a cleared conversation no longer has it). */
   cardId?: string | null;
+  /** Its cards in the agent's other sessions (a group chat member's), by session id. */
+  sessionCards?: Record<string, string>;
+}
+
+/** What a session other than the main one keeps besides its transcript and todos. */
+export interface SessionState {
+  /** The Claude Code session it continues, and the last user message that has seen (the main session's is on the agent's row). */
+  claudeCodeSession?: { id: string; lastUserSeq: number } | null;
 }
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const PAGE_FILE_PATTERN = /^[0-9a-f]{64}\.(md|html)$/;
+/** A revision's file in attachments/pages: Markdown for a document, HTML for a canvas. */
+const pageFile = (sha256: string, kind: PageKind) => `${sha256}.${kind === "canvas" ? "html" : "md"}`;
+const pageFiles = (page: PageRecord) => page.revisions.map((revision) => pageFile(revision.sha256, page.kind));
 /** A plugin installed from a marketplace, at the commit the user confirmed. */
 export interface InstalledPlugin {
   pluginId: string;
@@ -103,6 +125,10 @@ export interface InstalledPlugin {
   values: Record<string, string>;
   /** Box server id of each of its MCP servers, by the server's name in the plugin. */
   serverIds: Record<string, string>;
+  /** False while the user has it turned off (its servers stopped, its skills hidden); absent means on. */
+  enabled?: boolean;
+  /** Its name before its marketplace renamed it (`renames` in marketplace.json). */
+  renamedFrom?: string;
 }
 
 /** A skill an installed plugin gives every agent: read-only, and never written to an agent's folder. */
@@ -136,7 +162,31 @@ interface Transcript {
   entries: TranscriptEntry[];
   byId: Map<string, number>;
   lineCount: number;
+  /** Its log file. */
+  file: string;
 }
+
+/**
+ * A stored page's cards: the main session's `cardId`, and the others' `sessionCards`. A page saved
+ * before pages had a card per session named one card and the session it was in (`cardSessionId`).
+ */
+function pageCardsOf(page: Partial<PageRecord> & { cardSessionId?: unknown }): Pick<PageRecord, "cardId" | "sessionCards"> {
+  const sessionCards: Record<string, string> = {};
+  for (const [sessionId, cardId] of Object.entries(page.sessionCards ?? {})) {
+    if (sessionId !== MAIN_SESSION && isSessionId(sessionId) && typeof cardId === "string") sessionCards[sessionId] = cardId;
+  }
+  let cardId = typeof page.cardId === "string" ? page.cardId : null;
+  if (typeof page.cardSessionId === "string" && page.cardSessionId !== MAIN_SESSION && isSessionId(page.cardSessionId) && cardId != null) {
+    sessionCards[page.cardSessionId] ??= cardId;
+    cardId = null;
+  }
+  return { cardId, ...(Object.keys(sessionCards).length > 0 ? { sessionCards } : {}) };
+}
+
+/** In-memory key of an agent's session: the agent's id for its main one. */
+const sessionKey = (agentId: string, sessionId: string) => (sessionId === MAIN_SESSION ? agentId : `${agentId}\u0000${sessionId}`);
+/** A session's files are named after its id, with ":" (not allowed in Windows file names) as "~" (not allowed in session ids). */
+const sessionFileName = (sessionId: string) => sessionId.replace(/:/g, "~");
 
 function readJson<T>(path: string, fallback: T): T {
   try {
@@ -206,12 +256,18 @@ export class BoxStore {
   private marketplaceIndexes = new Map<string, MarketplaceIndex | null>();
   /** By plugin id. */
   private plugins = new Map<string, InstalledPlugin>();
+  /**
+   * plugins.json was read at startup and every plugin in it kept, so a plugin's folder that none of
+   * them names is a leftover. False when the file was missing, unreadable or had an entry that
+   * didn't check out: then nothing on disk may be taken for a leftover.
+   */
+  readonly installedPluginsWhole: boolean;
   private pluginSkillList: PluginSkill[] = [];
 
   constructor(readonly dataDir: string) {
     for (const sub of ["transcripts", "todos", "attachments", "workspaces", "skills", "memories", "templates", "pages", "marketplaces", "plugins"]) mkdirSync(join(dataDir, sub), { recursive: true });
     for (const agent of readJson<{ agents?: AgentSummary[] }>(join(dataDir, "agents.json"), {}).agents ?? []) {
-      this.agents.set(agent.id, { ...agent, isRunning: false, isComposingMessage: false, currentActivity: undefined, awaitingUserResponse: null, asyncTaskCount: undefined });
+      this.agents.set(agent.id, { ...agent, isRunning: false, isComposingMessage: false, currentActivity: undefined, awaitingUserResponse: null, asyncTaskCount: undefined, runningSessionIds: undefined, awaitingSessionIds: undefined });
     }
     this.automations = readJson<{ automations?: Automation[] }>(join(dataDir, "automations.json"), {}).automations ?? [];
     for (const agentId of readdirSync(join(dataDir, "skills"))) this.loadSkills(agentId);
@@ -227,10 +283,22 @@ export class BoxStore {
     for (const record of readJson<{ marketplaces?: MarketplaceRecord[] }>(join(dataDir, "marketplaces.json"), {}).marketplaces ?? []) {
       if (typeof record.id === "string" && isPluginName(record.id) && record.source != null) this.marketplaceRecords.set(record.id, record);
     }
-    for (const plugin of readJson<{ plugins?: InstalledPlugin[] }>(join(dataDir, "plugins.json"), {}).plugins ?? []) {
-      const id = typeof plugin.pluginId === "string" ? parsePluginId(plugin.pluginId) : null;
-      if (id != null && id.marketplace === plugin.marketplaceId && id.plugin === plugin.name && /^[\w:]+$/.test(plugin.commit) && plugin.plugin != null) this.plugins.set(plugin.pluginId, plugin);
+    // Read apart from readJson, which can't tell a missing or unreadable file from an empty one: plugins.ts
+    // deletes installed plugins' leftover files only when this list is known whole.
+    let installed: { plugins?: unknown } | null = null;
+    try {
+      const read: unknown = JSON.parse(readFileSync(join(dataDir, "plugins.json"), "utf8"));
+      installed = typeof read === "object" && read !== null && Array.isArray((read as { plugins?: unknown }).plugins) ? read : null;
+    } catch {
+      // missing (no plugin was ever installed) or unreadable: not known whole either way
     }
+    let skipped = 0;
+    for (const plugin of (installed?.plugins as InstalledPlugin[] | undefined) ?? []) {
+      const id = typeof plugin?.pluginId === "string" ? parsePluginId(plugin.pluginId) : null;
+      if (id != null && id.marketplace === plugin.marketplaceId && id.plugin === plugin.name && typeof plugin.commit === "string" && /^[\w:]+$/.test(plugin.commit) && plugin.plugin != null) this.plugins.set(plugin.pluginId, plugin);
+      else skipped++;
+    }
+    this.installedPluginsWhole = installed != null && skipped === 0;
   }
 
   // ---- agents ----------------------------------------------------------------
@@ -254,6 +322,8 @@ export class BoxStore {
     this.transcripts.delete(id);
     rmSync(join(this.dataDir, "transcripts", `${id}.jsonl`), { force: true });
     rmSync(join(this.dataDir, "todos", `${id}.json`), { force: true });
+    for (const key of [...this.transcripts.keys()]) if (key.startsWith(`${id}\u0000`)) this.transcripts.delete(key);
+    if (/^[\w-]+$/.test(id)) rmSync(join(this.dataDir, "sessions", id), { recursive: true, force: true });
     this.automations = this.automations.filter((automation) => automation.agentId !== id);
     this.saveAutomations();
     this.skills.delete(id);
@@ -263,7 +333,7 @@ export class BoxStore {
     const pages = this.pages.get(id) ?? [];
     this.pages.delete(id);
     if (/^[\w-]+$/.test(id)) rmSync(join(this.dataDir, "pages", id), { recursive: true, force: true });
-    this.dropPageSources(pages.flatMap((page) => page.revisions.map((revision) => revision.sha256)));
+    this.dropPageSources(pages.flatMap(pageFiles));
     if (this.claudeGrants[id] != null) {
       delete this.claudeGrants[id];
       this.saveEngine();
@@ -302,17 +372,24 @@ export class BoxStore {
   }
 
   flush(): void {
-    const agents = [...this.agents.values()].map((agent) => ({ ...agent, isRunning: false, isComposingMessage: false, currentActivity: undefined }));
+    const agents = [...this.agents.values()].map((agent) => ({ ...agent, isRunning: false, isComposingMessage: false, currentActivity: undefined, runningSessionIds: undefined, awaitingSessionIds: undefined }));
     writeJsonSync(join(this.dataDir, "agents.json"), { schemaVersion: 1, agents });
   }
 
   // ---- transcripts -------------------------------------------------------------
 
-  private transcript(agentId: string): Transcript {
-    let transcript = this.transcripts.get(agentId);
+  /** A session's folder; its id and the agent's name files, so only plain ones are allowed. */
+  private sessionDir(agentId: string, sessionId: string): string {
+    if (!/^[\w-]+$/.test(agentId) || sessionId === MAIN_SESSION || !isSessionId(sessionId)) throw new Error(`Bad session ${agentId}/${sessionId}`);
+    return join(this.dataDir, "sessions", agentId);
+  }
+
+  private transcript(agentId: string, sessionId: string = MAIN_SESSION): Transcript {
+    const key = sessionKey(agentId, sessionId);
+    let transcript = this.transcripts.get(key);
     if (transcript != null) return transcript;
-    transcript = { epoch: `${this.bootId}:${randomUUID()}`, sequence: 0, entries: [], byId: new Map(), lineCount: 0 };
-    const file = join(this.dataDir, "transcripts", `${agentId}.jsonl`);
+    const file = sessionId === MAIN_SESSION ? join(this.dataDir, "transcripts", `${agentId}.jsonl`) : join(this.sessionDir(agentId, sessionId), `${sessionFileName(sessionId)}.jsonl`);
+    transcript = { epoch: `${this.bootId}:${randomUUID()}`, sequence: 0, entries: [], byId: new Map(), lineCount: 0, file };
     if (existsSync(file)) {
       for (const line of readFileSync(file, "utf8").split("\n")) {
         if (line.trim().length === 0) continue;
@@ -330,7 +407,7 @@ export class BoxStore {
         if (record.entry != null) this.fold(transcript, record.entry);
       }
     }
-    this.transcripts.set(agentId, transcript);
+    this.transcripts.set(key, transcript);
     return transcript;
   }
 
@@ -344,69 +421,116 @@ export class BoxStore {
     }
   }
 
-  entries(agentId: string): TranscriptEntry[] {
-    return this.transcript(agentId).entries;
+  entries(agentId: string, sessionId: string = MAIN_SESSION): TranscriptEntry[] {
+    return this.transcript(agentId, sessionId).entries;
   }
 
-  hasEntry(agentId: string, id: string): boolean {
-    return this.transcript(agentId).byId.has(id);
+  hasEntry(agentId: string, id: string, sessionId: string = MAIN_SESSION): boolean {
+    return this.transcript(agentId, sessionId).byId.has(id);
   }
 
   /** The entry with this id as stored: the same object a run that is still writing it holds. */
-  entry(agentId: string, id: string): TranscriptEntry | undefined {
-    const transcript = this.transcript(agentId);
+  entry(agentId: string, id: string, sessionId: string = MAIN_SESSION): TranscriptEntry | undefined {
+    const transcript = this.transcript(agentId, sessionId);
     const index = transcript.byId.get(id);
     return index == null ? undefined : transcript.entries[index];
   }
 
-  ordered(agentId: string): OrderedStamp {
-    const transcript = this.transcript(agentId);
-    return { replicaKey: `transcript:${agentId}`, epoch: transcript.epoch, sequence: transcript.sequence };
+  ordered(agentId: string, sessionId: string = MAIN_SESSION): OrderedStamp {
+    const transcript = this.transcript(agentId, sessionId);
+    return { replicaKey: transcriptReplicaKey(agentId, sessionId), epoch: transcript.epoch, sequence: transcript.sequence };
   }
 
-  /** Advance the agent's sequence for one emitted event. */
-  stamp(agentId: string): OrderedStamp {
-    this.transcript(agentId).sequence++;
-    return this.ordered(agentId);
+  /** Advance the session's sequence for one emitted event. */
+  stamp(agentId: string, sessionId: string = MAIN_SESSION): OrderedStamp {
+    this.transcript(agentId, sessionId).sequence++;
+    return this.ordered(agentId, sessionId);
   }
 
-  nextSeq(agentId: string): number {
-    const entries = this.transcript(agentId).entries;
+  nextSeq(agentId: string, sessionId: string = MAIN_SESSION): number {
+    const entries = this.transcript(agentId, sessionId).entries;
     return entries.length === 0 ? 1 : entries[entries.length - 1].seq + 1;
   }
 
-  nextTurn(agentId: string): number {
-    const entries = this.transcript(agentId).entries;
+  nextTurn(agentId: string, sessionId: string = MAIN_SESSION): number {
+    const entries = this.transcript(agentId, sessionId).entries;
     return entries.length === 0 ? 1 : Math.max(...entries.slice(-50).map((entry) => entry.turn)) + 1;
   }
 
   /** Upsert in memory; `persist` also appends to the log (streaming partials skip this). */
-  upsertEntry(agentId: string, entry: TranscriptEntry, persist: boolean): void {
-    const transcript = this.transcript(agentId);
+  upsertEntry(agentId: string, entry: TranscriptEntry, persist: boolean, sessionId: string = MAIN_SESSION): void {
+    const transcript = this.transcript(agentId, sessionId);
     this.fold(transcript, entry);
     if (!persist) return;
-    appendFileSync(join(this.dataDir, "transcripts", `${agentId}.jsonl`), `${JSON.stringify({ epoch: transcript.epoch, entry })}\n`);
+    if (sessionId !== MAIN_SESSION) mkdirSync(this.sessionDir(agentId, sessionId), { recursive: true });
+    appendFileSync(transcript.file, `${JSON.stringify({ epoch: transcript.epoch, entry })}\n`);
     transcript.lineCount++;
-    if (transcript.lineCount > 400 && transcript.lineCount > transcript.entries.length * 3) this.compact(agentId, transcript);
+    if (transcript.lineCount > 400 && transcript.lineCount > transcript.entries.length * 3) this.compact(transcript);
   }
 
-  clearTranscript(agentId: string): OrderedStamp {
-    const transcript = this.transcript(agentId);
+  clearTranscript(agentId: string, sessionId: string = MAIN_SESSION): OrderedStamp {
+    const transcript = this.transcript(agentId, sessionId);
     transcript.epoch = `${this.bootId}:${randomUUID()}`;
     transcript.sequence = 0;
     transcript.entries = [];
     transcript.byId.clear();
-    writeFileSync(join(this.dataDir, "transcripts", `${agentId}.jsonl`), `${JSON.stringify({ epoch: transcript.epoch, cleared: true })}\n`);
+    if (sessionId !== MAIN_SESSION) mkdirSync(this.sessionDir(agentId, sessionId), { recursive: true });
+    writeFileSync(transcript.file, `${JSON.stringify({ epoch: transcript.epoch, cleared: true })}\n`);
     transcript.lineCount = 1;
-    return this.ordered(agentId);
+    return this.ordered(agentId, sessionId);
   }
 
-  private compact(agentId: string, transcript: Transcript): void {
-    const file = join(this.dataDir, "transcripts", `${agentId}.jsonl`);
+  private compact(transcript: Transcript): void {
     const lines = [JSON.stringify({ epoch: transcript.epoch, cleared: true }), ...transcript.entries.map((entry) => JSON.stringify({ epoch: transcript.epoch, entry }))];
-    writeFileSync(`${file}.tmp`, `${lines.join("\n")}\n`);
-    replaceFileSync(`${file}.tmp`, file);
+    writeFileSync(`${transcript.file}.tmp`, `${lines.join("\n")}\n`);
+    replaceFileSync(`${transcript.file}.tmp`, transcript.file);
     transcript.lineCount = lines.length;
+  }
+
+  // ---- sessions other than the main one -----------------------------------------------------
+
+  /** The agent's sessions other than the main one that have a transcript, by id. */
+  sessionIds(agentId: string): string[] {
+    if (!/^[\w-]+$/.test(agentId)) return [];
+    let files: string[];
+    try {
+      files = readdirSync(join(this.dataDir, "sessions", agentId));
+    } catch {
+      return [];
+    }
+    return files
+      .filter((name) => name.endsWith(".jsonl"))
+      .map((name) => name.slice(0, -".jsonl".length).replace(/~/g, ":"))
+      .filter((sessionId) => sessionId !== MAIN_SESSION && isSessionId(sessionId))
+      .sort();
+  }
+
+  /** Deletes one of the agent's other sessions: its transcript, todos and state. */
+  deleteSession(agentId: string, sessionId: string): void {
+    const dir = this.sessionDir(agentId, sessionId);
+    this.transcripts.delete(sessionKey(agentId, sessionId));
+    rmSync(join(dir, `${sessionFileName(sessionId)}.jsonl`), { force: true });
+    rmSync(join(dir, `${sessionFileName(sessionId)}.todos.json`), { force: true });
+    const states = this.sessionStates(agentId);
+    if (states[sessionId] != null) {
+      delete states[sessionId];
+      writeJsonSync(join(dir, "index.json"), { schemaVersion: 1, sessions: states });
+    }
+  }
+
+  sessionState(agentId: string, sessionId: string): SessionState {
+    return this.sessionStates(agentId)[sessionId] ?? {};
+  }
+
+  setSessionState(agentId: string, sessionId: string, state: SessionState): void {
+    const dir = this.sessionDir(agentId, sessionId);
+    mkdirSync(dir, { recursive: true });
+    writeJsonSync(join(dir, "index.json"), { schemaVersion: 1, sessions: { ...this.sessionStates(agentId), [sessionId]: state } });
+  }
+
+  private sessionStates(agentId: string): Record<string, SessionState> {
+    if (!/^[\w-]+$/.test(agentId)) return {};
+    return readJson<{ sessions?: Record<string, SessionState> }>(join(this.dataDir, "sessions", agentId, "index.json"), {}).sessions ?? {};
   }
 
   // ---- visualizations ----------------------------------------------------------------
@@ -424,7 +548,7 @@ export class BoxStore {
   }
 
   // ---- pages -------------------------------------------------------------------------
-  // A revision's Markdown is kept under its hash, so revisions that say the same share a file.
+  // A revision's Markdown (a canvas's HTML) is kept under its hash, so revisions that say the same share a file.
 
   /** Most recently changed first. */
   listPages(agentId: string): PageRecord[] {
@@ -435,12 +559,12 @@ export class BoxStore {
     return this.pages.get(agentId)?.find((page) => page.id === id);
   }
 
-  /** Adds the page or replaces it; Markdown its old revisions named and no page names now goes. */
+  /** Adds the page or replaces it; files its old revisions named and no page names now go. */
   putPage(agentId: string, record: PageRecord): PageRecord {
-    if (!/^[\w-]+$/.test(agentId) || !DOCUMENT_ID_PATTERN.test(record.id)) throw new Error(`Bad page id ${agentId}/${record.id}`);
+    if (!/^[\w-]+$/.test(agentId) || pageKindOf(record.id) !== record.kind) throw new Error(`Bad page id ${agentId}/${record.id}`);
     const list = this.pages.get(agentId) ?? [];
     const index = list.findIndex((page) => page.id === record.id);
-    const before = index >= 0 ? list[index].revisions.map((revision) => revision.sha256) : [];
+    const before = index >= 0 ? pageFiles(list[index]) : [];
     if (index < 0) list.push(record);
     else list[index] = record;
     this.pages.set(agentId, list);
@@ -455,14 +579,14 @@ export class BoxStore {
     if (index < 0) return undefined;
     const [removed] = list.splice(index, 1);
     this.savePages(agentId);
-    this.dropPageSources(removed.revisions.map((revision) => revision.sha256));
+    this.dropPageSources(pageFiles(removed));
     return removed;
   }
 
-  /** Keeps a revision's Markdown under its content hash (once); the hash names it in the page's revisions. */
-  savePageSource(source: string): string {
+  /** Keeps a revision's text under its content hash (once); the hash names it in the page's revisions. */
+  savePageSource(source: string, kind: PageKind = "document"): string {
     const sha256 = createHash("sha256").update(source).digest("hex");
-    const path = this.pageSourcePath(sha256);
+    const path = this.pageSourcePath(pageFile(sha256, kind));
     if (!existsSync(path)) {
       mkdirSync(join(this.dataDir, "attachments", "pages"), { recursive: true });
       writeTextSync(path, source);
@@ -470,26 +594,26 @@ export class BoxStore {
     return sha256;
   }
 
-  /** A revision's Markdown, or null when its file is gone. */
-  pageSource(sha256: string): string | null {
+  /** A revision's text, or null when its file is gone. */
+  pageSource(sha256: string, kind: PageKind = "document"): string | null {
     if (!SHA256_PATTERN.test(sha256)) return null;
     try {
-      return readFileSync(this.pageSourcePath(sha256), "utf8");
+      return readFileSync(this.pageSourcePath(pageFile(sha256, kind)), "utf8");
     } catch {
       return null;
     }
   }
 
-  private pageSourcePath(sha256: string): string {
-    return join(this.dataDir, "attachments", "pages", `${sha256}.md`);
+  private pageSourcePath(file: string): string {
+    return join(this.dataDir, "attachments", "pages", file);
   }
 
-  /** Deletes the Markdown files among these that no revision of any agent's pages names. */
-  private dropPageSources(hashes: Iterable<string>): void {
-    const candidates = new Set(hashes);
+  /** Deletes the files among these that no revision of any agent's pages names. */
+  private dropPageSources(files: Iterable<string>): void {
+    const candidates = new Set(files);
     if (candidates.size === 0) return;
-    for (const list of this.pages.values()) for (const page of list) for (const revision of page.revisions) candidates.delete(revision.sha256);
-    for (const sha256 of candidates) if (SHA256_PATTERN.test(sha256)) rmSync(this.pageSourcePath(sha256), { force: true });
+    for (const list of this.pages.values()) for (const page of list) for (const file of pageFiles(page)) candidates.delete(file);
+    for (const file of candidates) if (PAGE_FILE_PATTERN.test(file)) rmSync(this.pageSourcePath(file), { force: true });
   }
 
   private savePages(agentId: string): void {
@@ -504,20 +628,21 @@ export class BoxStore {
     const stored = readJson<{ pages?: Array<Partial<PageRecord>> }>(join(this.dataDir, "pages", agentId, "index.json"), {}).pages ?? [];
     const list: PageRecord[] = [];
     for (const page of Array.isArray(stored) ? stored : []) {
-      if (typeof page.id !== "string" || !DOCUMENT_ID_PATTERN.test(page.id) || list.some((other) => other.id === page.id)) continue;
+      const kind = typeof page.id === "string" ? pageKindOf(page.id) : null;
+      if (kind == null || (page.kind != null && page.kind !== kind) || list.some((other) => other.id === page.id)) continue;
       const revisions = (Array.isArray(page.revisions) ? page.revisions : []).filter(
         (revision) => Number.isInteger(revision?.n) && typeof revision.sha256 === "string" && SHA256_PATTERN.test(revision.sha256) && (revision.by === "agent" || revision.by === "user"),
       );
       if (revisions.length === 0) continue;
       const atMs = revisions[revisions.length - 1].atMs ?? 0;
       list.push({
-        id: page.id,
-        kind: "document",
+        id: page.id!,
+        kind,
         title: typeof page.title === "string" && page.title.trim().length > 0 ? page.title : "Untitled",
         createdAt: page.createdAt ?? revisions[0].atMs ?? 0,
         updatedAt: page.updatedAt ?? atMs,
         revisions: revisions.map((revision) => ({ n: revision.n, sha256: revision.sha256, by: revision.by, atMs: revision.atMs ?? atMs })),
-        cardId: typeof page.cardId === "string" ? page.cardId : null,
+        ...pageCardsOf(page),
       });
     }
     if (list.length > 0) this.pages.set(agentId, list);
@@ -525,12 +650,17 @@ export class BoxStore {
 
   // ---- todos -------------------------------------------------------------------
 
-  todos(agentId: string): AgentTodo[] {
-    return readJson<AgentTodo[]>(join(this.dataDir, "todos", `${agentId}.json`), []);
+  todos(agentId: string, sessionId: string = MAIN_SESSION): AgentTodo[] {
+    return readJson<AgentTodo[]>(this.todosFile(agentId, sessionId), []);
   }
 
-  setTodos(agentId: string, todos: AgentTodo[]): void {
-    writeJsonSync(join(this.dataDir, "todos", `${agentId}.json`), todos);
+  setTodos(agentId: string, todos: AgentTodo[], sessionId: string = MAIN_SESSION): void {
+    if (sessionId !== MAIN_SESSION) mkdirSync(this.sessionDir(agentId, sessionId), { recursive: true });
+    writeJsonSync(this.todosFile(agentId, sessionId), todos);
+  }
+
+  private todosFile(agentId: string, sessionId: string): string {
+    return sessionId === MAIN_SESSION ? join(this.dataDir, "todos", `${agentId}.json`) : join(this.sessionDir(agentId, sessionId), `${sessionFileName(sessionId)}.todos.json`);
   }
 
   // ---- automations ----------------------------------------------------------------
@@ -568,6 +698,19 @@ export class BoxStore {
     const groups = agentId == null ? [...this.skills.values()] : [this.skills.get(agentId) ?? new Map<string, StoredSkill>()];
     const own = groups.flatMap((group) => [...group.values()].map((stored) => stored.skill)).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
     return agentId == null ? own : [...own, ...this.pluginSkillList.map((skill) => pluginSkillFor(skill, agentId))];
+  }
+
+  /**
+   * The names a new or renamed skill of the agent can't take (skills.ts buildSkill): its own skills',
+   * and every installed plugin's skills' (`<plugin>:<skill>`), also a plugin turned off, whose
+   * commands come back with it.
+   */
+  skillNamesInUse(agentId: string): Array<{ id: string; name: string; pluginName?: string }> {
+    const own = [...(this.skills.get(agentId)?.values() ?? [])].map(({ skill }) => ({ id: skill.id, name: skill.name }));
+    const fromPlugins = this.installedPlugins().flatMap((installed) =>
+      installed.plugin.skills.map((skill) => ({ id: `${installed.pluginId}/${skill.name}`, name: `${installed.name}:${skill.name}`, pluginName: installed.plugin.displayName })),
+    );
+    return [...own, ...fromPlugins];
   }
 
   getSkill(agentId: string, id: string): Skill | undefined {

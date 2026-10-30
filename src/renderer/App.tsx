@@ -3,9 +3,10 @@ import { useEffect } from "react";
 import { desktop, main } from "./bridge";
 import { AgentDialog, DeleteAgentDialog } from "./components/AgentDialog";
 import { AsyncTasksPanel } from "./components/AsyncTasks";
-import { Avatar } from "./components/Avatar";
+import { AgentAvatar } from "./components/AgentAvatar";
 import { AddBotDialog, ShareTemplateDialog } from "./components/BotTemplates";
 import { ConnectApps } from "./components/ConnectApps";
+import { NewGroupDialog } from "./components/GroupChat";
 import { Icon } from "./components/icons";
 import { InfoPane } from "./components/InfoPane";
 import { Onboarding } from "./components/Onboarding";
@@ -48,7 +49,8 @@ export function App() {
   const agent = agents.find((item) => item.id === state.agentId) ?? hidden.find((item) => item.id === state.agentId);
   const openPage = useStore(stage, (value) => value.open);
   // A page on the stage takes the details pane's place, with the agent's chat beside it.
-  const page = state.view === "chat" && agent != null && openPage?.agentId === agent.id ? openPage : null;
+  // In a group chat, a member's page (from its card in the room) opens beside the room's chat.
+  const page = state.view === "chat" && agent != null && openPage != null && (openPage.agentId === agent.id || (agent.isGroup && agent.memberIds.includes(openPage.agentId))) ? openPage : null;
 
   useEffect(() => {
     applyTheme(desktop.boot.theme.resolved);
@@ -135,6 +137,7 @@ export function App() {
       </div>
       {sidebarCollapsed ? <CycleCursor /> : null}
       {state.dialog?.kind === "new-agent" ? <AgentDialog /> : null}
+      {state.dialog?.kind === "new-group" ? <NewGroupDialog /> : null}
       {state.dialog?.kind === "edit-agent" ? <AgentDialog agentId={state.dialog.agentId} /> : null}
       {state.dialog?.kind === "delete-agent" ? <DeleteAgentDialog agentId={state.dialog.agentId} /> : null}
       {state.dialog?.kind === "onboarding" ? <Onboarding /> : null}
@@ -157,7 +160,7 @@ function CycleCursor() {
   if (agent == null) return null;
   return (
     <div className="cycle-cursor" role="status">
-      <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={24} />
+      <AgentAvatar agent={agent} size={24} />
       <span>{agent.name}</span>
     </div>
   );

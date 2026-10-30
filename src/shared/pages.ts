@@ -1,27 +1,50 @@
 // Pages: what an agent makes for the user to open on the main stage, beside the chat (the
-// "page stage"). Documents come first: Markdown an agent writes with create_document and changes with
-// edit_document, kept in the box with every revision (src/box/pages.ts), which the user reads and
-// edits on the stage. Canvases (agent-written HTML pages) are pages too; agents don't make them
-// yet, so a page's `kind` is only "document" for now.
+// "page stage"). A document is Markdown an agent writes with create_document and changes with
+// edit_document, which the user reads and edits on the stage. A canvas is an interactive HTML page an
+// agent writes with write_canvas (src/shared/canvas.ts), which the user uses on the stage and only the
+// agent changes. The box keeps both with every revision (src/box/pages.ts).
 //
-// A document is named `{kind: "document", storeId, documentId}`. Each agent's box keeps its own
-// store, so `storeId` is the agent's id. A document's title is its first `# heading`, derived from
-// the source alone; a document without one keeps the title it was given.
+// A document is named `{kind: "document", storeId, documentId}` and a canvas `{kind: "canvas",
+// storeId, canvasId}`. Each agent's box keeps its own store, so `storeId` is the agent's id. A
+// document's title is its first `# heading`, derived from the source alone; a document without one
+// keeps the title it was given. A canvas keeps the title it was given (its <title> when it was given
+// none) until write_canvas or retitleCanvas gives it another.
 
-/** Characters of Markdown one document may hold: its tool calls are replayed to the model with the conversation. */
+/** Characters of Markdown, or of a canvas's HTML, one page may hold: its tool calls are replayed to the model with the conversation. */
 export const MAX_PAGE_SOURCE = 256 * 1024;
 /** Characters of a title (whitespace collapsed). */
 export const MAX_PAGE_TITLE = 200;
 /** Revisions a page keeps; the oldest go first. */
 export const MAX_PAGE_REVISIONS = 50;
 export const DOCUMENT_ID_PATTERN = /^doc-[a-z0-9]{6,40}$/;
+export const CANVAS_ID_PATTERN = /^canvas-[a-z0-9]{6,40}$/;
 
-/** Names a page. */
-export interface PageRef {
-  kind: "document";
-  storeId: string;
-  documentId: string;
+export type PageKind = "document" | "canvas";
+
+/** Names a page: a document or a canvas in an agent's store. */
+export type PageRef = { kind: "document"; storeId: string; documentId: string } | { kind: "canvas"; storeId: string; canvasId: string };
+
+/** The page's id in its agent's store; a document's and a canvas's never collide. */
+export const pageId = (ref: PageRef): string => (ref.kind === "canvas" ? ref.canvasId : ref.documentId);
+
+/** What kind of page an id names, or null when it names none. */
+export function pageKindOf(id: string): PageKind | null {
+  return DOCUMENT_ID_PATTERN.test(id) ? "document" : CANVAS_ID_PATTERN.test(id) ? "canvas" : null;
 }
+
+/** The ref of one of this agent's pages, by its id. */
+export function pageRefFor(storeId: string, id: string): PageRef {
+  return pageKindOf(id) === "canvas" ? { kind: "canvas", storeId, canvasId: id } : { kind: "document", storeId, documentId: id };
+}
+
+/** A page as gateway calls name one: its agent's store and its id. */
+export type PageLocator = { storeId: string; documentId: string } | { storeId: string; canvasId: string };
+
+export function pageLocatorFor(storeId: string, id: string): PageLocator {
+  return pageKindOf(id) === "canvas" ? { storeId, canvasId: id } : { storeId, documentId: id };
+}
+
+export const locatorPageId = (locator: PageLocator): string => ("canvasId" in locator ? locator.canvasId : locator.documentId);
 
 /** Who made a revision: the agent (its tools) or the user (the page stage). */
 export type PageAuthor = "agent" | "user";
@@ -44,7 +67,7 @@ export interface LibraryPage {
   updatedBy: PageAuthor;
 }
 
-/** `readPage`: the page and one revision's Markdown, the newest unless another was asked for. */
+/** `readPage`: the page and one revision's Markdown (`canvasPage`: a canvas's HTML), the newest unless another was asked for. */
 export interface PageDocument extends LibraryPage {
   source: string;
   sourceRevision: number;
@@ -64,16 +87,18 @@ export interface DocumentEditRight {
 export interface PageChangedEvent {
   agentId: string;
   page: LibraryPage;
-  change: "created" | "edited" | "restored" | "deleted" | "editable";
+  change: "created" | "edited" | "restored" | "renamed" | "deleted" | "editable";
   by: PageAuthor;
   editRight: DocumentEditRight;
 }
 
 /** A page the user changed, as the next message they send tells the agent. */
 export interface PageEditNote {
+  /** The page's id: a document's, or (with `kind`) a canvas's. */
   documentId: string;
   title: string;
   revision: number;
+  kind?: "canvas";
 }
 
 /** A title as pages keep it: one line, whitespace collapsed, at most MAX_PAGE_TITLE characters. */
@@ -162,15 +187,49 @@ export function applyDocumentEdits(source: string, edits: ReadonlyArray<{ find: 
   return { source: text };
 }
 
-/** The file a document is saved as (Save as Markdown): its title, with what a file name can't hold left out. */
-export function pageFileName(title: string): string {
-  const base = title.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s.]+|[\s.]+$/g, "").slice(0, 80).trim() || "Document";
-  return `${base}.md`;
+/** The file a page is saved as (Save as Markdown, Save as HTML): its title, with what a file name can't hold left out. */
+export function pageFileName(title: string, kind: PageKind = "document"): string {
+  const base = title.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s.]+|[\s.]+$/g, "").slice(0, 80).trim() || (kind === "canvas" ? "Canvas" : "Document");
+  return `${base}.${kind === "canvas" ? "html" : "md"}`;
+}
+
+/** Text from a canvas for its card and its title: what the page shows, without script, style or tags. */
+function canvasText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|template|svg|noscript)\b[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** A canvas's <title>, or else its first <h1>; null when it has neither. */
+export function canvasTitle(html: string): string | null {
+  for (const pattern of [/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i, /<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i]) {
+    const found = pattern.exec(html)?.[1];
+    const text = found != null ? cleanPageTitle(canvasText(found)) : "";
+    if (text.length > 0) return text;
+  }
+  return null;
+}
+
+/** A line or two of what a canvas shows, for its card; its title (the <head>) left out. */
+export function canvasExcerpt(html: string, limit = 240): string {
+  const text = canvasText(html.replace(/<head\b[\s\S]*?<\/head\s*>/i, " ").replace(/<title\b[\s\S]*?<\/title\s*>/gi, " "));
+  return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 }
 
 /** What the model reads at the start of the next message the user sends after changing pages (in the user's voice, as a reply's quote is). */
 export function pageEditsNote(edits: readonly PageEditNote[]): string {
   if (edits.length === 0) return "";
   const pages = edits.map((edit) => `“${edit.title}” (${edit.documentId}, now revision ${edit.revision})`).join(", ");
-  return `[I changed ${edits.length === 1 ? "this page" : "these pages"} since my last message: ${pages}. Read a page with read_document before you edit it again.]\n`;
+  const canvases = edits.filter((edit) => edit.kind === "canvas").length;
+  const read = canvases === 0 ? "read_document" : canvases === edits.length ? "read_canvas" : "read_document or read_canvas";
+  return `[I changed ${edits.length === 1 ? "this page" : "these pages"} since my last message: ${pages}. Read a page with ${read} before you ${canvases === 0 ? "edit" : "change"} it again.]\n`;
 }

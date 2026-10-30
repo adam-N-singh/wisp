@@ -15,6 +15,7 @@ import {
 } from "../../shared/model";
 import type { AgentBrowserState, ScreenCapture } from "../../shared/edges";
 import { desktop, gateway, main } from "../bridge";
+import { slashCommand } from "../skill-menu";
 import { openAsyncTasks, openConnectApps, openDialog } from "../store/app";
 import { automations, loadAutomations, loadMemories, loadSkills, loadTodos, memories, setAutomations, setMemories, setSkills, skills, todos } from "../store/agent-data";
 import { layout, updateLayout, type InfoTab } from "../store/layout";
@@ -22,6 +23,7 @@ import { effectiveModel, modelLabel, modelSettings } from "../store/models";
 import { useStore } from "../store/store";
 import { replicaStore, deliverMessage } from "../store/transcripts";
 import { backgroundText } from "./activity";
+import { GroupDetails } from "./GroupChat";
 import { Icon } from "./icons";
 import { LibrarySection } from "./PageCard";
 import { CloudControls } from "./SettingsView";
@@ -41,6 +43,12 @@ const errorText = (cause: unknown) => (cause instanceof Error ? cause.message.re
 const showInfoTab = (tab: InfoTab) => updateLayout((state) => ({ ...state, infoPane: { ...state.infoPane, overviewTab: tab } }));
 
 export function InfoPane({ agent }: { agent: AgentSummary }) {
+  // A group chat has no skills, automations or computer of its own: its pane is its members.
+  if (agent.isGroup) return <GroupDetails room={agent} />;
+  return <AgentDetails agent={agent} />;
+}
+
+function AgentDetails({ agent }: { agent: AgentSummary }) {
   const tab = useStore(layout, (state) => state.infoPane.overviewTab);
   const width = useStore(layout, (state) => state.infoPane.width);
   const reviews = useStore(memories, (state) => (state[agent.id] ?? []).filter((memory) => memory.review != null).length);
@@ -470,7 +478,7 @@ function PluginSkillCard({ agentId, skill, apply }: { agentId: string; skill: Sk
         ) : null}
       </div>
       <div className="automation__meta">
-        <span className="skill__command">/{skillCommand(skill.name)}</span>
+        <span className="skill__command">/{slashCommand(skill)}</span>
       </div>
       <p className="automation__prompt">{skill.description}</p>
       <div className="automation__actions">

@@ -1,11 +1,28 @@
 // Visualizations: an HTML fragment an agent writes (show_visualization) runs as its own document in
-// a sandboxed iframe in the transcript. The document gets the frame's CSP, so it can run inline
-// script and style but load nothing and reach nothing: no network, no other frames. It reports its
-// height to the page, which sizes the frame, and it gets the app's colors for the current theme as
-// CSS variables and `window.WispViz`.
+// a sandboxed iframe in the transcript (its `wisp-visualization:` frames). The document gets the
+// frame's CSP, so it can run inline script and style but load nothing and reach nothing: no network,
+// no other frames. It reports its height to the page, which sizes the frame, and it gets the app's
+// colors for the current theme as CSS variables and `window.WispViz`. CSP doesn't cover WebRTC: the
+// main window's preload takes it out of the frame, and Trusted Types keep the one world the preload
+// misses, a `javascript:` child frame, from running.
 
 /** The content security policy for visualization frames. */
 export const VISUALIZATION_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; frame-src 'none'";
+
+/**
+ * Trusted Types in visualization and canvas frames, to block one route out: a child frame
+ * given a `javascript:` address gets a fresh world the main window's preload doesn't reach, where
+ * WebRTC is still whole (src/shared/frame-lockdown.ts). Chromium checks a `javascript:` navigation
+ * in the frame it navigates, and a new frame has no policy, so it is refused there. The frame's own
+ * world gets a pass-through default policy first thing, so the agent's script (innerHTML, handlers
+ * set as attributes, scripts it adds) works as before.
+ */
+export const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'";
+export const TRUSTED_TYPES_DEFAULT_POLICY =
+  'if (window.trustedTypes) trustedTypes.createPolicy("default", { createHTML: function (s) { return s; }, createScript: function (s) { return s; }, createScriptURL: function (s) { return s; } });';
+
+/** What a visualization frame is served with: its CSP, Trusted Types, and the sandbox however it's opened. */
+export const VISUALIZATION_FRAME_CSP = `${VISUALIZATION_CSP}; ${TRUSTED_TYPES_CSP}; sandbox allow-scripts`;
 
 /** What a visualization frame posts to the page when its content's height changes. */
 export const VISUALIZATION_HEIGHT_MESSAGE = "wisp-visualization:height";
@@ -60,7 +77,8 @@ export function visualizationDocument(fragment: string, theme: "light" | "dark")
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
     `<style>:root { color-scheme: ${theme}; ${variables}; } html, body { margin: 0; background: transparent; color: var(--viz-text); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; } body { padding: 1px 0; overflow-x: auto; }</style>`,
-    `<script>window.WispViz = Object.freeze(${wispViz.replace(/</g, "\\u003c")});`,
+    `<script>${TRUSTED_TYPES_DEFAULT_POLICY}`,
+    `window.WispViz = Object.freeze(${wispViz.replace(/</g, "\\u003c")});`,
     // The body's height, which the page makes the frame's; a body sized to the frame (height: 100%) keeps it as it is.
     `(function () { var last = 0; function report() { var body = document.body; if (!body) return; var height = Math.ceil(Math.max(body.scrollHeight, body.getBoundingClientRect().height)); if (height !== last) { last = height; parent.postMessage({ type: "${VISUALIZATION_HEIGHT_MESSAGE}", height: height }, "*"); } }`,
     "  addEventListener('DOMContentLoaded', function () { report(); if (typeof ResizeObserver === 'function') new ResizeObserver(report).observe(document.body); }); addEventListener('load', report); })();</script>",

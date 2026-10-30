@@ -1,7 +1,8 @@
 // Prompt composer: Enter sends, Shift+Enter adds a line; files attach by
 // paste, drag-and-drop or the paperclip; Stop interrupts a running agent.
 // Typing "/" at the start opens the agent's skills: arrows move, Enter or Tab
-// picks one ("/<command> ", which the box runs as that skill), Esc closes.
+// picks one ("/<command> ", which the box runs as that skill; a plugin's is
+// "/<plugin>:<skill>", as Claude Code writes it), Esc closes.
 // A reply started from a message's toolbar shows its quote above the text and
 // goes out with the next message or voice memo; Esc or × drops it.
 // Voice: Ctrl+D or the microphone dictates into the box.
@@ -10,16 +11,19 @@
 // placeholder's place, and Esc cancels. When a connected provider can
 // transcribe, "+" offers Attach files and Record a voice memo, which sends the
 // recording with its transcript.
-import { useEffect, useRef, useState } from "react";
-import { type AgentSummary, CHATGPT_USAGE_URL, type Skill, skillCommand, usesChatGptPlan } from "../../shared/model";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type AgentSummary, CHATGPT_USAGE_URL, isSessionRunning, type Skill, usesChatGptPlan } from "../../shared/model";
 import type { StagedAttachment } from "../../shared/edges";
 import { desktop, gateway, main } from "../bridge";
 import { isModKey, MOD_LABEL, shortcutKey } from "../shortcuts";
+import { skillMatches, slashCommand, slashQuery } from "../skill-menu";
 import { loadSkills, skills } from "../store/agent-data";
 import { effectiveModel, modelLabel, modelSettings } from "../store/models";
+import { allAgents, roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { cancelReply, replyTargets, deliverMessage } from "../store/transcripts";
 import { loadVoiceCapabilities, type RecordedAudio, type Recording, stageRecording, startRecording, transcribeRecording, useVoiceCapabilities } from "../store/voice";
+import { AgentAvatar } from "./AgentAvatar";
 import { Icon } from "./icons";
 import { formatDuration } from "./Voice";
 
@@ -44,15 +48,28 @@ export function focusComposer(): void {
   document.querySelector<HTMLTextAreaElement>(".composer__input")?.focus();
 }
 
-/** Skills whose command or name contains what follows the "/", those that start with it first. */
-function skillMatches(list: Skill[], query: string): Skill[] {
-  const wanted = skillCommand(query);
-  return list
-    .map((skill) => ({ skill, command: skillCommand(skill.name) }))
-    .filter(({ skill, command }) => command.includes(wanted) || skill.name.toLowerCase().includes(query.toLowerCase()))
-    .sort((a, b) => Number(!a.command.startsWith(wanted)) - Number(!b.command.startsWith(wanted)))
-    .slice(0, MENU_ROWS)
-    .map(({ skill }) => skill);
+/** In a group chat, what an "@" offers: "everyone" (with two or more members) and the members. */
+interface MentionOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
+/** The "@" being typed just before the caret, and what follows it so far. */
+const MENTION_AT_CARET = /(?:^|\s)@([\p{L}\p{N}_-]*)$/u;
+
+/** Options whose name contains what follows the "@" (spaces ignored), those that start with it first. */
+function mentionMatches(members: AgentSummary[], query: string): MentionOption[] {
+  const wanted = query.toLowerCase();
+  const squash = (text: string) => text.toLowerCase().replace(/\s+/g, "");
+  const options: MentionOption[] = [
+    ...(members.length >= 2 ? [{ id: "everyone", label: "everyone", description: `All ${members.length} bots` }] : []),
+    ...members.map((member) => ({ id: member.id, label: member.name, description: member.description })),
+  ];
+  return options
+    .filter((option) => squash(option.label).includes(wanted))
+    .sort((a, b) => Number(!squash(a.label).startsWith(wanted)) - Number(!squash(b.label).startsWith(wanted)))
+    .slice(0, MENU_ROWS);
 }
 
 export function Composer({ agent }: { agent: AgentSummary }) {
@@ -80,9 +97,16 @@ export function Composer({ agent }: { agent: AgentSummary }) {
   const voiceSession = useRef(0);
   const textNow = useRef(text);
   textNow.current = text;
-  const slash = /^\/([\p{L}\p{N}-]*)$/u.exec(text);
-  const matches = slash == null || menuDismissed ? [] : skillMatches(agentSkills ?? [], slash[1]);
+  // A group chat has no skills of its own: its "@" menu lists its members instead.
+  const query = agent.isGroup ? null : slashQuery(text);
+  const matches = query == null || menuDismissed ? [] : skillMatches(agentSkills ?? [], query, MENU_ROWS);
   const active = Math.min(menuIndex, matches.length - 1);
+  const everyone = useStore(roster);
+  const [caret, setCaret] = useState(text.length);
+  const members = agent.isGroup ? agent.memberIds.flatMap((id) => allAgents(everyone).filter((candidate) => candidate.id === id)) : [];
+  const mention = agent.isGroup && !menuDismissed ? MENTION_AT_CARET.exec(text.slice(0, caret)) : null;
+  const mentions = mention == null ? [] : mentionMatches(members, mention[1]);
+  const activeMention = Math.min(menuIndex, mentions.length - 1);
 
   const setVoice = (next: Voice) => {
     voiceRef.current = next;
@@ -105,8 +129,20 @@ export function Composer({ agent }: { agent: AgentSummary }) {
     element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
   }, [text]);
 
+  // A picked @mention puts the caret after it as soon as the text is in, before the next key lands.
+  const pendingCaret = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    if (pendingCaret.current == null) return;
+    input.current?.setSelectionRange(pendingCaret.current, pendingCaret.current);
+    pendingCaret.current = null;
+  }, [text]);
+
   const addFiles = async (files: File[]) => {
     setError(null);
+    if (agent.isGroup) {
+      if (files.length > 0) setError("Group chats take text messages only for now.");
+      return;
+    }
     for (const file of files) {
       try {
         const staged = await desktop.local.stageAttachmentFile(file, file.name || "pasted.png");
@@ -138,17 +174,28 @@ export function Composer({ agent }: { agent: AgentSummary }) {
     void main.dropStagedUpload({ path: attachment.path });
   };
 
-  const edit = (value: string) => {
+  const edit = (value: string, at = value.length) => {
     setText(value);
+    setCaret(at);
     drafts.set(agent.id, value);
     setMenuIndex(0);
-    if (!value.startsWith("/")) setMenuDismissed(false);
+    if (!value.startsWith("/") && !(agent.isGroup && MENTION_AT_CARET.test(value.slice(0, at)))) setMenuDismissed(false);
   };
 
   const pickSkill = (skill: Skill) => {
-    const value = `/${skillCommand(skill.name)} `;
+    const value = `/${slashCommand(skill)} `;
     edit(value);
     requestAnimationFrame(() => input.current?.setSelectionRange(value.length, value.length));
+  };
+
+  /** Puts "@Name " in place of the "@" being typed. */
+  const pickMention = (option: MentionOption) => {
+    if (mention == null) return;
+    const before = text.slice(0, caret - mention[1].length - 1);
+    const inserted = `@${option.label} `;
+    const after = text.slice(caret).replace(/^\s+/, "");
+    pendingCaret.current = before.length + inserted.length;
+    edit(`${before}${inserted}${after}`, before.length + inserted.length);
   };
 
   // ---- voice ------------------------------------------------------------------------------
@@ -327,7 +374,7 @@ export function Composer({ agent }: { agent: AgentSummary }) {
   const dictating = (voice.kind === "starting" || voice.kind === "listening") && voice.purpose === "dictation";
   const memoActive = voice.kind === "memo-failed" || (voice.kind !== "idle" && voice.purpose === "memo");
   const canRecordMemo = capabilities?.transcription != null;
-  const placeholder = agent.awaitingUserResponse?.reason === "question" ? "Answer the question…" : `Message ${agent.name}`;
+  const placeholder = agent.isGroup ? "Message group" : agent.awaitingUserResponse?.reason === "question" ? "Answer the question…" : `Message ${agent.name}`;
   const shownPlaceholder = dictating ? "Listening…" : voice.kind === "transcribing" && voice.purpose === "dictation" ? "Transcribing…" : placeholder;
 
   return (
@@ -394,8 +441,31 @@ export function Composer({ agent }: { agent: AgentSummary }) {
               onMouseEnter={() => setMenuIndex(index)}
             >
               <Icon name="bolt" size={14} />
-              <span className="slash-menu__name">{skill.name}</span>
+              <span className="slash-menu__name">{skill.source === "plugin" ? `/${slashCommand(skill)}` : skill.name}</span>
               <span className="slash-menu__description">{skill.description}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {mentions.length > 0 ? (
+        <div className="slash-menu" role="listbox" id={`mention-menu-${agent.id}`} aria-label="Mention">
+          <div className="slash-menu__title">Mention</div>
+          {mentions.map((option, index) => (
+            <div
+              key={option.id}
+              id={`mention-option-${option.id}`}
+              role="option"
+              aria-selected={index === activeMention}
+              className={`slash-menu__item${index === activeMention ? " slash-menu__item--active" : ""}`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                pickMention(option);
+              }}
+              onMouseEnter={() => setMenuIndex(index)}
+            >
+              {option.id === "everyone" ? <Icon name="users" size={14} /> : <AgentAvatar agent={members.find((member) => member.id === option.id)!} size={16} />}
+              <span className="slash-menu__name">{option.label}</span>
+              <span className="slash-menu__description">{option.description}</span>
             </div>
           ))}
         </div>
@@ -421,7 +491,7 @@ export function Composer({ agent }: { agent: AgentSummary }) {
         />
       ) : (
         <div className="composer__row">
-          {canRecordMemo ? (
+          {agent.isGroup ? null : canRecordMemo ? (
             <div
               className="composer__actions"
               onBlur={(event) => {
@@ -484,10 +554,11 @@ export function Composer({ agent }: { agent: AgentSummary }) {
             placeholder={shownPlaceholder}
             aria-label={placeholder}
             aria-autocomplete="list"
-            aria-controls={matches.length > 0 ? `skill-menu-${agent.id}` : undefined}
-            aria-activedescendant={matches.length > 0 ? `skill-option-${matches[active].id}` : undefined}
+            aria-controls={matches.length > 0 ? `skill-menu-${agent.id}` : mentions.length > 0 ? `mention-menu-${agent.id}` : undefined}
+            aria-activedescendant={matches.length > 0 ? `skill-option-${matches[active].id}` : mentions.length > 0 ? `mention-option-${mentions[activeMention].id}` : undefined}
             spellCheck
-            onChange={(event) => edit(event.target.value)}
+            onChange={(event) => edit(event.target.value, event.target.selectionStart ?? event.target.value.length)}
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? text.length)}
             onPaste={(event) => {
               const files = [...event.clipboardData.files];
               if (files.length > 0) {
@@ -496,6 +567,23 @@ export function Composer({ agent }: { agent: AgentSummary }) {
               }
             }}
             onKeyDown={(event) => {
+              if (mentions.length > 0 && !event.nativeEvent.isComposing) {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setMenuIndex((activeMention + (event.key === "ArrowDown" ? 1 : mentions.length - 1)) % mentions.length);
+                  return;
+                }
+                if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
+                  event.preventDefault();
+                  pickMention(mentions[activeMention]);
+                  return;
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setMenuDismissed(true);
+                  return;
+                }
+              }
               if (matches.length > 0 && !event.nativeEvent.isComposing) {
                 if (event.key === "ArrowDown" || event.key === "ArrowUp") {
                   event.preventDefault();
@@ -550,7 +638,7 @@ export function Composer({ agent }: { agent: AgentSummary }) {
             {voice.kind === "listening" && dictating ? <LevelMeter recording={voice.recording} variant="ring" /> : null}
             <Icon name="mic" />
           </button>
-          {agent.isRunning && text.trim().length === 0 && attachments.length === 0 ? (
+          {isSessionRunning(agent) && text.trim().length === 0 && attachments.length === 0 ? (
             <button type="button" className="send-button send-button--stop" aria-label="Stop" title="Stop" onClick={() => void gateway.stopAgentRun({ id: agent.id })}>
               <Icon name="stop" />
             </button>
@@ -565,10 +653,14 @@ export function Composer({ agent }: { agent: AgentSummary }) {
         {dictating ? "Listening" : voice.kind === "transcribing" ? "Transcribing" : ""}
       </span>
       <div className="composer__meta">
-        <span className="composer__model" title="Change it in the agent’s settings">
-          {modelLabel(model)}
-        </span>
-        {onPlan ? (
+        {agent.isGroup ? (
+          <span className="composer__model">{members.length === 1 ? "1 bot" : `${members.length} bots`}, each on its own model</span>
+        ) : (
+          <span className="composer__model" title="Change it in the agent’s settings">
+            {modelLabel(model)}
+          </span>
+        )}
+        {onPlan && !agent.isGroup ? (
           <>
             <span className="composer__plan">Using ChatGPT plan</span>
             <button type="button" className="link-button" onClick={() => void main.openInBrowser({ url: CHATGPT_USAGE_URL })}>

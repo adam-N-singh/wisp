@@ -7,7 +7,7 @@
 // starts with "/<command>" (or Run now, or the skill's schedule) carries the
 // body itself.
 import { randomUUID } from "node:crypto";
-import { type AgentId, type InvokedSkill, type Skill, skillCommand, type SkillSpec } from "../shared/model";
+import { type AgentId, type InvokedSkill, qualifiedSkillCommand, type Skill, skillCommand, type SkillSpec } from "../shared/model";
 import { describeCron, isValidCron } from "./cron";
 import { computeNextRun, skillSchedule } from "./scheduler";
 
@@ -144,15 +144,25 @@ function yamlString(value: string): string {
   return plain ? value : JSON.stringify(value);
 }
 
-/** Checks a spec and fills in what the box keeps (id, file path, next run); throws a message for the user. */
-export function buildSkill(agentId: AgentId, spec: SkillSpec, others: Skill[], existing?: Skill): Skill {
+/** A skill name a new or renamed skill can't take; `pluginName` when an installed plugin's skill has it. */
+export type TakenSkillName = Pick<Skill, "id" | "name"> & { pluginName?: string };
+
+/**
+ * Checks a spec and fills in what the box keeps (id, file path, next run); throws a message for the
+ * user. `others` are the names its command can't share (BoxStore.skillNamesInUse): the agent's other
+ * skills, and every installed plugin's, turned off or not.
+ */
+export function buildSkill(agentId: AgentId, spec: SkillSpec, others: TakenSkillName[], existing?: Skill): Skill {
   const name = spec.name.replace(/\s+/g, " ").trim();
   const description = spec.description.trim();
   const body = spec.body.trim();
   if (name.length === 0) throw new Error("A skill needs a name.");
   if (name.length > MAX_SKILL_NAME) throw new Error(`A skill’s name can be up to ${MAX_SKILL_NAME} characters.`);
   if (skillCommand(name).length === 0) throw new Error("A skill’s name needs a letter or a digit.");
-  const clash = others.find((other) => other.id !== existing?.id && skillCommand(other.name) === skillCommand(name));
+  // A skill that already shares a plugin's command (made before the plugin came) keeps its name while it's edited.
+  const renamed = existing == null || skillCommand(existing.name) !== skillCommand(name);
+  const clash = others.find((other) => other.id !== existing?.id && skillCommand(other.name) === skillCommand(name) && (other.pluginName == null || renamed));
+  if (clash?.pluginName != null) throw new Error(`The installed plugin ${clash.pluginName} has a skill named “${clash.name}”, which runs as the same command. Pick another name.`);
   if (clash != null) throw new Error(`This agent already has a skill named “${clash.name}”.`);
   if (description.length === 0) throw new Error("Describe when the agent should use this skill.");
   if (description.length > MAX_SKILL_DESCRIPTION) throw new Error(`A skill’s description can be up to ${MAX_SKILL_DESCRIPTION} characters.`);
@@ -211,18 +221,31 @@ function firstParagraph(body: string): string | null {
   return null;
 }
 
+/**
+ * A skill by its command. With a colon ("notes:summarize") it's that skill exactly, a plugin's
+ * first: never an agent's own skill whose name only folds to the same command ("notes summarize").
+ * Without one ("notes-summarize") the colon and the spaces fold alike, and the agent's own skill
+ * wins, since listSkills puts them first.
+ */
+function skillByCommand(skills: Skill[], typed: string): Skill | null {
+  if (typed.includes(":")) {
+    const wanted = qualifiedSkillCommand(typed);
+    const exact = skills.filter((skill) => qualifiedSkillCommand(skill.name) === wanted);
+    return exact.find((skill) => skill.source === "plugin") ?? exact[0] ?? null;
+  }
+  const wanted = skillCommand(typed);
+  return wanted.length === 0 ? null : (skills.find((skill) => skillCommand(skill.name) === wanted) ?? null);
+}
+
 /** The skill a prompt runs: "/<command>" at its start, alone or followed by more text ("/plugin:skill" for a plugin's). */
 export function skillForPrompt(prompt: string, skills: Skill[]): Skill | null {
   const match = /^\/([\p{L}\p{N}][\p{L}\p{N}:-]*)(?=\s|$)/u.exec(prompt.trimStart());
-  if (match == null) return null;
-  const command = skillCommand(match[1]);
-  return skills.find((skill) => skillCommand(skill.name) === command) ?? null;
+  return match != null ? skillByCommand(skills, match[1]) : null;
 }
 
 /** A skill by the name the model gave load_skill: its name, its command, or either with odd spacing or case. */
 export function findSkill(skills: Skill[], name: string): Skill | null {
-  const wanted = skillCommand(name.replace(/^\//, ""));
-  return wanted.length === 0 ? null : (skills.find((skill) => skillCommand(skill.name) === wanted) ?? null);
+  return skillByCommand(skills, name.replace(/^\//, ""));
 }
 
 /** What the model reads with a message that runs a skill. */

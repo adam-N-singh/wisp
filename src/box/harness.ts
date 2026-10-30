@@ -42,6 +42,13 @@
 // (async-tasks.ts). When one ends unseen, the agent gets a hidden user message
 // (`suppressed: "quiet-wake"`) saying how, the way a prompt sent mid-run is
 // picked up, and a run starts for it unless the task was stopped.
+//
+// Runs, waiters and live state are kept per session: an agent's main conversation (session "")
+// and its others (`group:<roomId>`, later `task:<id>`) run side by side, sharing the agent's
+// memory, skills, apps, workspace and computer. The main session's live state and previews are
+// on the agent's row as before; another session's live state is its own, and the row only says
+// which sessions run or wait (`runningSessionIds`, `awaitingSessionIds`). With no other session,
+// the main one behaves byte for byte as it did before sessions (test/unit/sessions.test.ts).
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -57,10 +64,12 @@ import {
   formatModelRef,
   type InvokedSkill,
   type LocalToolPermissionAsk,
+  MAIN_SESSION,
   type MessageEntry,
   type NoticeEntry,
   type PageMessage,
   parseModelRef,
+  qualifiedSkillCommand,
   type SendMessageEntry,
   type Skill,
   skillCommand,
@@ -72,7 +81,7 @@ import {
 import { BROWSER_TOOL_NAMES } from "../shared/agent-browser";
 import type { LocalMachine, LocalToolDescriptor, PermissionAsk, ToolApproval, ToolResult } from "../shared/gateway-protocol";
 import { mimeFor } from "../shared/mime";
-import { type DocumentEditRight, MAX_PAGE_SOURCE, type PageAuthor, type PageChangedEvent, pageEditsNote } from "../shared/pages";
+import { type DocumentEditRight, MAX_PAGE_SOURCE, type PageAuthor, type PageChangedEvent, pageEditsNote, pageId } from "../shared/pages";
 import type { AsyncTasks } from "./async-tasks";
 import { BOX_TOOLS } from "./box-tools";
 import type { ClaudeCodeEngine, EngineHost } from "./claude-code";
@@ -91,7 +100,7 @@ const MAX_STEPS = 40;
 const STREAM_EMIT_MS = 50;
 const MODEL_OUTPUT_LIMIT = 20_000;
 /** load_skill's result is a skill's whole instructions and read_document's a whole document, which the model must read uncut. */
-const outputLimit = (tool: string) => (tool === "load_skill" ? MAX_SKILL_BODY + 1_000 : tool === "read_document" ? MAX_PAGE_SOURCE + 1_000 : MODEL_OUTPUT_LIMIT);
+const outputLimit = (tool: string) => (tool === "load_skill" ? MAX_SKILL_BODY + 1_000 : tool === "read_document" || tool === "read_canvas" ? MAX_PAGE_SOURCE + 1_000 : MODEL_OUTPUT_LIMIT);
 const STORED_OUTPUT_LIMIT = 100_000;
 /** What a tool call's entry keeps of its output: at least what the model reads of it. */
 const storedLimit = (tool: string) => Math.max(STORED_OUTPUT_LIMIT, outputLimit(tool));
@@ -102,9 +111,9 @@ const INLINE_IMAGE_LIMIT = 8 * 1024 * 1024;
 const CLAUDE_CONTEXT_LIMIT = 30_000;
 /** App tools Claude Code gets through the bridge (it has its own shell, files, web and todos). */
 const BRIDGED_LOCAL_TOOLS = new Set<string>(["take_screenshot", "read_clipboard", "write_clipboard", "open_url", "list_processes", ...BROWSER_TOOL_NAMES]);
-const BRIDGED_BOX_TOOLS = new Set(["ask_user", "schedule_automation", "list_automations", "delete_automation", "load_skill", "save_memory", "update_memory", "forget_memory", "show_visualization", "create_document", "read_document", "edit_document"]);
+const BRIDGED_BOX_TOOLS = new Set(["ask_user", "schedule_automation", "list_automations", "delete_automation", "load_skill", "save_memory", "update_memory", "forget_memory", "show_visualization", "create_document", "read_document", "edit_document", "write_canvas", "read_canvas"]);
 
-type NewEntry<T> = Omit<T, "id" | "seq" | "turn" | "step" | "timestampMs">;
+export type NewEntry<T> = Omit<T, "id" | "seq" | "turn" | "step" | "timestampMs">;
 type Resolution = "allow-once" | "always" | "deny" | "never";
 
 export interface LocalToolCall {
@@ -137,11 +146,72 @@ export interface HarnessDeps {
   cloudConfig(): CloudConfig | null;
   /** Agents' background commands (async-tasks.ts). */
   asyncTasks?: AsyncTasks;
+  /** What sessions other than the main one add and are told (a group chat's, rooms.ts). */
+  sessions?: SessionHooks;
   emit(channel: string, payload: unknown): void;
   log(line: string): void;
 }
 
+/** "activity" as main gets it: what it may notify the user of. */
+export interface ActivityPayload {
+  agentId: string;
+  name: string;
+  kind: "finished" | "error" | "needs-approval" | "question";
+  preview: string;
+}
+
+/** The live state of a session other than the main one. */
+export type SessionLiveState = LiveFields & { isRunning: boolean };
+
+/** For sessions other than the main one, which keep their live state, entries and activity apart from the agent's chat. */
+export interface SessionHooks {
+  /** Lines to add to the session's system prompt (a group chat's room section), or null. */
+  instructions?(agentId: string, sessionId: string): string[] | null;
+  /** The session's live state changed. */
+  live?(agentId: string, sessionId: string, live: SessionLiveState): void;
+  /** One of the session's entries was sent on "transcript". */
+  entry?(agentId: string, sessionId: string, entry: TranscriptEntry): void;
+  /** What the session would tell main on "activity". */
+  activity?(agentId: string, sessionId: string, payload: ActivityPayload): void;
+  /**
+   * The session was told something (a background command ended) and should answer: true when the
+   * hooks see to it (a group chat gives its member a turn), false for the harness to run it.
+   */
+  wake?(agentId: string, sessionId: string): boolean;
+}
+
+/**
+ * One of an agent's sessions: its main one ("") or another. `key` is the agent's id for the main one.
+ * A run's also has the transcript `epoch` it started in: once the session is started fresh (or
+ * deleted) under it, what the run still writes goes nowhere.
+ */
+interface Conversation {
+  agentId: string;
+  sessionId: string;
+  key: string;
+  epoch?: string;
+}
+
+/** What a session's run writes on the agent's row besides its live state: not the session's any more once it was started fresh. */
+const PREVIEW_KEYS = ["lastEntry", "lastMessagePreview", "lastMessageId", "newestEntryId", "hasUnread", "unreadCount", "claudeCodeSession"] as const;
+
+const conversation = (agentId: string, sessionId: string = MAIN_SESSION): Conversation => ({ agentId, sessionId, key: sessionId === MAIN_SESSION ? agentId : `${agentId}\u0000${sessionId}` });
+
+/** A session's live state, which for the main session is on the agent's row. */
+type LiveFields = Pick<AgentSummary, "isComposingMessage" | "currentActivity" | "awaitingUserResponse">;
+const LIVE_KEYS = ["isComposingMessage", "currentActivity", "awaitingUserResponse"] as const;
+
+/** How a turn in a session ended (runTurn). */
+export interface TurnOutcome {
+  outcome: "success" | "cancelled" | "error";
+  /** The text of each assistant message the turn wrote, in order. */
+  texts: string[];
+  /** Why it failed, for "error". */
+  error?: string;
+}
+
 interface Run {
+  c: Conversation;
   abort: AbortController;
   turn: number;
   nextStep: number;
@@ -152,9 +222,15 @@ interface Run {
   memoryTurn: number;
   /** Pages this run wrote: the user can't edit them until it ends. */
   pagesWritten: Set<string>;
+  /** The first turn it ran; runTurn reads what it wrote from there. */
+  firstTurn: number;
+  /** Told how the run ended. */
+  settled: Array<(outcome: TurnOutcome) => void>;
+  /** A prompt that came in after the run was stopped: a run of its own answers it once this one has wound down. */
+  next?: { turn: number; clientNonce: string; settled: Array<(outcome: TurnOutcome) => void> };
 }
 
-type Waiter = { agentId: string; entryId: string; kind: "permission" | "widget"; resolve: (value: string) => void; reject: (error: Error) => void };
+type Waiter = { c: Conversation; entryId: string; kind: "permission" | "widget"; resolve: (value: string) => void; reject: (error: Error) => void };
 
 class Interrupted extends Error {
   constructor() {
@@ -173,21 +249,35 @@ export function publicEntry<T extends TranscriptEntry>(entry: T): T {
 }
 
 export class Harness {
+  /** By conversation key. */
   private runs = new Map<string, Run>();
-  /** Keyed by requestId (permission cards) or entryId (widgets). */
+  /** By conversation key, then requestId (permission cards) or entryId (widgets). */
   private waiters = new Map<string, Waiter>();
   private emitted = new Set<string>();
-  /** The full conversation outline's items as last sent on the "outline" channel. */
+  /** The full conversation outline's items as last sent on the "outline" channel (the main sessions'). */
   private outline = new OutlineTracker();
-  private throttled = new Map<string, { agentId: string; entry: TranscriptEntry }>();
+  /** By conversation key and entry id. */
+  private throttled = new Map<string, { c: Conversation; entry: TranscriptEntry }>();
   private throttleTimer: NodeJS.Timeout | null = null;
+  /** Live state of sessions other than the main one, by conversation key, while they run or wait. */
+  private sessionLive = new Map<string, LiveFields & { c: Conversation }>();
+  /** Sessions deleted while their run winds down, by conversation key: it writes nothing more. */
+  private gone = new Set<string>();
 
   constructor(private readonly deps: HarnessDeps) {
     this.recoverInterruptedEntries();
   }
 
-  isRunning(agentId: string): boolean {
-    return this.runs.has(agentId);
+  /** Whether the session runs a turn; without one, whether any of the agent's sessions does. */
+  isRunning(agentId: string, sessionId?: string): boolean {
+    if (sessionId != null) return this.runs.has(conversation(agentId, sessionId).key);
+    return [...this.runs.values()].some((run) => run.c.agentId === agentId);
+  }
+
+  /** The session waits for the user's approval or answer. */
+  isAwaiting(agentId: string, sessionId: string = MAIN_SESSION): boolean {
+    const c = conversation(agentId, sessionId);
+    return [...this.waiters.values()].some((waiter) => waiter.c.key === c.key);
   }
 
   // ---- public operations ----------------------------------------------------------
@@ -210,22 +300,30 @@ export class Harness {
       voiceMemo?: Pick<VoiceMemo, "durationMs" | "provider" | "words">;
       replyToId?: string | null;
       replyQuote?: string | null;
+      /** The session it goes to; the main one without. */
+      sessionId?: string;
+      /** In a member's group session: the room's last entry the message brings it up to. */
+      roomThroughSeq?: number;
     },
   ): boolean {
-    this.requireAgent(agentId);
+    const row = this.requireAgent(agentId);
+    const c = conversation(agentId, input.sessionId);
+    // A group chat's own conversation is the room's to run (rooms.ts), never a model's.
+    if (row.isGroup && c.sessionId === MAIN_SESSION) throw new Error("A group chat's messages go to its members.");
+    const store = this.deps.store;
     const nonce = input.clientNonce;
-    if (nonce != null && this.deps.store.entries(agentId).some((entry) => entry.kind === "message" && entry.role === "user" && entry.clientNonce === nonce)) return false;
+    if (nonce != null && store.entries(agentId, c.sessionId).some((entry) => entry.kind === "message" && entry.role === "user" && entry.clientNonce === nonce)) return false;
 
-    const skill = input.voiceMemo != null ? null : (input.skill ?? skillForPrompt(input.prompt, this.deps.store.listSkills(agentId)));
+    const skill = input.voiceMemo != null ? null : (input.skill ?? skillForPrompt(input.prompt, store.listSkills(agentId)));
     const recording = input.voiceMemo != null ? input.attachmentPaths[0] : undefined;
-    const replied = input.replyToId != null ? this.deps.store.entry(agentId, input.replyToId) : undefined;
+    const replied = input.replyToId != null ? store.entry(agentId, input.replyToId, c.sessionId) : undefined;
     const quote = clipQuote(input.replyQuote != null && input.replyQuote.trim().length > 0 ? input.replyQuote : replied != null ? quoteOf(replied) : "");
-    // The pages the user changed since their previous message (or since the conversation began).
-    const entries = this.deps.store.entries(agentId);
+    // The pages the user changed since their previous message in this session (or since it began).
+    const entries = store.entries(agentId, c.sessionId);
     const previous = entries.findLast((entry) => entry.kind === "message" && entry.role === "user");
-    const pageEdits = pageEditsSince(this.deps.store, agentId, previous?.timestampMs ?? entries[0]?.timestampMs ?? Date.now());
-    const turn = this.deps.store.nextTurn(agentId);
-    const message = this.create<MessageEntry>(agentId, turn, 0, {
+    const pageEdits = pageEditsSince(store, agentId, previous?.timestampMs ?? entries[0]?.timestampMs ?? Date.now());
+    const turn = store.nextTurn(agentId, c.sessionId);
+    const message = this.create<MessageEntry>(c, turn, 0, {
       kind: "message",
       role: "user",
       content: input.prompt,
@@ -236,8 +334,9 @@ export class Harness {
       ...(recording != null && input.voiceMemo != null ? { voiceMemo: this.voiceMemo(recording, input.attachmentNames[0], input.voiceMemo) } : {}),
       ...(quote.length > 0 ? { replyQuote: quote, ...(replied != null ? { replyTo: replied.id, replyRole: replyRoleOf(replied) } : {}) } : {}),
       ...(pageEdits.length > 0 ? { pageEdits } : {}),
+      ...(input.roomThroughSeq != null ? { roomThroughSeq: input.roomThroughSeq } : {}),
     });
-    this.commit(agentId, message);
+    this.commit(c, message);
     // A voice memo's recording rides on its message; any other attachment gets a row of its own.
     (recording != null ? [] : input.attachmentPaths).forEach((path, index) => {
       let byteSize: number | undefined;
@@ -246,7 +345,7 @@ export class Harness {
       } catch {
         byteSize = undefined;
       }
-      const attachment = this.create<UserAttachmentEntry>(agentId, turn, 0, {
+      const attachment = this.create<UserAttachmentEntry>(c, turn, 0, {
         kind: "user-attachment",
         file_path: path,
         file_name: input.attachmentNames[index] ?? path.split(/[\\/]/).pop(),
@@ -254,11 +353,11 @@ export class Harness {
         ...(nonce != null ? { clientNonce: nonce } : {}),
         mime: mimeOf(path),
       });
-      this.commit(agentId, attachment);
+      this.commit(c, attachment);
     });
 
     const label = input.prompt.trim().length > 0 ? preview(input.prompt) : recording != null ? "Voice memo" : null;
-    this.patchAgent(agentId, {
+    this.patch(c, {
       lastEntry: label != null ? { kind: "text", text: label } : { kind: "attachment", count: input.attachmentPaths.length },
       lastMessagePreview: label ?? `${input.attachmentPaths.length} attachment(s)`,
       lastMessageId: message.id,
@@ -266,19 +365,52 @@ export class Harness {
       lastActivityAt: Date.now(),
     });
 
-    // A pending question is answered by the next prompt.
+    // A pending question is answered by the next prompt in its session.
     for (const waiter of [...this.waiters.values()]) {
-      if (waiter.agentId === agentId && waiter.kind === "widget") this.settleWidget(agentId, waiter.entryId, { respondedValue: input.prompt }, input.prompt);
+      if (waiter.c.key === c.key && waiter.kind === "widget") this.settleWidget(c, waiter.entryId, { respondedValue: input.prompt }, input.prompt);
     }
-    const run = this.runs.get(agentId);
-    if (run != null) {
+    const run = this.runs.get(c.key);
+    if (run != null && !run.abort.signal.aborted) {
       run.pendingInput = true;
       run.turn = turn;
       run.clientNonce = nonce ?? run.clientNonce;
+    } else if (run != null) {
+      // Stopped (or started fresh) and still winding down: the prompt is the next run's, not this one's.
+      run.next = { turn, clientNonce: nonce ?? message.id, settled: run.next?.settled ?? [] };
     } else {
-      void this.run(agentId, turn, nonce ?? message.id);
+      void this.run(c, turn, nonce ?? message.id);
     }
     return true;
+  }
+
+  /**
+   * Sends a prompt to a session and waits for the run that answers it to end: what a group chat's
+   * member says on its turn. A run already under way in the session takes the prompt up instead,
+   * and this waits for that one.
+   */
+  runTurn(agentId: string, sessionId: string, input: Omit<Parameters<Harness["submitPrompt"]>[1], "sessionId">): Promise<TurnOutcome> {
+    const c = conversation(agentId, sessionId);
+    return new Promise((resolve) => {
+      if (!this.submitPrompt(agentId, { ...input, sessionId })) return resolve({ outcome: "error", texts: [], error: "That message was already sent." });
+      const run = this.runs.get(c.key);
+      if (run == null) return resolve({ outcome: "error", texts: [], error: "The turn didn't start." });
+      (run.next ?? run).settled.push(resolve);
+    });
+  }
+
+  /**
+   * Runs a session on what it already holds (a message it was told quietly) and waits for that run,
+   * or for the one under way: a group chat member's turn to say how its background command ended.
+   */
+  resumeTurn(agentId: string, sessionId: string): Promise<TurnOutcome> {
+    const c = conversation(agentId, sessionId);
+    return new Promise((resolve) => {
+      const running = this.runs.get(c.key);
+      if (running != null) return (running.next ?? running).settled.push(resolve);
+      const last = this.deps.store.entries(agentId, sessionId).findLast((entry): entry is MessageEntry => entry.kind === "message" && entry.role === "user");
+      if (last == null) return resolve({ outcome: "success", texts: [] });
+      void this.run(c, last.turn, last.clientNonce ?? last.id, [resolve]);
+    });
   }
 
   private voiceMemo(path: string, name: string | undefined, memo: Pick<VoiceMemo, "durationMs" | "provider" | "words">): VoiceMemo {
@@ -301,58 +433,75 @@ export class Harness {
 
   /**
    * Tells the agent something the chat doesn't show (how a background task ended) as a hidden
-   * user message. A run picks it up at its next step; with `wake` and no run, one starts for it.
+   * user message, in the session the task was started from (the main one once that session is
+   * gone). A run picks it up at its next step; with `wake` and no run, one starts for it, or for a
+   * group chat member, its room gives it a turn.
    */
-  notifyQuietly(agentId: string, text: string, wake: boolean): void {
-    if (this.deps.store.getAgent(agentId) == null) return;
-    const turn = this.deps.store.nextTurn(agentId);
-    const message = this.create<MessageEntry>(agentId, turn, 0, { kind: "message", role: "user", content: text, isStreaming: false, suppressed: "quiet-wake" });
-    this.commit(agentId, message);
-    const run = this.runs.get(agentId);
-    if (run != null) {
+  notifyQuietly(agentId: string, text: string, wake: boolean, sessionId: string = MAIN_SESSION): void {
+    const row = this.deps.store.getAgent(agentId);
+    if (row == null || row.isGroup) return;
+    const target = sessionId !== MAIN_SESSION && this.deps.store.sessionIds(agentId).includes(sessionId) ? sessionId : MAIN_SESSION;
+    const c = conversation(agentId, target);
+    const turn = this.deps.store.nextTurn(agentId, target);
+    const message = this.create<MessageEntry>(c, turn, 0, { kind: "message", role: "user", content: text, isStreaming: false, suppressed: "quiet-wake" });
+    this.commit(c, message);
+    const run = this.runs.get(c.key);
+    if (run != null && !run.abort.signal.aborted) {
       run.pendingInput = true;
       run.turn = turn;
+    } else if (run != null) {
+      if (wake) run.next ??= { turn, clientNonce: message.id, settled: [] };
     } else if (wake) {
-      void this.run(agentId, turn, message.id);
+      if (target !== MAIN_SESSION && this.deps.sessions?.wake?.(agentId, target) === true) return;
+      void this.run(c, turn, message.id);
     }
   }
 
-  /** Sends a skill to its agent as the prompt "/<command>" carrying its instructions; false when the agent is gone. */
+  /** Sends a skill to its agent as the prompt "/<command>" ("/<plugin>:<skill>" for a plugin's) carrying its instructions; false when the agent is gone. */
   runSkill(skill: Skill, scheduled: boolean): boolean {
-    if (this.deps.store.getAgent(skill.agentId) == null) return false;
-    return this.submitPrompt(skill.agentId, { prompt: `/${skillCommand(skill.name)}`, attachmentPaths: [], attachmentNames: [], clientNonce: null, source: scheduled ? "automation" : "user", skill });
+    const row = this.deps.store.getAgent(skill.agentId);
+    if (row == null || row.isGroup) return false;
+    return this.submitPrompt(skill.agentId, { prompt: `/${skill.source === "plugin" ? qualifiedSkillCommand(skill.name) : skillCommand(skill.name)}`, attachmentPaths: [], attachmentNames: [], clientNonce: null, source: scheduled ? "automation" : "user", skill });
   }
 
-  interrupt(agentId: string): boolean {
-    const run = this.runs.get(agentId);
-    run?.abort.abort();
+  /** Stops the session's run and what it waits for; without a session, every one of the agent's. */
+  interrupt(agentId: string, sessionId?: string): boolean {
+    const only = sessionId != null ? conversation(agentId, sessionId).key : null;
+    const mine = (c: Conversation) => (only != null ? c.key === only : c.agentId === agentId);
+    let stopped = false;
+    for (const run of [...this.runs.values()]) {
+      if (!mine(run.c)) continue;
+      run.abort.abort();
+      stopped = true;
+    }
     for (const [key, waiter] of [...this.waiters]) {
-      if (waiter.agentId === agentId) {
+      if (mine(waiter.c)) {
         this.waiters.delete(key);
         waiter.reject(new Interrupted());
       }
     }
-    return run != null;
+    return stopped;
   }
 
-  resolvePermission(agentId: string, entryId: string, requestId: string, resolution: Resolution): void {
-    const waiter = this.waiters.get(requestId);
-    if (waiter == null || waiter.agentId !== agentId || waiter.entryId !== entryId) throw new Error("That permission request is no longer pending.");
-    this.waiters.delete(requestId);
+  resolvePermission(agentId: string, entryId: string, requestId: string, resolution: Resolution, sessionId: string = MAIN_SESSION): void {
+    const key = this.waiterKey(conversation(agentId, sessionId), requestId);
+    const waiter = this.waiters.get(key);
+    if (waiter == null || waiter.entryId !== entryId) throw new Error("That permission request is no longer pending.");
+    this.waiters.delete(key);
     waiter.resolve(resolution);
   }
 
-  answerCard(agentId: string, entryId: string, value: string): boolean {
-    const waiter = this.waiters.get(entryId);
-    if (waiter == null || waiter.agentId !== agentId) return false;
-    this.settleWidget(agentId, entryId, { respondedValue: value }, value);
+  answerCard(agentId: string, entryId: string, value: string, sessionId: string = MAIN_SESSION): boolean {
+    const c = conversation(agentId, sessionId);
+    if (!this.waiters.has(this.waiterKey(c, entryId))) return false;
+    this.settleWidget(c, entryId, { respondedValue: value }, value);
     return true;
   }
 
-  closeCard(agentId: string, entryId: string): boolean {
-    const waiter = this.waiters.get(entryId);
-    if (waiter == null || waiter.agentId !== agentId) return false;
-    this.settleWidget(agentId, entryId, { widgetDismissed: true }, "(the user dismissed the question)");
+  closeCard(agentId: string, entryId: string, sessionId: string = MAIN_SESSION): boolean {
+    const c = conversation(agentId, sessionId);
+    if (!this.waiters.has(this.waiterKey(c, entryId))) return false;
+    this.settleWidget(c, entryId, { widgetDismissed: true }, "(the user dismissed the question)");
     return true;
   }
 
@@ -360,32 +509,36 @@ export class Harness {
    * Changes an entry the user acts on after the fact (a reaction, a vote) and sends it as `updated`.
    * The change is made on the stored object itself, so a run that still holds the entry keeps it.
    */
-  annotate(agentId: string, entryId: string, change: (entry: TranscriptEntry) => void): TranscriptEntry {
+  annotate(agentId: string, entryId: string, change: (entry: TranscriptEntry) => void, sessionId: string = MAIN_SESSION): TranscriptEntry {
     this.requireAgent(agentId);
-    const entry = this.deps.store.entry(agentId, entryId);
+    const c = conversation(agentId, sessionId);
+    const entry = this.deps.store.entry(agentId, entryId, c.sessionId);
     if (entry == null) throw new MessageActionError("missing", "That message isn’t in this conversation any more.");
     change(entry);
-    this.commit(agentId, entry, "updated");
+    this.commit(c, entry, "updated");
     return entry;
   }
 
   /**
-   * Shows a change to one of the agent's pages: its card is updated in place, or, when the agent
-   * changed a page whose card the conversation no longer has, posted at `at`; a change by the user
-   * posts no card. Clients get "page-changed", and a page the agent wrote stays read-only to the
-   * user until its run ends, when an "editable" one says so.
+   * Shows a change to one of the agent's pages: every session's card of it is updated in place,
+   * and when the agent changed it from a session with no card of it (it never had one, or its
+   * conversation was cleared), one is posted there at `at`; a change by the user posts no card.
+   * Clients get "page-changed", and a page the agent wrote stays read-only to the user until its
+   * run ends, when an "editable" one says so.
    */
-  pageChanged(agentId: string, record: PageRecord, source: string, change: PageChangedEvent["change"], by: PageAuthor, at?: { turn: number; step: number }): void {
-    const card = this.pageCardEntry(agentId, record);
-    if (card != null) {
-      card.message = change === "deleted" ? { ...card.message, deleted: true } : pageCard(agentId, record, source);
-      this.commit(agentId, card, "updated");
-    } else if (at != null && change !== "deleted") {
-      const posted = this.create<SendMessageEntry>(agentId, at.turn, at.step, { kind: "send-message", message: pageCard(agentId, record, source) });
-      this.commit(agentId, posted);
-      this.deps.store.putPage(agentId, { ...record, cardId: posted.id });
+  pageChanged(agentId: string, record: PageRecord, source: string, change: PageChangedEvent["change"], by: PageAuthor, at?: { turn: number; step: number; sessionId?: string; epoch?: string }): void {
+    const cards = this.pageCards(agentId, record);
+    for (const { sessionId, entry } of cards) {
+      entry.message = change === "deleted" ? { ...entry.message, deleted: true } : pageCard(agentId, record, source);
+      this.commit(conversation(agentId, sessionId), entry, "updated");
     }
-    if (by === "agent") this.runs.get(agentId)?.pagesWritten.add(record.id);
+    const writer = at != null ? { ...conversation(agentId, at.sessionId), ...(at.epoch != null ? { epoch: at.epoch } : {}) } : null;
+    if (at != null && writer != null && change !== "deleted" && !cards.some((card) => card.sessionId === writer.sessionId) && this.current(writer)) {
+      const posted = this.create<SendMessageEntry>(writer, at.turn, at.step, { kind: "send-message", message: pageCard(agentId, record, source) });
+      this.commit(writer, posted);
+      this.deps.store.putPage(agentId, writer.sessionId === MAIN_SESSION ? { ...record, cardId: posted.id } : { ...record, sessionCards: { ...record.sessionCards, [writer.sessionId]: posted.id } });
+    }
+    if (by === "agent") this.runs.get(conversation(agentId, at?.sessionId).key)?.pagesWritten.add(record.id);
     this.emitPage(agentId, record, change, by);
   }
 
@@ -394,9 +547,9 @@ export class Harness {
     this.deps.emit("page-changed", event);
   }
 
-  /** The run under way wrote this page. */
+  /** A run under way in one of the agent's sessions wrote this page. */
   isWritingPage(agentId: string, documentId: string): boolean {
-    return this.runs.get(agentId)?.pagesWritten.has(documentId) === true;
+    return [...this.runs.values()].some((run) => run.c.agentId === agentId && run.pagesWritten.has(documentId));
   }
 
   /** Whether the user may edit the page now: not while the run under way is writing it. */
@@ -404,45 +557,86 @@ export class Harness {
     return this.isWritingPage(agentId, documentId) ? { canEdit: false, reason: "agent-writing" } : { canEdit: true };
   }
 
-  /** The page's card, if the conversation still has it: a cleared conversation's ids are used again by other entries. */
-  private pageCardEntry(agentId: string, record: PageRecord): (SendMessageEntry & { message: PageMessage }) | null {
-    const entry = record.cardId != null ? this.deps.store.entry(agentId, record.cardId) : undefined;
-    if (entry?.kind !== "send-message" || entry.message.type !== "page" || entry.message.page.documentId !== record.id) return null;
-    return entry as SendMessageEntry & { message: PageMessage };
+  /** The page's cards that their conversations still have, the main session's first: a cleared conversation's ids are used again by other entries. */
+  private pageCards(agentId: string, record: PageRecord): Array<{ sessionId: string; entry: SendMessageEntry & { message: PageMessage } }> {
+    const named: Array<[string, string | null | undefined]> = [[MAIN_SESSION, record.cardId], ...Object.entries(record.sessionCards ?? {})];
+    return named.flatMap(([sessionId, cardId]) => {
+      if (cardId == null || (sessionId !== MAIN_SESSION && !this.deps.store.sessionIds(agentId).includes(sessionId))) return [];
+      const entry = this.deps.store.entry(agentId, cardId, sessionId);
+      if (entry?.kind !== "send-message" || entry.message.type !== "page" || pageId(entry.message.page) !== record.id) return [];
+      return [{ sessionId, entry: entry as SendMessageEntry & { message: PageMessage } }];
+    });
   }
 
-  startFresh(agentId: string): void {
-    this.interrupt(agentId);
-    const ordered = this.deps.store.clearTranscript(agentId);
-    this.deps.store.setTodos(agentId, []);
+  startFresh(agentId: string, sessionId: string = MAIN_SESSION): void {
+    const c = conversation(agentId, sessionId);
+    this.interrupt(agentId, c.sessionId);
+    const ordered = this.deps.store.clearTranscript(agentId, c.sessionId);
+    this.deps.store.setTodos(agentId, [], c.sessionId);
     this.deps.emit("transcript", { type: "cleared", agentId, ordered });
+    if (c.sessionId !== MAIN_SESSION) {
+      this.deps.emit("todos", { agentId, sessionId: c.sessionId, todos: [] });
+      this.deps.store.setSessionState(agentId, c.sessionId, { ...this.deps.store.sessionState(agentId, c.sessionId), claudeCodeSession: null });
+      this.patch(c, { awaitingUserResponse: null });
+      return;
+    }
     this.deps.emit("outline", this.outline.cleared(agentId));
     this.deps.emit("todos", { agentId, todos: [] });
-    this.patchAgent(agentId, { lastEntry: null, lastMessageId: null, newestEntryId: undefined, lastMessagePreview: undefined, hasUnread: false, unreadCount: 0, awaitingUserResponse: null, claudeCodeSession: null });
+    this.patch(c, { lastEntry: null, lastMessageId: null, newestEntryId: undefined, lastMessagePreview: undefined, hasUnread: false, unreadCount: 0, awaitingUserResponse: null, claudeCodeSession: null });
+  }
+
+  /** Adds an entry to a session's transcript from outside its runs (what a group chat posts), as a turn of its own. */
+  append<T extends TranscriptEntry>(agentId: string, sessionId: string, body: NewEntry<T>): T {
+    const c = conversation(agentId, sessionId);
+    const entry = this.create<T>(c, this.deps.store.nextTurn(agentId, sessionId), 0, body);
+    this.commit(c, entry);
+    return entry;
+  }
+
+  /** Saves an entry changed outside its runs (a group chat's copy of a card) and sends it as `updated`. */
+  replace(agentId: string, sessionId: string, entry: TranscriptEntry): void {
+    this.commit(conversation(agentId, sessionId), entry, "updated");
+  }
+
+  /** Deletes one of the agent's other sessions, after stopping its run. */
+  deleteSession(agentId: string, sessionId: string): void {
+    if (sessionId === MAIN_SESSION) throw new Error("The main session can only be started fresh.");
+    const c = conversation(agentId, sessionId);
+    this.gone.add(c.key);
+    this.interrupt(agentId, sessionId);
+    this.deps.store.deleteSession(agentId, sessionId);
+    this.deps.emit("transcript", { type: "cleared", agentId, ordered: this.deps.store.ordered(agentId, sessionId) });
+    if (this.sessionLive.delete(c.key)) this.patch(c, {});
   }
 
   recordAutomationEvent(automation: Automation, action: Extract<EventEntry["event"], { type: "automation-changed" }>["action"]): void {
     if (this.deps.store.getAgent(automation.agentId) == null) return;
-    const entry = this.create<EventEntry>(automation.agentId, this.deps.store.nextTurn(automation.agentId), 0, {
+    const c = conversation(automation.agentId);
+    const entry = this.create<EventEntry>(c, this.deps.store.nextTurn(automation.agentId), 0, {
       kind: "event",
       event: { type: "automation-changed", action, automationId: automation.id, automationName: automation.name },
     });
-    this.commit(automation.agentId, entry);
+    this.commit(c, entry);
   }
 
   shutdown(): void {
-    for (const agentId of [...this.runs.keys()]) this.interrupt(agentId);
+    for (const run of [...this.runs.values()]) this.interrupt(run.c.agentId, run.c.sessionId);
     this.flushThrottled();
   }
 
   // ---- the run loop ------------------------------------------------------------------
 
-  private async run(agentId: string, turn: number, clientNonce: string): Promise<void> {
-    const run: Run = { abort: new AbortController(), turn, nextStep: 1, clientNonce, pendingInput: false, memories: [], memoryTurn: 0, pagesWritten: new Set() };
-    this.runs.set(agentId, run);
-    this.patchAgent(agentId, { isRunning: true, currentActivity: { kind: "thinking" } });
+  private async run(session: Conversation, turn: number, clientNonce: string, settled: Run["settled"] = []): Promise<void> {
+    const agentId = session.agentId;
+    this.gone.delete(session.key);
+    // What the run writes belongs to the conversation as it is now: not to one started fresh under it.
+    const c: Conversation = { ...session, epoch: this.deps.store.ordered(agentId, session.sessionId).epoch };
+    const run: Run = { c, abort: new AbortController(), turn, nextStep: 1, clientNonce, pendingInput: false, memories: [], memoryTurn: 0, pagesWritten: new Set(), firstTurn: turn, settled };
+    this.runs.set(c.key, run);
+    this.patch(c, { isRunning: true, currentActivity: { kind: "thinking" } });
     let finalText = "";
     let failed: string | null = null;
+    let failure: string | undefined;
     try {
       let steps = 0;
       for (; steps < MAX_STEPS; steps++) {
@@ -455,18 +649,19 @@ export class Harness {
         const resolution = this.resolveFor(agentId);
         if (!resolution.ok) {
           failed = "model-not-configured";
-          this.notice(agentId, run.turn, "error", resolution.reason);
+          failure = resolution.reason;
+          this.notice(c, run.turn, "error", resolution.reason);
           break;
         }
         if (resolution.model.kind === "claude-code") {
-          const outcome = await this.runClaudeCode(agentId, run, resolution.model);
+          const outcome = await this.runClaudeCode(c, run, resolution.model);
           if (outcome.text.trim().length > 0) finalText = outcome.text;
           failed = outcome.failed;
           if (run.pendingInput && failed == null && !run.abort.signal.aborted) continue;
           break;
         }
         const step = run.nextStep++;
-        const outcome = await this.modelStep(agentId, run, run.turn, step, resolution.model);
+        const outcome = await this.modelStep(c, run, run.turn, step, resolution.model);
         if (outcome.text.trim().length > 0) finalText = outcome.text;
         if (outcome.failed != null) {
           failed = outcome.failed;
@@ -478,21 +673,22 @@ export class Harness {
         }
         for (const { call, entry } of outcome.calls) {
           if (run.abort.signal.aborted) {
-            if (entry.status === "pending") this.finishTool(agentId, entry, "failed", "", "Interrupted.");
+            if (entry.status === "pending") this.finishTool(c, entry, "failed", "", "Interrupted.");
             continue;
           }
-          await this.executeTool(agentId, run, call, entry);
+          await this.executeTool(c, run, call, entry);
         }
       }
-      if (steps >= MAX_STEPS) this.notice(agentId, run.turn, "info", `Stopped after ${MAX_STEPS} steps. Send a message to continue.`);
+      if (steps >= MAX_STEPS) this.notice(c, run.turn, "info", `Stopped after ${MAX_STEPS} steps. Send a message to continue.`);
     } catch (error) {
       if (!run.abort.signal.aborted && !(error instanceof Interrupted)) {
         failed = error instanceof ModelError ? `model-http-${error.status}` : "run-failed";
-        this.notice(agentId, run.turn, "error", describeError(error));
-        this.deps.log(`run ${agentId} failed: ${describeError(error)}`);
+        failure = describeError(error);
+        this.notice(c, run.turn, "error", describeError(error));
+        this.deps.log(`run ${c.sessionId === MAIN_SESSION ? agentId : `${agentId} (${c.sessionId})`} failed: ${describeError(error)}`);
       }
     } finally {
-      this.runs.delete(agentId);
+      this.runs.delete(c.key);
       this.flushThrottled();
       // The pages it wrote are the user's to edit again.
       for (const documentId of run.pagesWritten) {
@@ -500,10 +696,10 @@ export class Harness {
         if (record != null) this.emitPage(agentId, record, "editable", "agent");
       }
       const aborted = run.abort.signal.aborted;
-      if (aborted) this.notice(agentId, run.turn, "info", "Stopped.");
+      if (aborted) this.notice(c, run.turn, "info", "Stopped.");
       const row = this.deps.store.getAgent(agentId);
       if (row != null) {
-        this.patchAgent(agentId, {
+        this.patch(c, {
           isRunning: false,
           isComposingMessage: false,
           currentActivity: undefined,
@@ -513,8 +709,23 @@ export class Harness {
           ...(aborted ? {} : { hasUnread: true, unreadCount: (row.unreadCount ?? 0) + 1 }),
           ...(finalText.length > 0 ? { lastEntry: { kind: "text" as const, text: preview(finalText) }, lastMessagePreview: preview(finalText) } : {}),
         });
-        if (!aborted) this.deps.emit("activity", { agentId, name: row.name, kind: failed != null ? "error" : "finished", preview: preview(finalText || (failed != null ? "The run failed." : "Done.")) });
+        if (!aborted) this.activity(c, { agentId, name: row.name, kind: failed != null ? "error" : "finished", preview: preview(finalText || (failed != null ? "The run failed." : "Done.")) });
       }
+      this.sessionLive.delete(c.key);
+      if (run.settled.length > 0) {
+        // A run whose conversation was started fresh under it said nothing that's still there.
+        const texts = !this.current(c)
+          ? []
+          : this.deps.store
+              .entries(agentId, c.sessionId)
+              .filter((entry): entry is MessageEntry => entry.kind === "message" && entry.role === "assistant" && entry.turn >= run.firstTurn && entry.content.trim().length > 0)
+              .map((entry) => entry.content);
+        const outcome: TurnOutcome = { outcome: aborted ? "cancelled" : failed != null ? "error" : "success", texts, ...(failed != null ? { error: failure ?? failed } : {}) };
+        for (const settle of run.settled) settle(outcome);
+      }
+      // A prompt sent after it was stopped gets a run of its own.
+      if (run.next != null && this.deps.store.getAgent(agentId) != null && !this.gone.has(c.key)) void this.run(session, run.next.turn, run.next.clientNonce, run.next.settled);
+      else for (const settle of run.next?.settled ?? []) settle({ outcome: "cancelled", texts: [] });
     }
   }
 
@@ -527,14 +738,14 @@ export class Harness {
   }
 
   private async modelStep(
-    agentId: string,
+    c: Conversation,
     run: Run,
     turn: number,
     step: number,
     model: ResolvedModel,
   ): Promise<{ text: string; calls: Array<{ call: ToolCall; entry: ToolCallEntry }>; failed: string | null; retry?: boolean }> {
-    const row = this.requireAgent(agentId);
-    const items = this.buildConversation(agentId);
+    const row = this.requireAgent(c.agentId);
+    const items = this.buildConversation(c.agentId, c.sessionId);
     let reply: MessageEntry | null = null;
     let reasoningStarted = 0;
     /** The provider's own search is running (or was the last thing it did) since the reply's text last grew. */
@@ -542,34 +753,34 @@ export class Harness {
     const toolCalls: ToolCall[] = [];
     let finish: { reason: string; detail?: string } = { reason: "stop" };
     const ensureReply = () =>
-      (reply ??= this.create<MessageEntry>(agentId, turn, step, { kind: "message", role: "assistant", content: "", isStreaming: true, modelRef: formatModelRef(model.ref) }));
+      (reply ??= this.create<MessageEntry>(c, turn, step, { kind: "message", role: "assistant", content: "", isStreaming: true, modelRef: formatModelRef(model.ref) }));
 
     try {
-      for await (const event of streamModel(model, { system: this.systemPrompt(row, run.memories), items, tools: this.toolSpecs(row), signal: run.abort.signal })) {
+      for await (const event of streamModel(model, { system: this.systemPrompt(row, run.memories, c.sessionId), items, tools: this.toolSpecs(row), signal: run.abort.signal })) {
         if (event.type === "reasoning") {
           const entry = ensureReply();
           if (reasoningStarted === 0) reasoningStarted = Date.now();
           entry.reasoning = (entry.reasoning ?? "") + event.delta;
-          this.stream(agentId, entry);
+          this.stream(c, entry);
         } else if (event.type === "text") {
           const entry = ensureReply();
           if (reasoningStarted > 0 && entry.reasoningMs == null) entry.reasoningMs = Date.now() - reasoningStarted;
           if (entry.content.length === 0 || searching) {
             searching = false;
-            this.patchAgent(agentId, { isComposingMessage: true, currentActivity: undefined });
+            this.patch(c, { isComposingMessage: true, currentActivity: undefined });
           }
           entry.content += event.delta;
-          this.stream(agentId, entry);
+          this.stream(c, entry);
         } else if (event.type === "search") {
           // The search runs inside the provider's response: "Searching the web", with the query once it's known.
           searching = true;
-          this.patchAgent(agentId, { isComposingMessage: false, currentActivity: { kind: "searching", tool: event.source === "x" ? "x_search" : "web_search", ...(event.query != null ? { detail: event.query } : {}) } });
+          this.patch(c, { isComposingMessage: false, currentActivity: { kind: "searching", tool: event.source === "x" ? "x_search" : "web_search", ...(event.query != null ? { detail: event.query } : {}) } });
         } else if (event.type === "sources") {
           const entry = ensureReply();
           entry.sources = mergeSources(entry.sources, event.sources);
-          this.stream(agentId, entry);
+          this.stream(c, entry);
         } else if (event.type === "notice") {
-          this.notice(agentId, turn, "info", event.text);
+          this.notice(c, turn, "info", event.text);
         } else if (event.type === "tool-call") {
           toolCalls.push(event.call);
         } else if (event.type === "replay") {
@@ -586,27 +797,27 @@ export class Harness {
         // A declined turn is replayed as plain text, never with its (possibly cut-off) blocks.
         if (finish.reason === "refusal") delete entry.replay;
         if (entry.content.length > 0 || (entry.reasoning ?? "").length > 0 || entry.replay != null) {
-          this.commit(agentId, entry);
-          if (entry.content.length > 0) this.patchAgent(agentId, { newestEntryId: entry.id, lastMessageId: entry.id, isComposingMessage: false });
+          this.commit(c, entry);
+          if (entry.content.length > 0) this.patch(c, { newestEntryId: entry.id, lastMessageId: entry.id, isComposingMessage: false });
         }
       }
     }
     const text = (reply as MessageEntry | null)?.content ?? "";
     if (finish.reason === "refusal") {
-      this.notice(agentId, turn, "error", `The model declined this request${finish.detail ? ` (${finish.detail})` : ""}. Try rephrasing it, or pick another model for this agent.`);
+      this.notice(c, turn, "error", `The model declined this request${finish.detail ? ` (${finish.detail})` : ""}. Try rephrasing it, or pick another model for this agent.`);
       return { text, calls: [], failed: "model-refusal" };
     }
     // The provider paused its own search loop part-way through the turn; the next step sends it back to continue.
     if (finish.reason === "pause_turn" && toolCalls.length === 0) return { text, calls: [], failed: null, retry: true };
 
     // Record every call before running any, so each one has a result even if the run stops part-way.
-    const calls = toolCalls.map((call) => ({ call, entry: this.recordToolCall(agentId, turn, step, call) }));
+    const calls = toolCalls.map((call) => ({ call, entry: this.recordToolCall(c, turn, step, call) }));
     if (finish.reason === "length" && calls.length > 0) {
       // Cut-off tool input must not run; the model sees why on the next step and can retry smaller.
-      for (const { entry } of calls) this.finishTool(agentId, entry, "failed", "", "Not run: the reply was cut off at the model's output limit. Try a smaller step.");
+      for (const { entry } of calls) this.finishTool(c, entry, "failed", "", "Not run: the reply was cut off at the model's output limit. Try a smaller step.");
       return { text, calls: [], failed: null, retry: true };
     }
-    if (finish.reason === "length" && text.length > 0) this.notice(agentId, turn, "info", "The reply was cut off at the model's output limit.");
+    if (finish.reason === "length" && text.length > 0) this.notice(c, turn, "info", "The reply was cut off at the model's output limit.");
     return { text, calls, failed: null };
   }
 
@@ -640,35 +851,36 @@ export class Harness {
     return specs.sort((a, b) => a.function.name.localeCompare(b.function.name));
   }
 
-  private recordToolCall(agentId: string, turn: number, step: number, call: ToolCall, engine?: "claude-code"): ToolCallEntry {
+  private recordToolCall(c: Conversation, turn: number, step: number, call: ToolCall, engine?: "claude-code"): ToolCallEntry {
     const { args, error } = parseToolArgs(call.function.arguments);
-    const entry = this.create<ToolCallEntry>(agentId, turn, step, {
+    const entry = this.create<ToolCallEntry>(c, turn, step, {
       kind: "tool-call",
       name: call.function.name,
       status: "pending",
-      summary: this.summaryFor(agentId, call.function.name, args),
+      summary: this.summaryFor(c.agentId, call.function.name, args),
       ...(engine != null ? { engine } : {}),
       detail: { callId: call.id, args, output: "", error, image: null, startedAt: Date.now(), finishedAt: null },
     });
-    this.commit(agentId, entry);
+    this.commit(c, entry);
     return entry;
   }
 
-  private finishTool(agentId: string, entry: ToolCallEntry, status: "done" | "failed", output: string, error: string | null = null): void {
+  private finishTool(c: Conversation, entry: ToolCallEntry, status: "done" | "failed", output: string, error: string | null = null): void {
     entry.status = status;
     entry.detail!.output = truncateMiddle(output, storedLimit(entry.name));
     entry.detail!.error = error;
     entry.detail!.finishedAt = Date.now();
-    this.commit(agentId, entry);
-    this.patchAgent(agentId, { currentActivity: { kind: "thinking" } });
+    this.commit(c, entry);
+    this.patch(c, { currentActivity: { kind: "thinking" } });
   }
 
-  private async executeTool(agentId: string, run: Run, call: ToolCall, entry: ToolCallEntry): Promise<void> {
+  private async executeTool(c: Conversation, run: Run, call: ToolCall, entry: ToolCallEntry): Promise<void> {
+    const agentId = c.agentId;
     const name = call.function.name;
     const turn = entry.turn;
     const step = entry.step;
-    this.patchAgent(agentId, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
-    const finish = (status: "done" | "failed", output: string, error: string | null = null) => this.finishTool(agentId, entry, status, output, error);
+    this.patch(c, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
+    const finish = (status: "done" | "failed", output: string, error: string | null = null) => this.finishTool(c, entry, status, output, error);
     if (entry.detail?.error != null) return finish("failed", "", entry.detail.error);
     const args = entry.detail?.args ?? {};
     const signal = run.abort.signal;
@@ -677,17 +889,18 @@ export class Harness {
       if (boxTool != null) {
         const result = await boxTool.run(args as Record<string, any>, {
           agentId,
+          sessionId: c.sessionId,
           store: this.deps.store,
           signal,
-          emitTodos: (todos: AgentTodo[]) => this.deps.emit("todos", { agentId, todos }),
+          emitTodos: (todos: AgentTodo[]) => this.deps.emit("todos", c.sessionId === MAIN_SESSION ? { agentId, todos } : { agentId, sessionId: c.sessionId, todos }),
           automationsChanged: (automation, action) => {
             this.recordAutomationEvent(automation, action);
             this.deps.emit("automations", { agentId, automations: this.deps.store.listAutomations(agentId) });
           },
           memoriesChanged: () => this.deps.emit("memories", { agentId, memories: this.deps.store.listMemories(agentId) }),
-          askUser: (prompt, options, allowCustom) => this.askUser(agentId, run, turn, step, prompt, options, allowCustom),
-          showVisualization: (visual) => this.commit(agentId, this.create<SendMessageEntry>(agentId, turn, step, { kind: "send-message", message: visual })),
-          pageChanged: (record, source, change) => this.pageChanged(agentId, record, source, change, "agent", { turn, step }),
+          askUser: (prompt, options, allowCustom) => this.askUser(c, run, turn, step, prompt, options, allowCustom),
+          showVisualization: (visual) => this.commit(c, this.create<SendMessageEntry>(c, turn, step, { kind: "send-message", message: visual })),
+          pageChanged: (record, source, change) => this.pageChanged(agentId, record, source, change, "agent", { turn, step, ...(c.sessionId !== MAIN_SESSION ? { sessionId: c.sessionId } : {}), ...(c.epoch != null ? { epoch: c.epoch } : {}) }),
         });
         return finish(result.isError ? "failed" : "done", result.output, result.isError ? result.output.slice(0, 500) : null);
       }
@@ -699,7 +912,7 @@ export class Harness {
         if (cloud == null || config == null) return finish("failed", "", "The cloud computer isn't set up. Ask the user to add an E2B API key in Settings → Cloud computer, or switch this agent to This PC.");
         if (cloudTool.mutating && config.askBeforeCommands) {
           const target = String(args.command ?? args.path ?? args.url ?? args.text ?? name);
-          const resolution = await this.requestPermission(agentId, run, turn, step, entry, {
+          const resolution = await this.requestPermission(c, run, turn, step, entry, {
             action: name === "run_shell" ? "run-command" : name.startsWith("computer_") || name === "open_url" ? "use-app" : "write-file",
             target,
             title: name === "run_shell" ? "Run a command on the cloud computer" : `${entry.summary ?? name} on the cloud computer`,
@@ -712,11 +925,12 @@ export class Harness {
         }
         const result = await cloudTool.run(args as Record<string, any>, {
           agentId,
+          ...(c.sessionId !== MAIN_SESSION ? { sessionId: c.sessionId } : {}),
           cloud,
           signal,
           progress: (chunk) => {
             entry.detail!.output = truncateMiddle(entry.detail!.output + chunk, STORED_OUTPUT_LIMIT);
-            this.stream(agentId, entry);
+            this.stream(c, entry);
           },
           shells: this.deps.asyncTasks,
         });
@@ -727,7 +941,7 @@ export class Harness {
       const mcpTool = this.deps.mcp.readyTools().find((tool) => sanitizeToolName(tool.qualifiedName) === name);
       if (mcpTool != null) {
         if (!this.deps.store.isMcpToolAllowed(mcpTool.qualifiedName)) {
-          const resolution = await this.requestPermission(agentId, run, turn, step, entry, {
+          const resolution = await this.requestPermission(c, run, turn, step, entry, {
             action: "use-app",
             target: `${mcpTool.serverName}: ${mcpTool.tool.name}`,
             title: `Use ${mcpTool.tool.name} from ${mcpTool.serverName}`,
@@ -766,7 +980,7 @@ export class Harness {
                 answer,
                 onProgress: (chunk) => {
                   entry.detail!.output = truncateMiddle(entry.detail!.output + chunk, STORED_OUTPUT_LIMIT);
-                  this.stream(agentId, entry);
+                  this.stream(c, entry);
                 },
               },
               signal,
@@ -775,7 +989,7 @@ export class Harness {
               // Once, or once more after the user's answer when the daemon doesn't carry the first approval over.
               if (approval != null && (answer == null || approvalsAfterAnswer++ > 0)) return finish("failed", "", "The tool asked for approval twice.");
               // The card carries the daemon's approval id, which it checks when the call comes back.
-              const resolution = await this.requestPermission(agentId, run, turn, step, entry, result.ask, result.approvalId);
+              const resolution = await this.requestPermission(c, run, turn, step, entry, result.ask, result.approvalId);
               if (resolution === "deny") return finish("failed", "", "The user denied this action.");
               approval = { resolution, entryId: entry.id, ...(result.approvalId != null ? { requestId: result.approvalId } : {}) };
               continue;
@@ -783,8 +997,8 @@ export class Harness {
             if (result.kind === "ask-user") {
               if (answer != null) return finish("failed", "", "The tool asked the user twice.");
               // An ask_user card in the chat (browser_wait_for_user has handed the user the agent browser meanwhile).
-              answer = await this.askUser(agentId, run, turn, step, result.question, result.options.map((label) => ({ label, value: label })), true);
-              this.patchAgent(agentId, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
+              answer = await this.askUser(c, run, turn, step, result.question, result.options.map((label) => ({ label, value: label })), true);
+              this.patch(c, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
               // The resend keeps the approval: the daemon honors it once more, for the same call on the same page.
               continue;
             }
@@ -793,7 +1007,12 @@ export class Harness {
               // A background command it started, waited for or stopped.
               if (result.task != null) {
                 told = name === "await_command" && result.task.state !== "running";
-                tasks?.noteShell("local", result.task, this.deps.localMachine?.()?.hostname ?? null, { told, ...(name === "stop_command" ? { stoppedBy: "agent" as const } : {}) });
+                tasks?.noteShell("local", result.task, this.deps.localMachine?.()?.hostname ?? null, {
+                  told,
+                  ...(name === "stop_command" ? { stoppedBy: "agent" as const } : {}),
+                  // The session that started it hears how it ends.
+                  ...(c.sessionId !== MAIN_SESSION ? { sessionId: c.sessionId } : {}),
+                });
               }
               if (result.image != null) entry.detail!.image = this.saveImage(entry.id, result.image.mime, result.image.base64);
               return finish("done", result.output);
@@ -815,64 +1034,72 @@ export class Harness {
     }
   }
 
-  private async requestPermission(agentId: string, run: Run, turn: number, step: number, toolEntry: ToolCallEntry, ask: PermissionAsk, approvalId?: string): Promise<Resolution> {
+  private async requestPermission(c: Conversation, run: Run, turn: number, step: number, toolEntry: ToolCallEntry, ask: PermissionAsk, approvalId?: string): Promise<Resolution> {
+    const agentId = c.agentId;
     const requestId = approvalId ?? `perm-${toolEntry.id}-${Date.now().toString(36)}`;
-    const card = this.create<SendMessageEntry>(agentId, turn, step, {
+    const card = this.create<SendMessageEntry>(c, turn, step, {
       kind: "send-message",
       requestId,
       // The daemon labels asks with its own computer, cloud tools say "Cloud computer"; the rest run where the box does.
       message: { type: "local-tool-permission", ask: { ...ask, requestId, status: "pending", machineLabel: ask.machineLabel ?? os.hostname() } },
     });
-    this.commit(agentId, card);
-    const row = this.patchAgent(agentId, { awaitingUserResponse: { reason: "approval", reasonCopy: ask.title ?? ask.target, since: Date.now(), tabId: "chat" } });
-    this.deps.emit("activity", { agentId, name: row?.name ?? "Agent", kind: "needs-approval", preview: ask.title ?? ask.target });
+    this.commit(c, card);
+    const row = this.patch(c, { awaitingUserResponse: { reason: "approval", reasonCopy: ask.title ?? ask.target, since: Date.now(), tabId: "chat" } });
+    this.activity(c, { agentId, name: row?.name ?? "Agent", kind: "needs-approval", preview: ask.title ?? ask.target });
 
     let resolution: Resolution;
     try {
-      resolution = (await this.wait(agentId, card.id, requestId, "permission", run.abort.signal)) as Resolution;
+      resolution = (await this.wait(c, card.id, requestId, "permission", run.abort.signal)) as Resolution;
     } catch (error) {
-      this.setAskStatus(agentId, card, "expired");
-      this.patchAgent(agentId, { awaitingUserResponse: null });
+      this.setAskStatus(c, card, "expired");
+      this.patch(c, { awaitingUserResponse: null });
       throw error;
     }
-    this.setAskStatus(agentId, card, resolution === "allow-once" ? "allowed" : resolution === "always" ? "always" : resolution === "never" ? "never" : "denied");
-    this.patchAgent(agentId, { awaitingUserResponse: null, currentActivity: { kind: "tool", tool: toolEntry.name, detail: toolEntry.summary } });
+    this.setAskStatus(c, card, resolution === "allow-once" ? "allowed" : resolution === "always" ? "always" : resolution === "never" ? "never" : "denied");
+    this.patch(c, { awaitingUserResponse: null, currentActivity: { kind: "tool", tool: toolEntry.name, detail: toolEntry.summary } });
     return resolution;
   }
 
-  private setAskStatus(agentId: string, card: SendMessageEntry, status: LocalToolPermissionAsk["status"]): void {
+  private setAskStatus(c: Conversation, card: SendMessageEntry, status: LocalToolPermissionAsk["status"]): void {
     if (card.message.type !== "local-tool-permission") return;
     card.message = { ...card.message, ask: { ...card.message.ask, status } };
-    this.commit(agentId, card);
+    this.commit(c, card);
   }
 
-  private async askUser(agentId: string, run: Run, turn: number, step: number, prompt: string, options: ChoiceOption[], allowCustom: boolean): Promise<string> {
-    const card = this.create<SendMessageEntry>(agentId, turn, step, { kind: "send-message", message: { type: "widget", widget: { prompt, options, allowCustom } } });
-    this.commit(agentId, card);
-    const row = this.patchAgent(agentId, { awaitingUserResponse: { reason: "question", reasonCopy: prompt, since: Date.now(), tabId: "chat" }, currentActivity: undefined });
-    this.deps.emit("activity", { agentId, name: row?.name ?? "Agent", kind: "question", preview: prompt });
+  private async askUser(c: Conversation, run: Run, turn: number, step: number, prompt: string, options: ChoiceOption[], allowCustom: boolean): Promise<string> {
+    const card = this.create<SendMessageEntry>(c, turn, step, { kind: "send-message", message: { type: "widget", widget: { prompt, options, allowCustom } } });
+    this.commit(c, card);
+    const row = this.patch(c, { awaitingUserResponse: { reason: "question", reasonCopy: prompt, since: Date.now(), tabId: "chat" }, currentActivity: undefined });
+    this.activity(c, { agentId: c.agentId, name: row?.name ?? "Agent", kind: "question", preview: prompt });
     try {
-      return await this.wait(agentId, card.id, card.id, "widget", run.abort.signal);
+      return await this.wait(c, card.id, card.id, "widget", run.abort.signal);
     } finally {
-      this.patchAgent(agentId, { awaitingUserResponse: null, currentActivity: { kind: "thinking" } });
+      this.patch(c, { awaitingUserResponse: null, currentActivity: { kind: "thinking" } });
     }
   }
 
-  private settleWidget(agentId: string, entryId: string, patch: Partial<SendMessageEntry>, answer: string): void {
-    const waiter = this.waiters.get(entryId);
+  private settleWidget(c: Conversation, entryId: string, patch: Partial<SendMessageEntry>, answer: string): void {
+    const key = this.waiterKey(c, entryId);
+    const waiter = this.waiters.get(key);
     if (waiter == null) return;
-    this.waiters.delete(entryId);
-    const card = this.deps.store.entries(agentId).find((entry): entry is SendMessageEntry => entry.id === entryId && entry.kind === "send-message");
-    if (card != null) this.commit(agentId, { ...card, ...patch });
+    this.waiters.delete(key);
+    const card = this.deps.store.entries(c.agentId, c.sessionId).find((entry): entry is SendMessageEntry => entry.id === entryId && entry.kind === "send-message");
+    if (card != null) this.commit(c, { ...card, ...patch });
     waiter.resolve(answer);
   }
 
-  private wait(agentId: string, entryId: string, key: string, kind: Waiter["kind"], signal: AbortSignal): Promise<string> {
+  /** Waiters are keyed within their session: entry ids repeat across sessions (and agents). */
+  private waiterKey(c: Conversation, key: string): string {
+    return `${c.key}\u0000${key}`;
+  }
+
+  private wait(c: Conversation, entryId: string, key: string, kind: Waiter["kind"], signal: AbortSignal): Promise<string> {
+    const waiterKey = this.waiterKey(c, key);
     return new Promise((resolve, reject) => {
       if (signal.aborted) return reject(new Interrupted());
-      this.waiters.set(key, { agentId, entryId, kind, resolve, reject });
+      this.waiters.set(waiterKey, { c, entryId, kind, resolve, reject });
       signal.addEventListener("abort", () => {
-        if (this.waiters.delete(key)) reject(new Interrupted());
+        if (this.waiters.delete(waiterKey)) reject(new Interrupted());
       });
     });
   }
@@ -958,13 +1185,13 @@ export class Harness {
   // ---- transcript -> model conversation ----------------------------------------------------
 
   /** Items in order of first appearance: user prompts (with attachments) and model steps grouped by (turn, step). */
-  private conversationItems(agentId: string): Array<{ kind: "user"; message: MessageEntry; attachments: UserAttachmentEntry[] } | { kind: "step"; reply: MessageEntry | null; texts: string[]; calls: ToolCallEntry[] }> {
+  private conversationItems(agentId: string, sessionId: string): Array<{ kind: "user"; message: MessageEntry; attachments: UserAttachmentEntry[] } | { kind: "step"; reply: MessageEntry | null; texts: string[]; calls: ToolCallEntry[] }> {
     type UserItem = { kind: "user"; message: MessageEntry; attachments: UserAttachmentEntry[] };
     type StepItem = { kind: "step"; reply: MessageEntry | null; texts: string[]; calls: ToolCallEntry[] };
     const items: Array<UserItem | StepItem> = [];
     const steps = new Map<string, StepItem>();
     const userByTurn = new Map<number, UserItem>();
-    for (const entry of this.deps.store.entries(agentId)) {
+    for (const entry of this.deps.store.entries(agentId, sessionId)) {
       if (entry.kind === "message" && entry.role === "user") {
         const item: UserItem = { kind: "user", message: entry, attachments: [] };
         userByTurn.set(entry.turn, item);
@@ -989,8 +1216,8 @@ export class Harness {
     return items;
   }
 
-  buildConversation(agentId: string): ConvItem[] {
-    const items = this.conversationItems(agentId);
+  buildConversation(agentId: string, sessionId: string = MAIN_SESSION): ConvItem[] {
+    const items = this.conversationItems(agentId, sessionId);
     // Keep the newest items within the character budget, starting at a prompt.
     let budget = CONTEXT_CHAR_BUDGET;
     let start = items.length;
@@ -1074,9 +1301,9 @@ export class Harness {
 
   /**
    * Stable for the life of a conversation: per-message times ride on the user messages instead.
-   * Runs pass the memories they read when the turn started.
+   * Runs pass the memories they read when the turn started, and the session they run in.
    */
-  systemPrompt(row: AgentSummary, memories: AgentMemory[] = this.deps.store.listMemories(row.id)): string {
+  systemPrompt(row: AgentSummary, memories: AgentMemory[] = this.deps.store.listMemories(row.id), sessionId: string = MAIN_SESSION): string {
     const cloudKind = this.deps.cloudConfig()?.kind ?? "headless";
     const machine = this.deps.localMachine?.() ?? null;
     const platform = machine?.platform ?? process.platform;
@@ -1111,6 +1338,7 @@ export class Harness {
       "- The chat also renders math between $$ … $$ (KaTeX; a single $ stays text) and ```mermaid diagrams; show_visualization shows a chart or small widget you build in HTML. Use them when they explain better than text.",
       "- A message that replies to an earlier one starts with [Replying to …] and the quoted text.",
       "- For something the user will keep, change or come back to (a plan, a report, notes, a draft), write a document with create_document instead of a long reply, and change it with edit_document. The user can edit your documents too: a message that starts with [I changed … since my last message] names the ones they changed; read_document gives a document as it is now.",
+      "- For an interactive page the user will use beside the chat (a tool, a calculator, a game, a dashboard), write a canvas with write_canvas: one self-contained HTML document. Send its canvas_id with the whole new HTML to change it; read_canvas gives it as it is now.",
       "- For tasks with three or more steps, keep a todo list with todo_write and update it as you go.",
       "- Prefer reading before writing. Make the smallest change that does the job.",
       "- Use ask_user only when you are blocked on information or a decision that only the user has.",
@@ -1118,6 +1346,9 @@ export class Harness {
       "- Messages that start with [Background command …] come from the app, not the user: a command you left running has ended. Carry on with what it was for, or tell the user what happened if they're waiting on it.",
       "- When you finish, summarize what you did and anything the user still needs to do.",
     ];
+    // A session other than the main one may have a section of its own (a group chat's room).
+    const section = sessionId !== MAIN_SESSION ? (this.deps.sessions?.instructions?.(row.id, sessionId) ?? null) : null;
+    if (section != null && section.length > 0) lines.push("", ...section);
     const skills = this.invocableSkills(row.id);
     if (skills.length > 0) {
       lines.push("", "## Skills", "The user saved these skills: instructions for particular kinds of tasks. When a request matches one, call load_skill with its name, then follow the instructions it returns.");
@@ -1135,24 +1366,30 @@ export class Harness {
 
   // ---- Claude Code engine ---------------------------------------------------------------
 
-  private async runClaudeCode(agentId: string, run: Run, model: Extract<ResolvedModel, { kind: "claude-code" }>): Promise<{ failed: string | null; text: string }> {
+  private async runClaudeCode(c: Conversation, run: Run, model: Extract<ResolvedModel, { kind: "claude-code" }>): Promise<{ failed: string | null; text: string }> {
     const engine = this.deps.claudeCode;
     if (engine == null) {
-      this.notice(agentId, run.turn, "error", "Claude Code isn't available in this build.");
+      this.notice(c, run.turn, "error", "Claude Code isn't available in this build.");
       return { failed: "claude-code-unavailable", text: "" };
     }
-    const row = this.requireAgent(agentId);
-    const session = row.claudeCodeSession ?? null;
-    const prompt = this.claudeCodePrompt(agentId, session);
+    const row = this.requireAgent(c.agentId);
+    // Each session continues a Claude Code session of its own: the main one's is on the agent's row.
+    const main = c.sessionId === MAIN_SESSION;
+    const session = (main ? row.claudeCodeSession : this.deps.store.sessionState(c.agentId, c.sessionId).claudeCodeSession) ?? null;
+    const prompt = this.claudeCodePrompt(c, session);
     if (prompt == null) return { failed: null, text: "" };
-    const outcome = await engine.runTurn(this.engineHost(agentId, run, model), model, { prompt: prompt.text, sessionId: session?.id ?? null });
-    this.patchAgent(agentId, { claudeCodeSession: outcome.sessionId != null ? { id: outcome.sessionId, lastUserSeq: prompt.lastUserSeq } : null });
+    const outcome = await engine.runTurn(this.engineHost(c, run, model), model, { prompt: prompt.text, sessionId: session?.id ?? null });
+    const next = outcome.sessionId != null ? { id: outcome.sessionId, lastUserSeq: prompt.lastUserSeq } : null;
+    // Started fresh meanwhile: the conversation has a Claude Code session of its own now (none, until its next turn).
+    if (!this.current(c)) return { failed: outcome.failed, text: outcome.text };
+    if (main) this.patchAgent(c.agentId, { claudeCodeSession: next });
+    else this.deps.store.setSessionState(c.agentId, c.sessionId, { ...this.deps.store.sessionState(c.agentId, c.sessionId), claudeCodeSession: next });
     return { failed: outcome.failed, text: outcome.text };
   }
 
   /** The user messages Claude Code hasn't seen yet; a new session also gets the earlier conversation as context. */
-  private claudeCodePrompt(agentId: string, session: { id: string; lastUserSeq: number } | null): { text: string; lastUserSeq: number } | null {
-    const entries = this.deps.store.entries(agentId);
+  private claudeCodePrompt(c: Conversation, session: { id: string; lastUserSeq: number } | null): { text: string; lastUserSeq: number } | null {
+    const entries = this.deps.store.entries(c.agentId, c.sessionId);
     let since = session?.lastUserSeq ?? -1;
     if (session == null) {
       // Everything after the last reply is new; earlier turns become context.
@@ -1179,7 +1416,7 @@ export class Harness {
     return { text: blocks.join("\n\n"), lastUserSeq: pending[pending.length - 1].seq };
   }
 
-  private claudeCodeNotes(row: AgentSummary): string {
+  private claudeCodeNotes(row: AgentSummary, sessionId: string = MAIN_SESSION): string {
     const lines = [
       `You are working as "${row.name}", an agent in Wisp, a desktop app where people delegate work to personal agents. The user reads your replies in the app's chat.`,
       row.description.trim().length > 0 ? `Your role: ${row.description.trim()}` : "",
@@ -1189,6 +1426,8 @@ export class Harness {
       "The chat renders Markdown, math between $$ … $$ (KaTeX; a single $ stays text) and ```mermaid diagrams. A message that replies to an earlier one starts with [Replying to …] and the quoted text.",
       "Messages that start with [Automation …] come from a schedule the user set up; do the task and report briefly.",
     ];
+    const section = sessionId !== MAIN_SESSION ? (this.deps.sessions?.instructions?.(row.id, sessionId) ?? null) : null;
+    if (section != null && section.length > 0) lines.push(...section.map((line) => line.replace(/^## /, "")));
     const skills = this.invocableSkills(row.id);
     if (skills.length > 0) {
       lines.push("Skills the user saved (instructions for particular kinds of tasks). When a request matches one, call mcp__wisp__load_skill with its name, then follow the instructions it returns:");
@@ -1217,24 +1456,25 @@ export class Harness {
     return tools;
   }
 
-  private engineHost(agentId: string, run: Run, model: ResolvedModel): EngineHost {
+  private engineHost(c: Conversation, run: Run, model: ResolvedModel): EngineHost {
+    const agentId = c.agentId;
     return {
       agentId,
       signal: run.abort.signal,
       workspace: () => this.deps.store.workspaceFor(agentId, this.deps.workspaceRoot()),
-      agentNotes: () => this.claudeCodeNotes(this.requireAgent(agentId)),
+      agentNotes: () => this.claudeCodeNotes(this.requireAgent(agentId), c.sessionId),
       newStep: () => run.nextStep++,
-      beginReply: (step) => this.create<MessageEntry>(agentId, run.turn, step, { kind: "message", role: "assistant", content: "", isStreaming: true, modelRef: formatModelRef(model.ref) }),
+      beginReply: (step) => this.create<MessageEntry>(c, run.turn, step, { kind: "message", role: "assistant", content: "", isStreaming: true, modelRef: formatModelRef(model.ref) }),
       stream: (entry) => {
-        if (entry.kind === "message" && entry.content.length > 0) this.patchAgentQuiet(agentId, { isComposingMessage: true, currentActivity: undefined });
-        this.stream(agentId, entry);
+        if (entry.kind === "message" && entry.content.length > 0) this.patchQuiet(c, { isComposingMessage: true, currentActivity: undefined });
+        this.stream(c, entry);
       },
       commit: (entry) => {
-        this.commit(agentId, entry);
-        if (entry.kind === "message" && entry.content.length > 0) this.patchAgent(agentId, { newestEntryId: entry.id, lastMessageId: entry.id, isComposingMessage: false });
+        this.commit(c, entry);
+        if (entry.kind === "message" && entry.content.length > 0) this.patch(c, { newestEntryId: entry.id, lastMessageId: entry.id, isComposingMessage: false });
       },
       createToolEntry: (step, name, summary, callId, args) => {
-        const entry = this.create<ToolCallEntry>(agentId, run.turn, step, {
+        const entry = this.create<ToolCallEntry>(c, run.turn, step, {
           kind: "tool-call",
           name,
           status: "pending",
@@ -1242,21 +1482,21 @@ export class Harness {
           engine: "claude-code",
           detail: { callId, args, output: "", error: null, image: null, startedAt: Date.now(), finishedAt: null },
         });
-        this.commit(agentId, entry);
+        this.commit(c, entry);
         return entry;
       },
-      finishToolEntry: (entry, status, output, error) => this.finishTool(agentId, entry, status, output, error),
-      notice: (tone, text) => this.notice(agentId, run.turn, tone, text),
-      setActivity: (activity) => this.patchAgent(agentId, { currentActivity: activity ?? undefined }),
+      finishToolEntry: (entry, status, output, error) => this.finishTool(c, entry, status, output, error),
+      notice: (tone, text) => this.notice(c, run.turn, tone, text),
+      setActivity: (activity) => this.patch(c, { currentActivity: activity ?? undefined }),
       setTodos: (todos) => {
-        this.deps.store.setTodos(agentId, todos);
-        this.deps.emit("todos", { agentId, todos });
+        this.deps.store.setTodos(agentId, todos, c.sessionId);
+        this.deps.emit("todos", c.sessionId === MAIN_SESSION ? { agentId, todos } : { agentId, sessionId: c.sessionId, todos });
       },
-      requestApproval: (entry, ask) => this.requestPermission(agentId, run, entry.turn, entry.step, entry, ask),
+      requestApproval: (entry, ask) => this.requestPermission(c, run, entry.turn, entry.step, entry, ask),
       runAppTool: async (step, name, args) => {
         const call: ToolCall = { id: `app_${randomUUID()}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
-        const entry = this.recordToolCall(agentId, run.turn, step, call, "claude-code");
-        await this.executeTool(agentId, run, call, entry);
+        const entry = this.recordToolCall(c, run.turn, step, call, "claude-code");
+        await this.executeTool(c, run, call, entry);
         const detail = entry.detail!;
         return { output: entry.status === "done" ? detail.output : `Error: ${detail.error ?? "the tool failed"}`, isError: entry.status !== "done", image: detail.image != null ? readImage(detail.image) : null };
       },
@@ -1268,26 +1508,37 @@ export class Harness {
 
   // ---- transcript & roster bookkeeping -----------------------------------------------------
 
-  private create<T extends TranscriptEntry>(agentId: string, turn: number, step: number, body: NewEntry<T>): T {
+  private create<T extends TranscriptEntry>(c: Conversation, turn: number, step: number, body: NewEntry<T>): T {
     const store = this.deps.store;
-    const entries = store.entries(agentId);
+    const entries = store.entries(c.agentId, c.sessionId);
     let index = entries.filter((entry) => entry.turn === turn).length;
-    while (store.hasEntry(agentId, `t${turn}s${index}`)) index++;
-    const entry = { id: `t${turn}s${index}`, seq: store.nextSeq(agentId), turn, step, timestampMs: Date.now(), ...body } as T;
-    store.upsertEntry(agentId, entry, false); // reserve id and seq
+    while (store.hasEntry(c.agentId, `t${turn}s${index}`, c.sessionId)) index++;
+    const entry = { id: `t${turn}s${index}`, seq: store.nextSeq(c.agentId, c.sessionId), turn, step, timestampMs: Date.now(), ...body } as T;
+    // A run winding down in a session deleted or started fresh under it writes nowhere.
+    if (this.current(c)) store.upsertEntry(c.agentId, entry, false, c.sessionId); // reserve id and seq
     return entry;
   }
 
   /** Persist and broadcast now; `updated` for an entry that existed before (also one from before a restart). */
-  private commit(agentId: string, entry: TranscriptEntry, type?: "updated"): void {
-    this.throttled.delete(entry.id);
-    this.deps.store.upsertEntry(agentId, entry, true);
-    this.emitEntry(agentId, entry, type);
+  private commit(c: Conversation, entry: TranscriptEntry, type?: "updated"): void {
+    this.throttled.delete(`${c.key}\u0000${entry.id}`);
+    if (!this.current(c)) return;
+    this.deps.store.upsertEntry(c.agentId, entry, true, c.sessionId);
+    this.emitEntry(c, entry, type);
+  }
+
+  /**
+   * The conversation is still the one `c` was made for: not deleted, and for a run's, not started
+   * fresh since the run began (its transcript's epoch is the one the run started in).
+   */
+  private current(c: Conversation): boolean {
+    if (this.gone.has(c.key)) return false;
+    return c.epoch == null || c.epoch === this.deps.store.ordered(c.agentId, c.sessionId).epoch;
   }
 
   /** Broadcast a streaming partial at most every STREAM_EMIT_MS, without persisting. */
-  private stream(agentId: string, entry: TranscriptEntry): void {
-    this.throttled.set(entry.id, { agentId, entry });
+  private stream(c: Conversation, entry: TranscriptEntry): void {
+    this.throttled.set(`${c.key}\u0000${entry.id}`, { c, entry });
     this.throttleTimer ??= setTimeout(() => this.flushThrottled(), STREAM_EMIT_MS);
   }
 
@@ -1296,19 +1547,86 @@ export class Harness {
     this.throttleTimer = null;
     const pending = [...this.throttled.values()];
     this.throttled.clear();
-    for (const { agentId, entry } of pending) this.emitEntry(agentId, entry);
+    for (const { c, entry } of pending) if (this.current(c)) this.emitEntry(c, entry);
   }
 
-  private emitEntry(agentId: string, entry: TranscriptEntry, known?: "updated"): void {
-    const key = `${agentId}\u0000${entry.id}`;
+  /**
+   * Sends the entry on "transcript", stamped in its session's replica (`transcript:<agentId>\0<sessionId>`
+   * for a session other than the main one). The outline follows the main session.
+   */
+  private emitEntry(c: Conversation, entry: TranscriptEntry, known?: "updated"): void {
+    const key = `${c.key}\u0000${entry.id}`;
     const type = known ?? (this.emitted.has(key) ? "updated" : "appended");
     this.emitted.add(key);
-    this.deps.emit("transcript", { type, agentId, entry: publicEntry(structuredClone(entry)), ordered: this.deps.store.stamp(agentId) });
-    for (const event of this.outline.changes(agentId, entry)) this.deps.emit("outline", event);
+    const sent = publicEntry(structuredClone(entry));
+    this.deps.emit("transcript", { type, agentId: c.agentId, entry: sent, ordered: this.deps.store.stamp(c.agentId, c.sessionId) });
+    if (c.sessionId === MAIN_SESSION) for (const event of this.outline.changes(c.agentId, entry)) this.deps.emit("outline", event);
+    else this.deps.sessions?.entry?.(c.agentId, c.sessionId, sent);
   }
 
-  private notice(agentId: string, turn: number, tone: NonNullable<NoticeEntry["tone"]>, text: string): void {
-    this.commit(agentId, this.create<NoticeEntry>(agentId, turn, 0, { kind: "notice", text, tone }));
+  private notice(c: Conversation, turn: number, tone: NonNullable<NoticeEntry["tone"]>, text: string): void {
+    this.commit(c, this.create<NoticeEntry>(c, turn, 0, { kind: "notice", text, tone }));
+  }
+
+  /** "activity" (what main may notify the user of) for the main session; other sessions' is theirs to tell. */
+  private activity(c: Conversation, payload: ActivityPayload): void {
+    if (c.sessionId === MAIN_SESSION) this.deps.emit("activity", payload);
+    else this.deps.sessions?.activity?.(c.agentId, c.sessionId, payload);
+  }
+
+  /**
+   * Changes the agent's row for one of its sessions. The main session's change goes on the row as
+   * it is; another session keeps its live fields (`LIVE_KEYS`) to itself and leaves the rest of the
+   * row (its chat's preview, unread count, Claude Code session) alone. Either way the row then says
+   * which sessions run and wait.
+   */
+  private patch(c: Conversation, patch: Partial<AgentSummary>): AgentSummary | null {
+    if (c.sessionId === MAIN_SESSION) {
+      if (this.deps.store.getAgent(c.agentId) == null) return null;
+      // A run whose chat was started fresh under it still says it stopped, but previews nothing.
+      if (!this.current(c)) patch = Object.fromEntries(Object.entries(patch).filter(([key]) => !(PREVIEW_KEYS as readonly string[]).includes(key)));
+      return this.patchAgent(c.agentId, { ...patch, ...this.sessionFields(c.agentId, patch) });
+    }
+    if (this.deps.store.getAgent(c.agentId) == null) return null;
+    const live = this.sessionLive.get(c.key) ?? { c, isComposingMessage: false, currentActivity: undefined, awaitingUserResponse: null };
+    for (const key of LIVE_KEYS) if (key in patch) (live as Record<string, unknown>)[key] = patch[key];
+    this.sessionLive.set(c.key, live);
+    const fields = this.sessionFields(c.agentId);
+    const row = Object.keys(fields).length > 0 ? this.patchAgent(c.agentId, fields) : (this.deps.store.getAgent(c.agentId) ?? null);
+    this.deps.sessions?.live?.(c.agentId, c.sessionId, { isRunning: this.runs.has(c.key), isComposingMessage: live.isComposingMessage, currentActivity: live.currentActivity, awaitingUserResponse: live.awaitingUserResponse });
+    return row;
+  }
+
+  /** Like patch, but only when something actually changes (streaming calls this often). */
+  private patchQuiet(c: Conversation, patch: Partial<AgentSummary>): void {
+    if (c.sessionId === MAIN_SESSION) return this.patchAgentQuiet(c.agentId, patch);
+    const live = this.sessionLive.get(c.key);
+    if (live != null && LIVE_KEYS.every((key) => !(key in patch) || live[key] === patch[key])) return;
+    this.patch(c, patch);
+  }
+
+  /**
+   * `isRunning`, `runningSessionIds` and `awaitingSessionIds` as the agent's sessions are now,
+   * when they differ from what the row (with `patch` applied) says; nothing when they agree, which
+   * keeps a main session's changes as they were while it's the only one.
+   */
+  private sessionFields(agentId: string, patch: Partial<AgentSummary> = {}): Partial<AgentSummary> {
+    const row = this.deps.store.getAgent(agentId);
+    if (row == null) return {};
+    const others: string[] = [];
+    for (const run of this.runs.values()) if (run.c.agentId === agentId && run.c.sessionId !== MAIN_SESSION) others.push(run.c.sessionId);
+    const awaiting: string[] = [];
+    for (const live of this.sessionLive.values()) if (live.c.agentId === agentId && live.awaitingUserResponse != null) awaiting.push(live.c.sessionId);
+    const mainRunning = this.runs.has(agentId);
+    const fields: Pick<AgentSummary, "isRunning" | "runningSessionIds" | "awaitingSessionIds"> = {
+      isRunning: mainRunning || others.length > 0,
+      runningSessionIds: others.length > 0 ? [...(mainRunning ? [MAIN_SESSION] : []), ...others.sort()] : undefined,
+      awaitingSessionIds: awaiting.length > 0 ? awaiting.sort() : undefined,
+    };
+    const next = { ...row, ...patch };
+    const sameList = (a: string[] | undefined, b: string[] | undefined) => (a ?? []).join("\u0000") === (b ?? []).join("\u0000") && (a == null) === (b == null);
+    const same = next.isRunning === fields.isRunning && sameList(next.runningSessionIds, fields.runningSessionIds) && sameList(next.awaitingSessionIds, fields.awaitingSessionIds);
+    return same ? {} : fields;
   }
 
   private requireAgent(agentId: string): AgentSummary {
@@ -1333,18 +1651,21 @@ export class Harness {
     this.patchAgent(agentId, patch);
   }
 
-  /** Rows left mid-flight by a crash are closed out on start. */
+  /** Rows left mid-flight by a crash are closed out on start, in every session. */
   private recoverInterruptedEntries(): void {
     for (const agent of this.deps.store.rosterAgents()) {
-      for (const entry of this.deps.store.entries(agent.id)) {
-        if (entry.kind === "tool-call" && entry.status === "pending") {
-          this.deps.store.upsertEntry(agent.id, { ...entry, status: "failed", detail: entry.detail != null ? { ...entry.detail, error: entry.detail.error ?? "Interrupted (the app restarted)." } : undefined }, true);
-        } else if (entry.kind === "message" && entry.isStreaming) {
-          this.deps.store.upsertEntry(agent.id, { ...entry, isStreaming: false }, true);
-        } else if (entry.kind === "send-message" && entry.message.type === "local-tool-permission" && entry.message.ask.status === "pending") {
-          this.deps.store.upsertEntry(agent.id, { ...entry, message: { ...entry.message, ask: { ...entry.message.ask, status: "expired" } } }, true);
-        } else if (entry.kind === "send-message" && entry.message.type === "widget" && entry.respondedValue == null && entry.widgetDismissed !== true) {
-          this.deps.store.upsertEntry(agent.id, { ...entry, widgetDismissed: true }, true);
+      for (const sessionId of [MAIN_SESSION, ...this.deps.store.sessionIds(agent.id)]) {
+        const upsert = (entry: TranscriptEntry) => this.deps.store.upsertEntry(agent.id, entry, true, sessionId);
+        for (const entry of this.deps.store.entries(agent.id, sessionId)) {
+          if (entry.kind === "tool-call" && entry.status === "pending") {
+            upsert({ ...entry, status: "failed", detail: entry.detail != null ? { ...entry.detail, error: entry.detail.error ?? "Interrupted (the app restarted)." } : undefined });
+          } else if (entry.kind === "message" && entry.isStreaming) {
+            upsert({ ...entry, isStreaming: false });
+          } else if (entry.kind === "send-message" && entry.message.type === "local-tool-permission" && entry.message.ask.status === "pending") {
+            upsert({ ...entry, message: { ...entry.message, ask: { ...entry.message.ask, status: "expired" } } });
+          } else if (entry.kind === "send-message" && entry.message.type === "widget" && entry.respondedValue == null && entry.widgetDismissed !== true) {
+            upsert({ ...entry, widgetDismissed: true });
+          }
         }
       }
     }

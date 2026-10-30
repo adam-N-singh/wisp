@@ -2,9 +2,11 @@
 // what the app leaves out; the review that comes before anything a plugin brings runs (each
 // server's exact command, arguments and environment, or its address, and the commit they come
 // from), and for an update what it changes (the version, each skill added, removed or changed
-// with its texts, the servers, other files); the Marketplaces tab (add by link, refresh, remove);
-// and the Skills tab, a search over every plugin's skills.
+// with its texts, the servers, other files); the switch that turns an installed plugin off and
+// on; the Marketplaces tab (add by link, refresh, what the daily check found, plugins a
+// marketplace removed, remove); and the Skills tab, a search over every plugin's skills.
 import { useEffect, useMemo, useState } from "react";
+import { lineDiff } from "../../shared/line-diff";
 import { type CatalogPlugin, type MarketplaceView, type PluginServerSpec, type PluginSkillChange, type PluginUpdate, type SkillCatalogEntry, UNSUPPORTED_LABELS } from "../../shared/marketplace";
 import type { McpCatalogEntry, McpServerSummary } from "../../shared/model";
 import { gateway, main } from "../bridge";
@@ -139,9 +141,13 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
           <div className="muted">{[plugin.marketplaceName, version != null ? `v${version}` : null, plugin.author].filter(Boolean).join(" · ")}</div>
         </div>
         {installed != null ? (
-          <span className="app-card__state">
-            <Icon name="check" size={12} /> Installed
-          </span>
+          <label className="plugin-switch" title={installed.enabled ? "Turn it off: its servers stop and agents don’t get its skills" : "Turn it back on"}>
+            <span className="switch">
+              <input type="checkbox" role="switch" checked={installed.enabled} disabled={busy != null} aria-label={`${entry.displayName} on`} onChange={(event) => void run("switch", async () => setMcpState(await gateway.setMcpPluginEnabled({ pluginId: plugin.pluginId, enabled: event.target.checked })))} />
+              <span />
+            </span>
+            {installed.enabled ? "On" : "Off"}
+          </label>
         ) : mode !== "install" ? (
           <button type="button" className="button button--primary" disabled={!canInstall} onClick={() => setMode("install")}>
             Review and install
@@ -214,8 +220,29 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
           <h3>Installed</h3>
           <p className="muted">
             At <span className="mono">{short(installed.commit)}</span> since {new Date(installed.updatedAt).toLocaleString()}.
-            {installed.delisted ? " Its marketplace no longer lists it; it stays installed until you uninstall it." : ""}
+            {installed.renamedFrom != null ? ` Its marketplace renamed it from “${installed.renamedFrom}”; its settings came along.` : ""}
+            {installed.delisted && !installed.removalRequested ? ` ${installed.removed ? "Its marketplace says it was removed" : "Its marketplace no longer lists it"}; it stays installed until you uninstall it.` : ""}
           </p>
+          {!installed.enabled ? <p className="plugin-off">Turned off: its servers are stopped and agents don’t get its skills. Its settings and sign-ins are kept for when you turn it back on.</p> : null}
+          {installed.removalRequested && mode !== "uninstall" ? (
+            <div className="plugin-update plugin-update--review">
+              <span>Its marketplace removed it and asks for it to be uninstalled. Nothing goes until you confirm.</span>
+              <button type="button" className="button button--small" onClick={() => setMode("uninstall")}>
+                Uninstall…
+              </button>
+            </div>
+          ) : null}
+          {installed.updateFound != null ? (
+            <div className={`plugin-update${installed.updateFound.serversChanged ? " plugin-update--review" : ""}`}>
+              <span>
+                The daily check, {new Date(installed.updateFound.checkedAt).toLocaleString()}, saw a new version at <span className="mono">{short(installed.updateFound.commit)}</span>.
+                {installed.updateFound.serversChanged ? " It runs or reaches something else." : ""} Refresh its marketplace to read it, then review the update; nothing updates by itself.
+              </span>
+              <button type="button" className="button button--small" disabled={busy != null} onClick={() => void run("refresh", () => gateway.refreshMarketplace({ id: plugin.marketplaceId }).then(setMarketplaces))}>
+                <Icon name="refresh" size={12} /> {busy === "refresh" ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
+          ) : null}
           {installed.updateAvailable && plugin.commit != null ? (
             <div className={`plugin-update${installed.serversChanged ? " plugin-update--review" : ""}`}>
               <span>
@@ -280,7 +307,9 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
           <p className="muted">
             {installed == null
               ? "Once it’s installed, every agent has these, read-only."
-              : installed.updateAvailable
+              : !installed.enabled
+                ? "Agents don’t have these while it’s turned off."
+                : installed.updateAvailable
                 ? "These are the new version’s skills: agents get them once you update. Review update shows what changes."
                 : "Every agent has these, read-only. Copy one to an agent from its Skills tab to change it."}
           </p>
@@ -295,7 +324,7 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
             {installed.servers.filter((spec) => servers.length === 1 || server.name.endsWith(`: ${spec.name}`)).map((spec) => (
               <ServerSpec key={spec.name} server={spec} where={where} />
             ))}
-            <ServerManage server={server} entry={entry} />
+            {installed.enabled ? <ServerManage server={server} entry={entry} /> : <p className="muted">Stopped while the plugin is off.</p>}
           </section>
         ))
       ) : plugin.servers.length > 0 && mode !== "install" ? (
@@ -449,29 +478,6 @@ function skillSummary(changes: { added: string[]; removed: string[]; changed: st
   return parts.length > 0 ? `Its skills change: ${parts.join(", ")}.` : "Its skills don’t change.";
 }
 
-/** A line diff of two texts (longest common subsequence); null when they're too long to compare here. */
-function lineDiff(before: string, after: string): Array<{ kind: "same" | "add" | "del"; text: string }> | null {
-  const a = before.split("\n");
-  const b = after.split("\n");
-  if ((a.length + 1) * (b.length + 1) > 1_000_000) return null;
-  // How long the common part of a[i…] and b[j…] is.
-  const common = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) common[i][j] = a[i] === b[j] ? common[i + 1][j + 1] + 1 : Math.max(common[i + 1][j], common[i][j + 1]);
-  }
-  const lines: Array<{ kind: "same" | "add" | "del"; text: string }> = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) lines.push({ kind: "same", text: a[i++] }), j++;
-    else if (common[i + 1][j] >= common[i][j + 1]) lines.push({ kind: "del", text: a[i++] });
-    else lines.push({ kind: "add", text: b[j++] });
-  }
-  while (i < a.length) lines.push({ kind: "del", text: a[i++] });
-  while (j < b.length) lines.push({ kind: "add", text: b[j++] });
-  return lines;
-}
-
 const CHANGE_LABELS: Record<PluginSkillChange["change"], string> = { changed: "Changed", added: "Added", removed: "Removed" };
 
 /**
@@ -622,10 +628,11 @@ export function MarketplacesTab({ browse }: { browse(marketplaceId: string): voi
 }
 
 function MarketplaceCard({ view, browse }: { view: MarketplaceView; browse(): void }) {
-  const [mode, setMode] = useState<"view" | "remove">("view");
-  const [busy, setBusy] = useState<"refresh" | "remove" | null>(null);
+  const [mode, setMode] = useState<"view" | "remove" | "remove-deleted">("view");
+  const [busy, setBusy] = useState<"refresh" | "remove" | "remove-deleted" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const act = async (kind: "refresh" | "remove", call: () => Promise<MarketplaceView[]>) => {
+  const removedNames = view.removedPlugins.map((plugin) => plugin.displayName).join(", ");
+  const act = async (kind: "refresh" | "remove" | "remove-deleted", call: () => Promise<MarketplaceView[]>) => {
     setBusy(kind);
     setError(null);
     try {
@@ -662,10 +669,26 @@ function MarketplaceCard({ view, browse }: { view: MarketplaceView; browse(): vo
           </>
         ) : null}
         {view.indexedAt != null ? `, ${new Date(view.indexedAt).toLocaleString()}` : ""}
+        {view.checkedAt != null && view.checkedAt !== view.indexedAt ? ` · checked for updates ${new Date(view.checkedAt).toLocaleString()}` : ""}
         {view.owner != null ? ` · by ${view.owner}` : ""}
       </div>
       {view.error != null ? <div className="form-error">The last refresh failed: {view.error} What it read before still stands.</div> : null}
       {view.updateCount > 0 ? <div className="plugin-update">{view.updateCount === 1 ? "An installed plugin has" : `${view.updateCount} installed plugins have`} a new version. Open each one to review it; nothing updates by itself.</div> : null}
+      {view.foundUpdateCount > 0 ? (
+        <div className="plugin-update">
+          <span>The daily check saw a new version of {view.foundUpdateCount === 1 ? "an installed plugin" : `${view.foundUpdateCount} installed plugins`}. Refresh to read {view.foundUpdateCount === 1 ? "it" : "them"}, then review each update; nothing updates by itself.</span>
+        </div>
+      ) : null}
+      {view.removedPlugins.length > 0 && mode !== "remove-deleted" ? (
+        <div className="plugin-update plugin-update--review">
+          <span>
+            It removed {removedNames} and asks for {view.removedPlugins.length === 1 ? "it" : "them"} to be uninstalled.
+          </span>
+          <button type="button" className="button button--small" onClick={() => setMode("remove-deleted")}>
+            Uninstall…
+          </button>
+        </div>
+      ) : null}
       {view.unfetchedCount > 0 ? (
         <div className="muted marketplace-card__note">
           {view.unfetchedCount === 1 ? "One plugin is kept in a repository of its own and read when you open it." : `${view.unfetchedCount} plugins are kept in repositories of their own and read when you open them.`}
@@ -681,7 +704,22 @@ function MarketplaceCard({ view, browse }: { view: MarketplaceView; browse(): vo
           </ul>
         </details>
       ) : null}
-      {mode === "remove" ? (
+      {mode === "remove-deleted" ? (
+        <div className="account-card__row">
+          <span>Uninstall {removedNames}? Their servers and sign-ins, skills and files are removed. Skills you copied to an agent stay.</span>
+          <button
+            type="button"
+            className="button button--danger button--small"
+            disabled={busy != null}
+            onClick={() => void act("remove-deleted", () => gateway.removeDeletedPlugins({ id: view.id, pluginIds: view.removedPlugins.map((plugin) => plugin.pluginId) }))}
+          >
+            {busy === "remove-deleted" ? "Uninstalling…" : "Uninstall"}
+          </button>
+          <button type="button" className="button button--ghost button--small" onClick={() => setMode("view")}>
+            Cancel
+          </button>
+        </div>
+      ) : mode === "remove" ? (
         <div className="account-card__row">
           <span>Remove {view.displayName}?{view.installedCount > 0 ? ` Its ${plural(view.installedCount, "installed plugin is", "installed plugins are")} uninstalled.` : ""}</span>
           <button type="button" className="button button--danger button--small" disabled={busy != null} onClick={() => void act("remove", () => gateway.removeMarketplace({ id: view.id }))}>

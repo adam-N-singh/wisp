@@ -8,7 +8,8 @@
 // at each refresh once it's installed. What a plugin offers is read from its files: skills
 // (skills/<name>/SKILL.md), MCP servers (.mcp.json) and .claude-plugin/plugin.json, or its
 // marketplace entry when it has no plugin.json. Hooks, commands, subagents and the rest are listed
-// as unsupported and never run.
+// as unsupported and never run. The file's `renames` (former names to current ones, or null for a
+// plugin removed) and `forceRemoveDeletedPlugins` are kept on the index for src/box/plugins.ts.
 import { createHash, randomBytes } from "node:crypto";
 import { cpSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, posix, relative } from "node:path";
@@ -36,6 +37,15 @@ export interface MarketplaceRecord {
   addedAt: number;
   /** The last refresh that failed, and why; the index it read before still stands. */
   error: string | null;
+  /** What the daily check last found (src/box/plugins.ts); a refresh clears it. */
+  check?: MarketplaceCheck | null;
+}
+
+/** The daily check's last look at a marketplace: newer files for installed plugins that no refresh has read. */
+export interface MarketplaceCheck {
+  at: number;
+  /** By installed plugin id: the commit the newer files are at, and whether its servers change with them. */
+  updates: Record<string, { commit: string; serversChanged: boolean }>;
 }
 
 /** Where a plugin's files are: a folder of the marketplace's repository ("" for its root), a GitHub repository, or a source the box can't fetch. */
@@ -106,6 +116,10 @@ export interface MarketplaceIndex {
   plugins: IndexedPlugin[];
   /** Entries that were skipped, one sentence each. */
   problems: string[];
+  /** `renames`, each chain followed to its end: a former name to the listed plugin it's now, or null when it was removed. */
+  renames?: Record<string, string | null>;
+  /** `forceRemoveDeletedPlugins`: plugins it no longer lists (or renamed) should be uninstalled. */
+  forceRemoveDeletedPlugins?: boolean;
 }
 
 export class MarketplaceError extends Error {}
@@ -298,8 +312,47 @@ export function pluginSource(value: unknown, pluginRoot: string, kind: Marketpla
   return { kind: "unsupported", reason: `Its source type “${value.source}” isn’t one Wisp knows.` };
 }
 
-/** The marketplace file: its name, description and owner, and an entry per plugin it lists. */
-export function readMarketplaceFile(content: string, kind: MarketplaceSource["kind"]): { name: string; displayName: string; description: string; owner: string | null; entries: Array<{ name: string; entry: Record<string, unknown>; source: PluginSource }>; problems: string[] } {
+/**
+ * `renames` as Claude Code follows it, from the oldest name: each former name to the listed plugin
+ * its chain ends at, or null for one that was removed. A chain that loops, or ends at a name that's
+ * neither listed nor null, is skipped with a note (Claude Code's validate refuses it).
+ */
+function resolveRenames(value: unknown, listed: Set<string>, problems: string[]): Record<string, string | null> {
+  if (value == null) return {};
+  if (!isRecord(value)) {
+    problems.push("Its renames isn’t a map of former names to current ones, so it was ignored.");
+    return {};
+  }
+  const resolved: Record<string, string | null> = {};
+  for (const from of Object.keys(value)) {
+    if (!isPluginName(from) || listed.has(from)) {
+      problems.push(`Its renames entry “${from}” was skipped: ${listed.has(from) ? "it lists a plugin with that name" : "that isn’t a plugin name"}.`);
+      continue;
+    }
+    const seen = new Set([from]);
+    let next: unknown = value[from];
+    let end: string | null | undefined;
+    for (;;) {
+      if (next === null) end = null;
+      else if (typeof next === "string" && listed.has(next)) end = next;
+      else if (typeof next === "string" && !seen.has(next) && Object.hasOwn(value, next)) {
+        seen.add(next);
+        next = value[next];
+        continue;
+      }
+      break;
+    }
+    if (end === undefined) problems.push(`Its renames entry “${from}” was skipped: it doesn’t lead to a plugin it lists, or to null.`);
+    else resolved[from] = end;
+  }
+  return resolved;
+}
+
+/** The marketplace file: its name, description and owner, an entry per plugin it lists, and its renames. */
+export function readMarketplaceFile(
+  content: string,
+  kind: MarketplaceSource["kind"],
+): { name: string; displayName: string; description: string; owner: string | null; entries: Array<{ name: string; entry: Record<string, unknown>; source: PluginSource }>; problems: string[]; renames: Record<string, string | null>; forceRemoveDeletedPlugins: boolean } {
   let json: unknown;
   try {
     json = JSON.parse(content.replace(/^﻿/, ""));
@@ -325,7 +378,39 @@ export function readMarketplaceFile(content: string, kind: MarketplaceSource["ki
     entries.push({ name: entry.name, entry, source });
   });
   const owner = isRecord(json.owner) ? text(json.owner.name) : null;
-  return { name, displayName: text(json.displayName) ?? name, description: text(json.description) ?? text(metadata.description) ?? "", owner, entries, problems };
+  const renames = resolveRenames(json.renames, new Set(entries.map((entry) => entry.name)), problems);
+  return { name, displayName: text(json.displayName) ?? name, description: text(json.description) ?? text(metadata.description) ?? "", owner, entries, problems, renames, forceRemoveDeletedPlugins: json.forceRemoveDeletedPlugins === true };
+}
+
+/** Where a plugin of the marketplace is now: its own name while listed, the name `renames` leads to, or null when it's gone. */
+export function currentName(index: Pick<MarketplaceIndex, "plugins" | "renames">, name: string): string | null {
+  if (index.plugins.some((plugin) => plugin.name === name)) return name;
+  const renamed = index.renames?.[name];
+  return renamed != null && index.plugins.some((plugin) => plugin.name === renamed) ? renamed : null;
+}
+
+/**
+ * The commit a GitHub repository's branch or tag (its default branch without one) is at now, from
+ * git's ref advertisement (`info/refs`, a few hundred bytes for most repositories), so the daily
+ * check downloads an archive only when it moved. A ref that is a commit is its own answer. Null
+ * when the host doesn't say (a mirror that serves only archives, say): the caller downloads.
+ */
+export async function remoteHead(hosts: MarketplaceHosts, repo: string, ref: string | null): Promise<string | null> {
+  if (ref != null && COMMIT.test(ref)) return ref;
+  let advertisement: string;
+  try {
+    advertisement = await fetchLimitedText(`${hosts.github.replace(/\/+$/, "")}/${repo}.git/info/refs?service=git-upload-pack`, { accept: "application/x-git-upload-pack-advertisement", webPage: "That isn’t git’s ref list." });
+  } catch {
+    return null;
+  }
+  // pkt-lines: "<4 hex length><sha> <ref>\0<capabilities>" for the first, "<length><sha> <ref>" after.
+  const refs = new Map<string, string>();
+  for (const line of advertisement.split("\n")) {
+    const match = /([0-9a-f]{40}) ([^\s\0]+)/.exec(line);
+    if (match != null && !refs.has(match[2])) refs.set(match[2], match[1]);
+  }
+  // A tag's own line names the tag object; the peeled line (^{}) names its commit.
+  return ref == null ? (refs.get("HEAD") ?? null) : (refs.get(`refs/tags/${ref}^{}`) ?? refs.get(`refs/heads/${ref}`) ?? refs.get(`refs/tags/${ref}`) ?? null);
 }
 
 // ---- a plugin's files -------------------------------------------------------------------
@@ -801,7 +886,20 @@ export async function indexMarketplace(source: MarketplaceSource, dir: string, h
       moveFolderSync(from, to);
       Object.assign(plugin, { ...before, entry: plugin.entry, files: { ...before.files, folder: `${snapshot}/plugins/${plugin.name}` } });
     }
-    return { schemaVersion: 1, name: file.name, displayName: file.displayName, description: file.description, owner: file.owner, commit, indexedAt: Date.now(), snapshot, plugins, problems: file.problems };
+    return {
+      schemaVersion: 1,
+      name: file.name,
+      displayName: file.displayName,
+      description: file.description,
+      owner: file.owner,
+      commit,
+      indexedAt: Date.now(),
+      snapshot,
+      plugins,
+      problems: file.problems,
+      renames: file.renames,
+      forceRemoveDeletedPlugins: file.forceRemoveDeletedPlugins,
+    };
   } catch (error) {
     rmSync(join(dir, snapshot), { recursive: true, force: true });
     throw error;

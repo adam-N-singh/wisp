@@ -9,7 +9,7 @@ import { readSlice, sliceKey, writeSlice } from "./slices";
 import { Store } from "./store";
 import { openTranscript } from "./transcripts";
 
-export type SettingsSection = "general" | "box" | "model" | "cloud" | "permissions" | "mcp" | "about";
+export type SettingsSection = "general" | "box" | "model" | "cloud" | "permissions" | "vault" | "mcp" | "about";
 
 /**
  * Connect Apps' front page: the apps (with marketplaces' plugins), their skills, the marketplaces
@@ -22,6 +22,8 @@ export type PaletteMode = "jump" | "search";
 
 export type Dialog =
   | { kind: "new-agent" }
+  /** New group chat (Mod+Shift+N). */
+  | { kind: "new-group" }
   | { kind: "edit-agent"; agentId: string }
   | { kind: "delete-agent"; agentId: string }
   | { kind: "onboarding" }

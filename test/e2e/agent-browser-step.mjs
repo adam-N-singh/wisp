@@ -4,8 +4,10 @@
 // file:// page, downloads a file into its workspace and gets a page's new window as a tab; a
 // page's confirm is dismissed on the agent's turn and shows in the toolbar on the user's; its call
 // waits while the user has taken over and runs when they hand back; a purchase-like click asks
-// and is denied; and browser_wait_for_user asks in the chat and goes on with the answer. Only
-// pages this test serves on this computer are opened.
+// and is denied; and browser_wait_for_user asks in the chat and goes on with the answer. A frame
+// from the page's own origin is read in its place and typed and clicked in; one from another
+// origin (this computer under its other name) is only named. Only pages this test serves on this
+// computer are opened.
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 
@@ -27,6 +29,8 @@ const PAGE = `<!doctype html>
   <div style="position:relative;display:inline-block"><button type="button">Hidden behind</button><div style="position:absolute;inset:0;background:rgba(0,0,0,.05)"></div></div>
   <form action="/order" method="post"><button>Buy now</button></form>
   <a href="/second">Second page</a>
+  <iframe title="Coupon frame" src="/frame" style="width:420px;height:110px"></iframe>
+  <iframe title="Other site" src="{{OTHER}}/frame" style="width:420px;height:110px"></iframe>
   <script>
     const $ = (id) => document.getElementById(id);
     $("greet").addEventListener("click", () => ($("out").textContent = "Hello, " + $("name").value + "!"));
@@ -38,6 +42,16 @@ const PAGE = `<!doctype html>
   </script>
 </body></html>`;
 
+/** A frame's page: a field and a button that says what was typed. */
+const FRAME = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Coupon</title></head>
+<body>
+  <label>Coupon code <input id="code"></label>
+  <button type="button" id="apply">Apply the coupon</button>
+  <p id="applied" role="status"></p>
+  <script>document.getElementById("apply").addEventListener("click", () => (document.getElementById("applied").textContent = "Applied " + document.getElementById("code").value));</script>
+</body></html>`;
+
 export async function startTestSite() {
   const orders = [];
   const server = createServer((request, response) => {
@@ -46,7 +60,11 @@ export async function startTestSite() {
       response.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="notes.txt"' });
       return response.end("notes from the test site");
     }
-    const body = request.url === "/second" ? "<!doctype html><title>Second page</title><h1>The second page</h1>" : request.url === "/order" ? "<!doctype html><title>Ordered</title><h1>Order placed</h1>" : PAGE;
+    // The page's second frame is this computer under its other name: another origin.
+    const host = String(request.headers.host ?? "");
+    const other = host.startsWith("localhost") ? host.replace("localhost", "127.0.0.1") : host.replace("127.0.0.1", "localhost");
+    const body =
+      request.url === "/second" ? "<!doctype html><title>Second page</title><h1>The second page</h1>" : request.url === "/order" ? "<!doctype html><title>Ordered</title><h1>Order placed</h1>" : request.url === "/frame" ? FRAME : PAGE.replace("{{OTHER}}", `http://${other}`);
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(body);
   });
@@ -150,6 +168,19 @@ export async function driveAgentBrowser({ app, page, send, conversation, site, s
   // Typing again on the same site doesn't ask.
   await send(`/tool browser_type ${JSON.stringify({ ref: name, text: "Grace" })}`);
   await lastOutput("Typed 5 characters");
+
+  // A frame from the page's origin is read in its place, and its field and button work with their refs;
+  // the frame from the other origin is named, with where it's from, and not read.
+  if (!/- iframe "Coupon frame"\n(?: {2,}- .*\n)* {2,}- textbox "Coupon code" \[ref=e\d+\]/.test(opened)) throw new Error(`the same-origin frame wasn't read in its place:\n${opened}`);
+  if (!/iframe "Other site" \[from http:\/\/localhost:\d+: its contents aren't read\]/.test(opened)) throw new Error(`the other origin's frame wasn't named as unread:\n${opened}`);
+  if ((opened.match(/textbox "Coupon code"/g) ?? []).length !== 1) throw new Error(`only the same-origin frame's field should show:\n${opened}`);
+  await send(`/tool browser_type ${JSON.stringify({ ref: refOf(opened, 'textbox "Coupon code"'), text: "SAVE10" })}`);
+  await lastOutput("Typed 6 characters");
+  const apply = refOf(opened, 'button "Apply the coupon"');
+  await send(`/tool browser_click ${JSON.stringify({ ref: apply })}`);
+  await lastOutput(`Clicked ${apply}`);
+  await send("/tool browser_snapshot {}");
+  await lastOutput("Applied SAVE10");
 
   // A dropdown's option is chosen by its label.
   await send(`/tool browser_type ${JSON.stringify({ ref: refOf(opened, 'combobox "Size" \\[options: "Small", "Large"\\]'), text: "large" })}`);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { agentScore, canHaveAgentBrowser, nameScore, pageMatches } from "../../src/renderer/palette-match";
 import type { AgentSummary } from "../../src/shared/model";
-import type { LibraryPage } from "../../src/shared/pages";
+import { type LibraryPage, pageId } from "../../src/shared/pages";
 
 function agent(id: string, name: string, extra: Partial<AgentSummary> = {}): AgentSummary {
   return {
@@ -48,7 +48,7 @@ test("Jump to's pages: newest of sidebar agents with nothing typed; with a query
     page("writer", "doc-dddddd", "Notes from the trip", 20),
     page("gone", "doc-eeeeee", "Trip from a deleted agent", 50),
   ];
-  const ids = (matches: ReturnType<typeof pageMatches>) => matches.map((match) => `${match.agent.id}/${match.page.page.documentId}`);
+  const ids = (matches: ReturnType<typeof pageMatches>) => matches.map((match) => `${match.agent.id}/${pageId(match.page.page)}`);
 
   // Nothing typed: the newest pages of agents in the sidebar, within the limit.
   assert.deepEqual(ids(pageMatches(pages, agents, "", 2)), ["writer/doc-bbbbbb", "writer/doc-dddddd"]);

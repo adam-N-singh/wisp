@@ -17,12 +17,14 @@ import { EdgeCallFailure } from "../shared/rpc/edge";
 import { type BoxConfig, gatewayEdge } from "../shared/edges";
 import { GATEWAY_CAPABILITIES, GATEWAY_PROTOCOL_VERSION, type LocalExecRequest, type LocalMachine, type LocalToolDescriptor, type ToolResult } from "../shared/gateway-protocol";
 import { MAX_ATTACHMENT_BYTES, mimeFor, safeFileName } from "../shared/mime";
+import { locatorPageId, pageKindOf } from "../shared/pages";
 import {
   AVATAR_COLORS,
   AVATAR_SHAPES,
   type AgentSummary,
   type ConversationMatch,
   type McpSignInTarget,
+  MAIN_SESSION,
   type MessageEntry,
   type MessageMatch,
   type ModelChoice,
@@ -63,8 +65,9 @@ import { catalogApp, type CatalogFile, catalogServer, mcpCatalog } from "./mcp-c
 import { addMemory, editMemory, MemoryError, reviewMemory } from "./memory";
 import { MessageActionError, nextFeedback, toggleReaction } from "./message-actions";
 import { conversationOutline } from "./outline";
-import { documentView, libraryPage, PageError, readDocument, requirePage, restoreRevision, revisionList, writePage } from "./pages";
+import { documentView, libraryPage, PageError, readCanvas, readDocument, storedPage, retitleCanvas, requirePage, restoreRevision, revisionList, writePage } from "./pages";
 import { PluginError, PluginHost } from "./plugins";
+import { RoomError, Rooms } from "./rooms";
 import { buildAutomation, Scheduler } from "./scheduler";
 import { buildSkill, fetchSkillText, skillFromMarkdown } from "./skills";
 import { BoxStore } from "./store";
@@ -95,6 +98,8 @@ export interface BoxHostOptions {
   mcpCatalog?: CatalogFile;
   /** Where plugin marketplaces are downloaded from; GitHub unless a test gives a fake. */
   marketplaceHosts?: MarketplaceHosts;
+  /** The clock the daily plugin update check goes by; the real one unless a test moves it on. */
+  marketplaceClock?: () => number;
   /** Extra routes behind the token (the standalone server's /admin); resolve true when handled. */
   routes?(request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean>;
   log(line: string): void;
@@ -110,6 +115,8 @@ export interface BoxHost {
   mcpSignInTarget(serverId: string): McpSignInTarget;
   /** The server's sign-in was saved or removed: connect it again. */
   mcpSignInChanged(serverId: string): void;
+  /** Runs the daily plugin update check now for the marketplaces it's due (it otherwise looks every hour). */
+  checkPluginUpdates(): Promise<void>;
   close(): void;
 }
 
@@ -187,7 +194,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
   const mcp = new McpManager(() => broadcast("apps-state", mcpState()), log, options.mcpAuth);
   /** The servers as clients see them, stamped with the change they reflect. */
   const mcpState = () => ({ servers: mcp.state(store.mcpServers()), ordered: mcp.ordered() });
-  mcp.sync(store.mcpServers());
+  // The servers start once the plugins are read (below): a plugin turned off keeps its servers stopped.
 
   // Claude Code runs reach back into this box through the bridge MCP server.
   let bridgePort = 0;
@@ -204,7 +211,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       bridgeScript: join(__dirname, "..", "claude-bridge", "main.cjs"),
     },
     tempDir: join(options.dataDir, "claude-code"),
-    mcpServers: () => store.mcpServers(),
+    mcpServers: () => plugins.runnable(store.mcpServers()),
     mcpHttpHeaders: (server) => mcp.clientHeaders(server.id),
     log,
   });
@@ -255,14 +262,15 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     store,
     emit: broadcast,
     patchAgent: (agentId, patch) => harness.patchAgent(agentId, patch),
-    ended: (record, text, wake) => harness.notifyQuietly(record.agentId, text, wake),
+    // The session that started it hears how it ended (a group chat member's, in its room).
+    ended: (record, text, wake) => harness.notifyQuietly(record.agentId, text, wake, record.sessionId ?? MAIN_SESSION),
     controlLocal,
     localHost: () => (localExec?.stream != null ? (localExec.machine?.hostname ?? localExec.label) : null),
     cloud,
     log,
   });
 
-  const harness = new Harness({
+  const harness: Harness = new Harness({
     store,
     models: () => config?.models ?? null,
     resolveDeps,
@@ -276,6 +284,22 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     cloud,
     cloudConfig: () => config?.cloud ?? null,
     asyncTasks,
+    // Members' room sessions (rooms.ts); the hooks run only once the box is serving.
+    sessions: {
+      instructions: (agentId, sessionId) => rooms.hooks.instructions?.(agentId, sessionId) ?? null,
+      live: (agentId, sessionId, live) => rooms.hooks.live?.(agentId, sessionId, live),
+      entry: (agentId, sessionId, entry) => rooms.hooks.entry?.(agentId, sessionId, entry),
+      activity: (agentId, sessionId, payload) => rooms.hooks.activity?.(agentId, sessionId, payload),
+      wake: (agentId, sessionId) => rooms.hooks.wake?.(agentId, sessionId) ?? false,
+    },
+    emit: broadcast,
+    log,
+  });
+  // Group chats: the rooms' turns, run in their members' `group:<roomId>` sessions.
+  const rooms: Rooms = new Rooms({
+    store,
+    harness: () => harness,
+    newRow: (input) => newAgent(input),
     emit: broadcast,
     log,
   });
@@ -293,7 +317,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     hosts: options.marketplaceHosts ?? (mirror && isSecureEndpoint(mirror) ? { github: mirror } : GITHUB_HOSTS),
     // `${VAR}` in a plugin's server reads only what the server itself gets: the basics, not the box's keys.
     env: basicEnv(),
-    syncServers: () => mcp.sync(store.mcpServers()),
+    syncServers: () => syncMcp(),
     forgetServer: (serverId) => mcp.forget(serverId),
     newServerId: (name) => newMcpServerId(name),
     serverStatus: (serverId) => mcp.state(store.mcpServers()).find((server) => server.id === serverId)?.status ?? null,
@@ -301,9 +325,14 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       for (const agent of store.rosterAgents()) emitSkills(agent.id);
     },
     changed: () => broadcast("marketplaces", { marketplaces: plugins.marketplaces() }),
+    now: options.marketplaceClock ?? Date.now,
     log,
   });
+  /** Starts, stops and restarts the box's servers to match the store; a turned-off plugin's stay stopped. */
+  const syncMcp = () => mcp.sync(plugins.runnable(store.mcpServers()));
   plugins.load();
+  syncMcp();
+  plugins.startChecks();
 
   const scheduler = new Scheduler(
     store,
@@ -358,14 +387,29 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     if (agent == null) throw new CommandError(404, `No agent ${id}`, "message.no-agent");
     return agent;
   };
+  /** An agent that isn't a group chat: a room has no skills, automations or template of its own. */
+  const requireBot = (id: string, what: string) => {
+    const agent = requireAgent(id);
+    if (agent.isGroup) throw new CommandError(400, `A group chat has no ${what} of its own; its bots do.`, "group/refused");
+    return agent;
+  };
+  /** A group chat call; its refusals are for the user. */
+  const roomCall = <T>(run: () => T): T => {
+    try {
+      return run();
+    } catch (error) {
+      if (!(error instanceof RoomError)) throw error;
+      throw new CommandError(error.code === "missing" ? 404 : 400, error.message, error.code === "missing" ? "group/not-found" : "group/refused");
+    }
+  };
 
-  const tailPage = (id: string, beforeSeq: number | undefined, limit: number) => {
-    const entries = store.entries(id);
+  const tailPage = (id: string, beforeSeq: number | undefined, limit: number, sessionId: string = MAIN_SESSION) => {
+    const entries = store.entries(id, sessionId);
     const end = beforeSeq == null ? entries.length : entries.findIndex((entry) => entry.seq >= beforeSeq);
     const stop = end < 0 ? entries.length : end;
     const startIndex = Math.max(0, stop - limit);
     const page = entries.slice(startIndex, stop).map((entry) => publicEntry(entry));
-    return { entries: page, ...(startIndex > 0 ? { nextBeforeSeq: page[0]?.seq } : {}), ordered: store.ordered(id) };
+    return { entries: page, ...(startIndex > 0 ? { nextBeforeSeq: page[0]?.seq } : {}), ordered: store.ordered(id, sessionId) };
   };
 
   const upserted = (agent: AgentSummary | null) => {
@@ -475,10 +519,10 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     if (skill != null) throw new CommandError(409, `“${skill.name}” comes with the plugin ${skill.pluginName}. Copy it to the agent to change it.`, "plugin/skill");
   };
   /** A reaction or vote on one of the agent's entries; refusals are for the user. */
-  const actOnMessage = (agentId: string, entryId: string, change: (entry: TranscriptEntry) => void): null => {
+  const actOnMessage = (agentId: string, entryId: string, change: (entry: TranscriptEntry) => void, sessionId: string = MAIN_SESSION): null => {
     requireAgent(agentId);
     try {
-      harness.annotate(agentId, entryId, change);
+      harness.annotate(agentId, entryId, change, sessionId);
     } catch (error) {
       if (!(error instanceof MessageActionError)) throw error;
       throw new CommandError(error.code === "missing" ? 404 : error.code === "streaming" ? 409 : 400, error.message);
@@ -492,7 +536,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     try {
       const found = skillFromMarkdown(text, name);
       if ("reason" in found) throw new Error(found.reason);
-      const skill = store.putSkill(buildSkill(agentId, { ...found.spec, sourceRef }, store.listSkills(agentId)), found.extra);
+      const skill = store.putSkill(buildSkill(agentId, { ...found.spec, sourceRef }, store.skillNamesInUse(agentId)), found.extra);
       result.imported.push({ id: skill.id, name: skill.name });
       emitSkills(agentId);
     } catch (error) {
@@ -584,8 +628,17 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         ...(memoryReview != null ? { memoryReview } : {}),
       });
     },
+    makeGroupChat: ({ name, description, memberAgentIds, humanMemberUserIds, clientNonce }) =>
+      roomCall(() => {
+        if ((humanMemberUserIds ?? []).length > 0) throw new CommandError(400, "Group chats with people aren't supported. Only bots can join.", "group/refused");
+        return { agent: rooms.makeGroupChat({ name, description, memberAgentIds, clientNonce }), transcript: [] };
+      }),
+    changeGroupMembers: ({ id, memberAgentIds }) => roomCall(() => rooms.setMembers(id, memberAgentIds)),
     removeAgents: ({ ids }) => {
       for (const id of ids) {
+        // A room's members stay; a member leaves its rooms.
+        if (rooms.isRoom(id)) rooms.deleteRoom(id);
+        else rooms.memberDeleted(id);
         harness.interrupt(id);
         asyncTasks.forgetAgent(id);
         store.deleteAgent(id);
@@ -594,7 +647,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       return { transcript: [] };
     },
     copyAgent: ({ id }) => {
-      const source = requireAgent(id);
+      const source = requireBot(id, "copy");
       const agent = store.putAgent({ ...newAgent({ name: `${source.name} (copy)`, description: source.description, avatarShape: source.avatarShape, avatarColor: source.avatarColor }), instructions: source.instructions, model: source.model, computer: source.computer });
       upserted(agent);
       return { agent, transcript: [] };
@@ -615,8 +668,10 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       harness.patchAgent(id, { notifyOnUpdatesEnabled: isEnabled });
       return null;
     },
-    followTranscript: ({ id, limit }) => {
+    followTranscript: ({ id, limit, sessionId }) => {
       const agent = requireAgent(id);
+      // Another session is only read: opening it doesn't open the agent's chat.
+      if (sessionId != null && sessionId !== MAIN_SESSION) return { ...tailPage(id, undefined, limit, sessionId), unreadAnchor: { kind: "none" } };
       const page = tailPage(id, undefined, limit);
       const unread = agent.unreadCount ?? 0;
       const firstUnread = unread > 0 && agent.lastViewedAt != null ? page.entries.find((entry) => entry.timestampMs > agent.lastViewedAt! && !(entry.kind === "message" && entry.role === "user")) : undefined;
@@ -624,15 +679,21 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       harness.patchAgent(id, { hasUnread: false, unreadCount: 0, lastViewedAt: Date.now(), isActive: true });
       return { ...page, unreadAnchor: firstUnread != null ? { kind: "at", entryId: firstUnread.id, seq: firstUnread.seq, newerRows: page.entries.filter((e) => e.seq >= firstUnread.seq).length } : { kind: "none" } };
     },
-    readTranscriptEnd: ({ id, beforeSeq, limit }) => {
+    readTranscriptEnd: ({ id, beforeSeq, limit, sessionId }) => {
       requireAgent(id);
-      return tailPage(id, beforeSeq, limit);
+      return tailPage(id, beforeSeq, limit, sessionId ?? MAIN_SESSION);
     },
     deliverMessage: (args) => {
-      requireAgent(args.agentId);
+      const agent = requireAgent(args.agentId);
       const attachmentPaths: string[] = args.attachmentPaths ?? [];
       if (args.prompt.trim().length === 0 && attachmentPaths.length === 0) throw new CommandError(400, "Nothing to send.", "message.rejected");
       if (args.prompt.length > 200_000) throw new CommandError(400, "Message too long.", "message.rejected");
+      // A member's room session hears only from its room.
+      if (args.sessionId?.startsWith("group:")) throw new CommandError(400, "A bot’s group chat session takes its messages from the group chat.", "send/refused");
+      if (agent.isGroup) {
+        if (attachmentPaths.length > 0 || args.voiceMemo != null) throw new CommandError(400, "Group chats take text messages only for now.", "send/refused");
+        return { accepted: roomCall(() => rooms.post(agent.id, { prompt: args.prompt, clientNonce: args.clientNonce ?? null, replyToId: args.replyToId ?? null, replyQuote: args.replyQuote ?? null })) };
+      }
       // A voice memo is one recording from the attachment store, which is all the UI plays from.
       if (args.voiceMemo != null && (attachmentPaths.length !== 1 || !isInside(attachmentPaths[0], attachmentsDir))) {
         throw new CommandError(400, "A voice memo is one recording attached in the app.", "send/voice-memo-refused");
@@ -647,38 +708,51 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         voiceMemo: args.voiceMemo,
         replyToId: args.replyToId ?? null,
         replyQuote: args.replyQuote ?? null,
+        ...(args.sessionId != null && args.sessionId !== MAIN_SESSION ? { sessionId: args.sessionId } : {}),
       });
       return { accepted: true };
     },
-    stopAgentRun: ({ id }) => ({ hadActiveRun: harness.interrupt(id) }),
-    resetConversation: ({ id }) => {
-      requireAgent(id);
-      harness.startFresh(id);
+    // A group chat's Stop stops every member's turn in it.
+    stopAgentRun: ({ id, sessionId }) => ({ hadActiveRun: rooms.isRoom(id) ? rooms.stop(id) : harness.interrupt(id, sessionId ?? MAIN_SESSION) }),
+    resetConversation: ({ id, sessionId }) => {
+      const agent = requireAgent(id);
+      if (agent.isGroup) rooms.startFresh(id);
+      else harness.startFresh(id, sessionId ?? MAIN_SESSION);
       return null;
     },
-    answerCard: ({ agentId, entryId, value }) => ({ accepted: harness.answerCard(agentId, entryId, value) }),
-    closeCard: ({ agentId, entryId }) => ({ accepted: harness.closeCard(agentId, entryId) }),
-    answerToolApproval: ({ agentId, entryId, requestId, resolution }) => {
+    answerCard: ({ agentId, entryId, value, sessionId }) => ({ accepted: harness.answerCard(agentId, entryId, value, sessionId ?? MAIN_SESSION) }),
+    closeCard: ({ agentId, entryId, sessionId }) => ({ accepted: harness.closeCard(agentId, entryId, sessionId ?? MAIN_SESSION) }),
+    answerToolApproval: ({ agentId, entryId, requestId, resolution, sessionId }) => {
       try {
-        harness.resolvePermission(agentId, entryId, requestId, resolution);
+        harness.resolvePermission(agentId, entryId, requestId, resolution, sessionId ?? MAIN_SESSION);
       } catch (error) {
         throw new CommandError(409, error instanceof Error ? error.message : String(error), "approval.stale");
       }
       return null;
     },
-    setReaction: ({ agentId, entryId, emoji }) =>
-      actOnMessage(agentId, entryId, (entry) => {
-        const reactions = toggleReaction(entry, emoji, "user");
-        if (reactions.length > 0) entry.reactions = reactions;
-        else delete entry.reactions;
-      }),
-    rateReply: ({ agentId, entryId, action, categories, comment }) =>
-      actOnMessage(agentId, entryId, (entry) => {
-        const feedback = nextFeedback(entry, action, categories, comment);
-        if (entry.kind !== "message") return;
-        if (feedback != null) entry.feedback = feedback;
-        else delete entry.feedback;
-      }),
+    setReaction: ({ agentId, entryId, emoji, sessionId }) =>
+      actOnMessage(
+        agentId,
+        entryId,
+        (entry) => {
+          const reactions = toggleReaction(entry, emoji, "user");
+          if (reactions.length > 0) entry.reactions = reactions;
+          else delete entry.reactions;
+        },
+        sessionId ?? MAIN_SESSION,
+      ),
+    rateReply: ({ agentId, entryId, action, categories, comment, sessionId }) =>
+      actOnMessage(
+        agentId,
+        entryId,
+        (entry) => {
+          const feedback = nextFeedback(entry, action, categories, comment);
+          if (entry.kind !== "message") return;
+          if (feedback != null) entry.feedback = feedback;
+          else delete entry.feedback;
+        },
+        sessionId ?? MAIN_SESSION,
+      ),
     findInConversation: ({ agentId, query, beforeSeq, limit }) => {
       requireAgent(agentId);
       const max = limit ?? 50;
@@ -705,7 +779,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       if (entry?.kind !== "tool-call") throw new CommandError(404, "That tool call isn’t in this conversation any more.");
       return entry.detail ?? null;
     },
-    readAgentTodos: ({ id }) => store.todos(id),
+    readAgentTodos: ({ id, sessionId }) => store.todos(id, sessionId ?? MAIN_SESSION),
     readAsyncTasks: ({ id }) => {
       requireAgent(id);
       return asyncTasks.info(id);
@@ -729,7 +803,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     },
     listAgentAutomations: ({ id }) => store.listAutomations(id),
     addAgentAutomation: ({ id, spec }) => {
-      requireAgent(id);
+      requireBot(id, "automations");
       let automation;
       try {
         automation = buildAutomation(id, spec);
@@ -774,8 +848,8 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     },
     listAgentSkills: ({ id }) => store.listSkills(id),
     addAgentSkill: ({ id, spec }) => {
-      requireAgent(id);
-      store.putSkill(checked(() => buildSkill(id, spec, store.listSkills(id))));
+      requireBot(id, "skills");
+      store.putSkill(checked(() => buildSkill(id, spec, store.skillNamesInUse(id))));
       emitSkills(id);
       return store.listSkills(id);
     },
@@ -783,7 +857,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       refusePluginSkill(id, skillId);
       const existing = store.getSkill(id, skillId);
       if (existing == null) throw new CommandError(404, "No such skill.");
-      store.putSkill(checked(() => buildSkill(id, spec, store.listSkills(id), existing)));
+      store.putSkill(checked(() => buildSkill(id, spec, store.skillNamesInUse(id), existing)));
       emitSkills(id);
       return store.listSkills(id);
     },
@@ -794,7 +868,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       return store.listSkills(id);
     },
     runAgentSkillNow: ({ id, skillId }) => {
-      requireAgent(id);
+      requireBot(id, "skills");
       // A plugin's skill keeps no runs: it just runs.
       const fromPlugin = store.pluginSkill(id, skillId);
       if (fromPlugin != null) harness.runSkill(fromPlugin, false);
@@ -802,22 +876,22 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       return null;
     },
     copyPluginSkill: ({ id, skillId }) => {
-      requireAgent(id);
+      requireBot(id, "skills");
       const skill = store.pluginSkills().find((candidate) => candidate.id === skillId);
       if (skill == null) throw new CommandError(404, "No such plugin skill.");
-      // Its own name, made unique among the agent's skills.
-      const own = store.listSkills(id).filter((candidate) => candidate.source !== "plugin");
+      // Its own name, made unique among the agent's skills and the plugins' commands.
+      const taken = store.skillNamesInUse(id);
       const base = skill.name.slice(skill.name.indexOf(":") + 1);
       let name = base;
-      for (let count = 2; own.some((candidate) => skillCommand(candidate.name) === skillCommand(name)); count++) name = `${base}-${count}`;
+      for (let count = 2; taken.some((candidate) => skillCommand(candidate.name) === skillCommand(name)); count++) name = `${base}-${count}`;
       return importSkill(id, skill.name, skill.text, skill.sourceRef, name);
     },
     importSkillText: ({ id, markdown, name }) => {
-      requireAgent(id);
+      requireBot(id, "skills");
       return importSkill(id, "Pasted Markdown", markdown, null, name);
     },
     importSkillFromLink: async ({ id, url, name }) => {
-      requireAgent(id);
+      requireBot(id, "skills");
       if (!/^https?:$/.test(new URL(url).protocol)) throw new CommandError(400, "Only http(s) addresses can be imported.");
       let text: string;
       try {
@@ -853,7 +927,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     templateExportRules: () => ({ exportPolicy: "all" }),
     listStarterTemplates: ({ category }) => botMarketplace(undefined, category),
     createBotTemplateVersion: ({ sourceAgentId, include }) => {
-      const agent = requireAgent(sourceAgentId);
+      const agent = requireBot(sourceAgentId, "template");
       return templateCall(() => saveTemplateVersion(store, agent, include, catalogLookup));
     },
     addAgentFromTemplate: ({ template: sent, name, avatarShape, avatarColor }) => {
@@ -884,7 +958,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         throw new CommandError(400, error instanceof Error ? error.message : String(error), "mcp-config-refused");
       }
       store.putMcpServer({ id: newMcpServerId(name), ...parsed, enabled: true });
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return mcpState();
     },
     readAppCatalog: () => [...mcpCatalog(options.mcpCatalog), ...plugins.catalogEntries()],
@@ -917,20 +991,20 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         id = newMcpServerId(key.length > 0 ? `${entryId}-${key}` : entryId);
         store.putMcpServer({ id, name: app.name, transport: "http", ...endpoint, enabled: true, pluginId: entryId, accountKey: key });
       }
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return { ...mcpState(), serverId: id };
     },
     switchMcpTool: ({ serverId, toolName }) => {
       const server = requireMcpServer(serverId);
       const disabled = server.disabledTools ?? [];
       store.putMcpServer({ ...server, disabledTools: disabled.includes(toolName) ? disabled.filter((name) => name !== toolName) : [...disabled, toolName] });
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return mcp.toolsOf(serverId);
     },
     changeAppInstructions: ({ serverId, instructions }) => {
       const server = requireMcpServer(serverId);
       store.putMcpServer({ ...server, customInstructions: instructions.trim() });
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return mcpState();
     },
     relabelMcpAccount: ({ serverId, accountKey, newAccountKey }) => {
@@ -940,14 +1014,14 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         throw new CommandError(409, key.length > 0 ? `You already have a ${server.name} account called “${key}”.` : `Another ${server.name} account has no name. Name this one.`);
       }
       store.putMcpServer({ ...server, accountKey: key });
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return mcpState();
     },
     dropMcpAccount: ({ serverId, accountKey }) => {
       requireMcpAccount(serverId, accountKey);
       refusePluginServer(serverId);
       store.deleteMcpServer(serverId);
-      mcp.sync(store.mcpServers());
+      syncMcp();
       mcp.forget(serverId);
       return mcpState();
     },
@@ -966,17 +1040,23 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       }),
     getPluginUpdate: ({ pluginId }) => pluginCall(() => plugins.pluginUpdate(pluginId)),
     dropPlugin: ({ pluginId }) => ({ removed: plugins.uninstall(pluginId), reason: null, state: mcpState() }),
+    setMcpPluginEnabled: ({ pluginId, enabled }) =>
+      pluginCall(() => {
+        plugins.setEnabled(pluginId, enabled);
+        return mcpState();
+      }),
+    removeDeletedPlugins: ({ id, pluginIds }) => pluginCall(() => plugins.removeDeleted(id, pluginIds)),
     dropMcpServer: ({ serverId }) => {
       refusePluginServer(serverId);
       store.deleteMcpServer(serverId);
-      mcp.sync(store.mcpServers());
+      syncMcp();
       mcp.forget(serverId);
       return mcpState();
     },
     setMcpServerEnabled: ({ serverId, enabled }) => {
       const server = requireMcpServer(serverId);
       store.putMcpServer({ ...server, enabled });
-      mcp.sync(store.mcpServers());
+      syncMcp();
       return mcpState();
     },
     mcpServerTools: ({ serverId }) => mcp.toolsOf(serverId),
@@ -1064,8 +1144,8 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       }),
     pageEditAccess: ({ locator }) =>
       pageCall(locator.storeId, (agent) => {
-        requirePage(store, agent.id, locator.documentId);
-        return harness.editRight(agent.id, locator.documentId);
+        requirePage(store, agent.id, locatorPageId(locator));
+        return harness.editRight(agent.id, locatorPageId(locator));
       }),
     writePage: ({ locator, source, baseRevision }) =>
       pageCall(locator.storeId, (agent) => {
@@ -1074,27 +1154,35 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
         if (saved.changed) harness.pageChanged(agent.id, saved.record, saved.source, "edited", "user");
         return documentView(agent.id, saved.record, saved.source);
       }),
-    // Documents only (no canvases yet).
-    libraryPages: ({ includeDocuments }) =>
-      includeDocuments
-        ? store
-            .rosterAgents()
-            .flatMap((agent) => store.listPages(agent.id).map((record) => libraryPage(agent.id, record)))
-            .sort((a, b) => b.updatedAt - a.updatedAt)
-        : [],
-    libraryDocuments: ({ agentId }) => pageCall(agentId, (agent) => store.listPages(agent.id).map((record) => libraryPage(agent.id, record))),
-    listPageRevisions: ({ locator }) => pageCall(locator.storeId, (agent) => revisionList(requirePage(store, agent.id, locator.documentId))),
+    canvasPage: ({ locator, revision }) =>
+      pageCall(locator.storeId, (agent) => {
+        const read = readCanvas(store, agent.id, locator.canvasId, revision);
+        return documentView(agent.id, read.record, read.source, read.revision);
+      }),
+    retitleCanvas: ({ storeId, canvasId, title }) =>
+      pageCall(storeId, (agent) => {
+        checkNotWriting(agent, canvasId);
+        const renamed = retitleCanvas(store, agent.id, canvasId, title);
+        if (renamed.changed) harness.pageChanged(agent.id, renamed.record, readCanvas(store, agent.id, canvasId).source, "renamed", "user");
+        return { title: renamed.record.title };
+      }),
+    libraryPages: ({ includeDocuments, agentId }) =>
+      (agentId != null ? [requireAgent(agentId)] : store.rosterAgents())
+        .flatMap((agent) => store.listPages(agent.id).filter((record) => includeDocuments || record.kind === "canvas").map((record) => libraryPage(agent.id, record)))
+        .sort((a, b) => b.updatedAt - a.updatedAt),
+    libraryDocuments: ({ agentId }) => pageCall(agentId, (agent) => store.listPages(agent.id).filter((record) => record.kind === "document").map((record) => libraryPage(agent.id, record))),
+    listPageRevisions: ({ locator }) => pageCall(locator.storeId, (agent) => revisionList(requirePage(store, agent.id, locatorPageId(locator)))),
     restorePageRevision: ({ locator, revision, baseRevision }) =>
       pageCall(locator.storeId, (agent) => {
-        checkNotWriting(agent, locator.documentId);
-        const restored = restoreRevision(store, agent.id, locator.documentId, revision, baseRevision);
+        checkNotWriting(agent, locatorPageId(locator));
+        const restored = restoreRevision(store, agent.id, locatorPageId(locator), revision, baseRevision);
         if (restored.changed) harness.pageChanged(agent.id, restored.record, restored.source, "restored", "user");
         return documentView(agent.id, restored.record, restored.source);
       }),
     deletePage: ({ locator }) =>
       pageCall(locator.storeId, (agent) => {
-        checkNotWriting(agent, locator.documentId);
-        const removed = store.deletePage(agent.id, locator.documentId);
+        checkNotWriting(agent, locatorPageId(locator));
+        const removed = store.deletePage(agent.id, locatorPageId(locator));
         if (removed == null) throw new PageError("missing", "That page isn’t there any more.");
         harness.pageChanged(agent.id, removed, "", "deleted", "user");
         return null;
@@ -1182,6 +1270,24 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     createReadStream(path).pipe(response);
   };
 
+  /**
+   * GET /pages/<agentId>/<pageId>[?rev=<n>]: a page and one revision's text (readPage's shape),
+   * which main's `wisp-canvas://` reads to serve a canvas frame, from a box on this PC or a server.
+   */
+  const handlePage = (url: URL, response: ServerResponse) => {
+    const [, , storeId = "", id = "", ...rest] = url.pathname.split("/");
+    const rev = url.searchParams.get("rev");
+    const agent = /^[\w-]+$/.test(storeId) ? store.getAgent(storeId) : undefined;
+    if (rest.length > 0 || agent == null || pageKindOf(id) == null || (rev != null && !/^[1-9]\d{0,8}$/.test(rev))) return json(response, 404, { error: "There’s no such page.", failureCode: "page/not-found" });
+    try {
+      const read = storedPage(store, agent.id, id, rev != null ? Number(rev) : undefined);
+      return json(response, 200, documentView(agent.id, read.record, read.source, read.revision));
+    } catch (error) {
+      if (!(error instanceof PageError)) throw error;
+      return json(response, 404, { error: error.message, failureCode: "page/not-found" });
+    }
+  };
+
   const readMachine = (value: unknown): LocalMachine | null => {
     if (typeof value !== "object" || value == null) return null;
     const machine = value as Record<string, unknown>;
@@ -1237,6 +1343,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       }
       if (request.method === "POST" && url.pathname === "/attachments") return await handleUpload(url, request, response);
       if (request.method === "GET" && url.pathname === "/media") return handleMedia(url, response);
+      if (request.method === "GET" && url.pathname.startsWith("/pages/")) return handlePage(url, response);
       if (request.method === "POST" && url.pathname === "/pc/register") {
         const body = (await readJson(request)) as { tools?: LocalToolDescriptor[]; label?: string; machine?: unknown; tasks?: unknown };
         const machine = readMachine(body.machine);
@@ -1320,6 +1427,7 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     if (bridgeServer == null) bridgePort = port;
   } catch (error) {
     clearInterval(keepAlive);
+    plugins.stopChecks();
     scheduler.stop();
     asyncTasks.stop();
     harness.shutdown();
@@ -1365,12 +1473,15 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
       return mcp.signInTarget(server);
     },
     mcpSignInChanged: (serverId) => mcp.restart(serverId),
+    checkPluginUpdates: () => plugins.checkDue(),
     close: () => {
       if (closed) return;
       closed = true;
       clearInterval(keepAlive);
+      plugins.stopChecks();
       scheduler.stop();
       asyncTasks.stop();
+      rooms.shutdown();
       harness.shutdown();
       mcp.stopAll();
       store.close();

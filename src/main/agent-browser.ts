@@ -9,13 +9,26 @@
 // Main drives each tab over the DevTools protocol (webContents.debugger): the accessibility tree
 // for snapshots (agent-browser-snapshot.ts), DOM quads and trusted mouse and key events for
 // actions, and an isolated world for the few page reads that need script (form, focus, scroll),
-// out of reach of the page's own scripts. The daemon has already planned and allowed each call
-// (src/local-exec/browser-tools.ts); here a call also waits while the user has the browser, and
-// is refused when the page has moved to another site since it was rated.
+// out of reach of the page's own scripts. A frame from the page's own origin runs in the page's
+// renderer, so its tree is read into the snapshot and its elements are acted on like the page's,
+// each in an isolated world of its own frame; any other frame is only named. The daemon has
+// already planned and allowed each call (src/local-exec/browser-tools.ts); here a call also waits
+// while the user has the browser, and is refused when the page has moved to another site since it
+// was rated.
 //
 // The window's toolbar (src/renderer/agent-browser/) shows who drives, with Take over / Hand back.
 // Page permission prompts are refused, downloads go to the agent's workspace, popups become tabs,
-// and only http(s) pages open. fillByRef is the seam for a trusted filler (a future vault).
+// and only http(s) pages open. Each agent's window opens where the user last left it
+// (agent-browser-bounds.ts).
+//
+// The vault (src/main/vault.ts) fills logins and contact info through `vault()`: it reads the
+// page's real origin and each field's own document here, and the values go straight into the page
+// (Input.insertText), never through the daemon. A filled field stays masked for the agent: its
+// snapshot line says "filled from your vault"; screenshots paint over it and anything else on screen
+// holding a value (a restored or swapped field, a pasted copy, an echo on the next page); every value
+// is blanked wherever a reply, an error or a card would repeat it (agent-browser-mask.ts); copying
+// and cutting aren't pressed while the window holds values, nor pasting one; and read_clipboard
+// gets the clipboard with them blanked.
 //
 // A page's alert and confirm come here instead of Electron's native message box, which isn't tied
 // to the agent's window and stays on screen when the dialog is answered some other way: while the
@@ -27,15 +40,34 @@
 // Electron throws in the page.)
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { BaseWindow, type IpcMain, type Session, session as sessions, type WebContents, WebContentsView } from "electron";
-import { AGENT_BROWSER_PARTITION, type BrowserPlanInfo, type BrowserRunReply, type BrowserTarget, type BrowserToolName, checkBrowserUrl, parseKeyChord, siteLabel, siteOf, untrustedPage } from "../shared/agent-browser";
+import { BaseWindow, clipboard, type IpcMain, nativeImage, screen, type Session, session as sessions, type WebContents, WebContentsView } from "electron";
+import {
+  AGENT_BROWSER_PARTITION,
+  type BrowserPlanInfo,
+  type BrowserRunReply,
+  type BrowserTarget,
+  type BrowserToolName,
+  checkBrowserUrl,
+  clipboardChord,
+  type KeyChord,
+  parseKeyChord,
+  sensitiveField,
+  siteLabel,
+  siteOf,
+  untrustedPage,
+} from "../shared/agent-browser";
 import type { EdgeEmitter } from "../shared/rpc/edge";
 import { serveEdge } from "../shared/rpc/runtime";
 import { ipcServerTransport } from "../shared/rpc/transports";
 import { type AgentBrowserState, agentBrowserToolbarEdge, type AgentBrowserToolbarView } from "../shared/edges";
-import { type AXNode, type FieldInfo, needsFieldInfo, RefTable, renderSnapshot } from "./agent-browser-snapshot";
+import { type AgentBrowserBounds, placeWindow } from "./agent-browser-bounds";
+import { coverRegions, holdsValue, quadRegion, type Region, scaleRegion, type ScreenScan, scrubClipboard, scrubValues, valueRegions } from "./agent-browser-mask";
+import { type AXNode, type FieldInfo, type FrameContent, needsFieldInfo, RefTable, renderSnapshot } from "./agent-browser-snapshot";
+import { forgetFrameWorld, inWorld } from "./agent-browser-worlds";
+import { fillable, type VaultBrowser, type VaultField, type VaultFill } from "./vault";
 
 const TOOLBAR_HEIGHT = 80;
+const WINDOW_SIZE = { width: 1200, height: 860, minWidth: 520, minHeight: 360 };
 /** The toolbar's extra row while it shows a page's dialog. */
 const DIALOG_ROW_HEIGHT = 48;
 const MAX_TABS = 12;
@@ -43,6 +75,9 @@ const DOWNLOAD_LIMIT = 1024 ** 3;
 const LOAD_TIMEOUT_MS = 30_000;
 const CDP_TIMEOUT_MS = 15_000;
 const WORLD = "wisp-agent-browser";
+/** How many same-origin frames a snapshot reads, and how deep in frames within frames. */
+const MAX_FRAMES = 20;
+const MAX_FRAME_DEPTH = 3;
 
 export interface AgentBrowserDeps {
   distDir: string;
@@ -53,6 +88,8 @@ export interface AgentBrowserDeps {
   /** Opens the agent's conversation in the main window. */
   showChat(agentId: string): void;
   onChange(state: AgentBrowserState): void;
+  /** Where each agent's window was, so it opens there again. */
+  windowBounds: Pick<AgentBrowserBounds, "get" | "set" | "saveNow">;
 }
 
 interface Tab {
@@ -60,14 +97,18 @@ interface Tab {
   view: WebContentsView;
   contents: WebContents;
   refs: RefTable;
-  /** The isolated world's execution context in the current document. */
-  world: number | null;
+  /** The isolated world's execution context in the current document ("") and in its same-origin frames, by frame id. */
+  worlds: Map<string, number>;
+  /** Each frame the last snapshot met: its element in the frame around it, and that frame (null for the page). */
+  frameOwners: Map<string, { owner: number; parent: string | null }>;
   /** Counts documents, so a call can tell whether it navigated. */
   documents: number;
   /** This tab's alerts and confirms come to us (see the top of this file). */
   ownsDialogs: boolean;
   /** A dialog the page waits on while the user has the browser. */
   dialog: PendingDialog | null;
+  /** Fields in this document filled from the vault (backend node ids): masked for the agent. */
+  filled: Set<number>;
 }
 
 interface PendingDialog {
@@ -92,6 +133,8 @@ interface AgentWindow {
   queue: Promise<unknown>;
   /** Calls waiting while the user has the browser. */
   waiters: Set<() => void>;
+  /** Values filled from the vault while this window is open, blanked in everything the agent reads. Never logged. */
+  vaultValues: Set<string>;
 }
 
 interface Call {
@@ -132,6 +175,8 @@ function safeFileName(name: string): string {
 export class AgentBrowsers {
   private windows = new Map<string, AgentWindow>();
   private calls = new Map<string, Call>();
+  /** Values of closed windows that were on the clipboard when they closed. Never logged. */
+  private clipboardHeld = new Set<string>();
   private emitToolbar: EdgeEmitter<typeof agentBrowserToolbarEdge> | null = null;
   readonly session: Session;
 
@@ -287,11 +332,24 @@ export class AgentBrowsers {
     const win = this.windows.get(call.agentId);
     const tab = win != null ? this.activeTab(win) : null;
     const info: BrowserPlanInfo = { open: win != null, url: tab != null ? tab.contents.getURL() || null : null, control: win?.control ?? "agent", target: null };
-    if (call.tool === "browser_click" || call.tool === "browser_type") {
-      if (tab == null) throw new BrowserError("The agent browser has no page open. Open one with browser_navigate first.");
-      info.target = await this.describe(tab, String(call.args.ref ?? ""));
-    } else if (call.tool === "browser_press" && tab != null) {
-      info.target = await this.focused(tab);
+    try {
+      if (call.tool === "browser_click" || call.tool === "browser_type") {
+        if (tab == null) throw new BrowserError("The agent browser has no page open. Open one with browser_navigate first.");
+        info.target = await this.describe(tab, String(call.args.ref ?? ""));
+      } else if (call.tool === "browser_press") {
+        // Refused before anyone is asked: no card for a key that would take a vault value out.
+        const chord = parseKeyChord(String(call.args.key ?? ""));
+        if (win != null && chord != null) await this.guardClipboard(win, chord);
+        if (tab != null) info.target = await this.focused(tab);
+      }
+    } catch (error) {
+      throw win != null ? this.scrubbedError(win, error) : error;
+    }
+    // What the approval card shows goes to the box too: a page repeating a vault value doesn't put it there.
+    if (win != null && win.vaultValues.size > 0) {
+      const scrub = (text: string) => scrubValues(text, win.vaultValues);
+      if (info.url != null) info.url = scrub(info.url);
+      if (info.target != null) info.target = { ...info.target, name: scrub(info.target.name), href: scrub(info.target.href) };
     }
     return info;
   }
@@ -303,17 +361,67 @@ export class AgentBrowsers {
     const token: Call = { cancelled: false, wake: null, interrupt };
     this.calls.set(call.callId, token);
     try {
-      if (call.tool === "browser_wait_for_user") return await this.waitForUser(call.agentId, String(call.args.reason ?? ""), call.answer);
+      if (call.tool === "browser_wait_for_user") {
+        const reply = await this.waitForUser(call.agentId, String(call.args.reason ?? ""), call.answer);
+        const owner = this.windows.get(call.agentId);
+        return owner != null ? this.scrubbed(owner, reply) : reply;
+      }
       // Only opening a page opens the window; anything else needs one already.
       const opens = call.tool === "browser_navigate" || (call.tool === "browser_tabs" && call.args.action === "new");
       const win = opens ? this.ensureWindow(call.agentId, false) : this.windows.get(call.agentId);
       if (win == null) throw new BrowserError("The agent browser has no page open. Open one with browser_navigate.");
       const task = win.queue.then(() => this.execute(win, call, token));
       win.queue = task.catch(() => undefined);
-      return await Promise.race([task, interrupted]);
+      return this.scrubbed(win, await Promise.race([task, interrupted]));
+    } catch (error) {
+      // An error can quote the page too (an element's name).
+      const owner = this.windows.get(call.agentId);
+      throw owner != null ? this.scrubbedError(owner, error) : error;
     } finally {
       this.calls.delete(call.callId);
     }
+  }
+
+  /** A reply with the window's vault values blanked, wherever the page put them. */
+  private scrubbed(win: AgentWindow, reply: BrowserRunReply): BrowserRunReply {
+    if (win.vaultValues.size === 0) return reply;
+    const scrub = (text: string) => scrubValues(text, win.vaultValues);
+    return { ...reply, output: scrub(reply.output), askUser: reply.askUser != null ? { ...reply.askUser, question: scrub(reply.askUser.question) } : reply.askUser };
+  }
+
+  private scrubbedError(win: AgentWindow, error: unknown): unknown {
+    if (win.vaultValues.size > 0 && error instanceof Error) error.message = scrubValues(error.message, win.vaultValues);
+    return error;
+  }
+
+  /** Every vault value the agent browser holds: each window's, and closed windows' the clipboard still held. */
+  private allVaultValues(): Set<string> {
+    const values = new Set(this.clipboardHeld);
+    for (const win of this.windows.values()) for (const value of win.vaultValues) values.add(value);
+    return values;
+  }
+
+  /**
+   * Copying or cutting (any chord for it, wherever the focus is: a shadow root, a frame) while the
+   * window holds vault values, or pasting while the clipboard holds one, would take a value out of
+   * the page. A copy the page makes itself (a site's own Copy button) is caught at the other end:
+   * read_clipboard blanks the values, and pasting one is refused.
+   */
+  private async guardClipboard(win: AgentWindow, chord: KeyChord): Promise<void> {
+    const use = clipboardChord(chord);
+    if (use === "copy" || use === "cut") {
+      if (win.vaultValues.size > 0) throw new BrowserError(`${chord.label} would ${use} from the page, and this window holds values filled from the vault, so it isn't pressed.`);
+    } else if (use === "paste") {
+      const values = this.allVaultValues();
+      if (values.size > 0 && holdsValue(await clipboard.readText(), values)) throw new BrowserError(`The clipboard holds a value from the vault, so ${chord.label} isn't pressed.`);
+    }
+  }
+
+  /** The clipboard's text as read_clipboard gives it: vault values the agent browser holds are blanked. */
+  scrubClipboard(text: string): string {
+    // A closed window's values are kept only while the clipboard still has them.
+    for (const value of this.clipboardHeld) if (!holdsValue(text, [value])) this.clipboardHeld.delete(value);
+    return scrubClipboard(text, this.allVaultValues());
   }
 
   cancel(callId: string): void {
@@ -325,27 +433,121 @@ export class AgentBrowsers {
   }
 
   /**
-   * The seam for a trusted filler, such as a future password vault: types `value` into the field
-   * behind `ref` on the agent's page without it passing through the daemon, the box, the
-   * transcript or the model. No edge the daemon or a box can call reaches it; the caller, in main,
-   * decides what may be filled where and names the site the value belongs to, which must be the
-   * page's site. The value is neither logged nor returned. Like the agent's own calls, it waits
-   * while the user has the browser.
+   * The trusted filler the vault uses (src/main/vault.ts): the page's real origin, the fields behind
+   * refs, and filling values into them without them passing through the daemon, the box, the
+   * transcript or the model. No edge the daemon or a box can call reaches it; the vault decides
+   * what may be filled where. Values are neither logged nor returned.
    */
-  async fillByRef(agentId: string, ref: string, value: string, options: { site: string }): Promise<void> {
+  vault(): VaultBrowser {
+    return {
+      page: async (agentId) => {
+        const win = this.windows.get(agentId);
+        const tab = win != null ? this.activeTab(win) : null;
+        return tab != null ? await this.realPage(tab) : null;
+      },
+      fields: async (agentId, refs) => {
+        const win = this.windows.get(agentId);
+        const tab = win != null ? this.activeTab(win) : null;
+        const found = new Map<string, VaultField>();
+        if (win == null || tab == null) return found;
+        for (const ref of refs) {
+          if (tab.refs.get(ref) == null) continue;
+          const backendNodeId = this.backendId(tab, ref);
+          const field = { ...(await this.describe(tab, ref)), ...(await this.fieldHome(tab, backendNodeId)) };
+          // A field's label is the page's, and goes on the card: a page repeating a value doesn't put it there.
+          found.set(ref, { ...field, name: scrubValues(field.name, win.vaultValues), href: scrubValues(field.href, win.vaultValues) });
+        }
+        return found;
+      },
+      fill: (agentId, fills, options) => this.fillFromVault(agentId, fills, options),
+      scrub: (agentId, text) => {
+        const win = this.windows.get(agentId);
+        return win != null ? scrubValues(text, win.vaultValues) : text;
+      },
+    };
+  }
+
+  /** The page as the DevTools protocol has it: its site only when the frame's URL, its origin and Electron's address agree. */
+  private async realPage(tab: Tab): Promise<{ url: string; site: string | null }> {
+    const { frameTree } = await this.cdp<{ frameTree: { frame: { url: string; urlFragment?: string; securityOrigin?: string } } }>(tab, "Page.getFrameTree");
+    const url = `${frameTree.frame.url}${frameTree.frame.urlFragment ?? ""}`;
+    const site = siteOf(url);
+    return { url, site: site != null && site === frameTree.frame.securityOrigin && site === siteOf(tab.contents.getURL()) ? site : null };
+  }
+
+  /** Whether the element is in the page's own document (not a frame's) and that document's origin. */
+  private async fieldHome(tab: Tab, backendNodeId: number): Promise<{ inPage: boolean; origin: string }> {
+    // A ref in a same-origin frame is never the page's own field. The check runs in the main
+    // frame's isolated world, where an element of another frame doesn't resolve.
+    if (tab.refs.frameOf(backendNodeId) != null) return { inPage: false, origin: "" };
+    const home = (await this.callOn(tab, backendNodeId, FIELD_HOME, [], [], null).catch(() => null)) as { inPage?: boolean; origin?: string } | null;
+    return { inPage: home?.inPage === true, origin: String(home?.origin ?? "") };
+  }
+
+  private async fillFromVault(agentId: string, fills: VaultFill[], options: { site: string; submit: boolean; callId: string; stillOn(url: string): boolean }): ReturnType<VaultBrowser["fill"]> {
     const win = this.windows.get(agentId);
-    if (win == null) throw new BrowserError("The agent has no browser open.");
-    const token: Call = { cancelled: false, wake: null, interrupt: () => undefined };
+    if (win == null) return { filled: 0, submitted: false, navigated: false, error: "the agent has no browser open." };
+    let interrupt!: (error: Error) => void;
+    const interrupted = new Promise<never>((_resolve, reject) => (interrupt = reject));
+    interrupted.catch(() => undefined);
+    const token: Call = { cancelled: false, wake: null, interrupt };
+    this.calls.set(options.callId, token);
+    let filled = 0;
+    let submitted = false;
+    let navigated = false;
     const task = win.queue.then(async () => {
       await this.agentTurn(win, token);
       const tab = this.requireTab(win);
-      if (siteOf(tab.contents.getURL()) !== siteOf(options.site)) throw new BrowserError("The page isn't on the site this value belongs to.");
-      const target = await this.describe(tab, ref);
-      if (!target.editable || target.tag === "select") throw new BrowserError(`${ref} isn't a text field.`);
-      await this.replaceText(tab, this.backendId(tab, ref), value);
+      const documents = tab.documents;
+      let last: number | null = null;
+      for (const fill of fills) {
+        // Each field is checked again just before its value goes in: the page may have moved on.
+        const page = await this.realPage(tab);
+        if (tab.documents !== documents || page.site !== options.site || !options.stillOn(page.url)) throw new BrowserError(`the page isn't on ${siteLabel(options.site)} any more.`);
+        const backendNodeId = this.backendId(tab, fill.ref);
+        const target = await this.inspect(tab, backendNodeId);
+        const home = await this.fieldHome(tab, backendNodeId);
+        if (!home.inPage || home.origin !== options.site) throw new BrowserError(`${fill.ref} is in a frame from another site now.`);
+        const password = target.inputType === "password" || /\b(current|new)-password\b/.test(target.autocomplete);
+        const secret = sensitiveField(target);
+        if (!fillable(target) || password !== fill.password || secret === "payment card" || secret === "one-time code") {
+          throw new BrowserError(`${fill.ref} isn't the kind of field it was when you were asked.`);
+        }
+        if (token.cancelled) throw new BrowserError("interrupted");
+        // Marked before the value goes in, and left marked if the call fails: a value that landed
+        // while the protocol's answer timed out stays masked.
+        tab.filled.add(backendNodeId);
+        win.vaultValues.add(fill.value);
+        if (target.tag === "select") {
+          if ((await this.callOn(tab, backendNodeId, CHOOSE_EXACT, [fill.value])) !== true) {
+            // No option is the value: the dropdown didn't change.
+            tab.filled.delete(backendNodeId);
+            continue;
+          }
+        } else {
+          await this.replaceText(tab, backendNodeId, fill.value);
+        }
+        last = backendNodeId;
+        filled++;
+      }
+      if (options.submit && last != null) {
+        await this.cdp(tab, "DOM.focus", { backendNodeId: last });
+        await this.press(tab, parseKeyChord("Enter")!);
+        submitted = true;
+        await this.settle(tab);
+        navigated = tab.documents !== documents;
+      }
     });
     win.queue = task.catch(() => undefined);
-    await task;
+    try {
+      await Promise.race([task, interrupted]);
+      return { filled, submitted, navigated, error: null };
+    } catch (error) {
+      const message = error instanceof BrowserError ? error.message : "the page didn't take the value.";
+      return { filled, submitted, navigated, error: message === "interrupted" ? "interrupted." : message };
+    } finally {
+      this.calls.delete(options.callId);
+    }
   }
 
   // ---- windows and tabs -------------------------------------------------------------------------
@@ -353,7 +555,23 @@ export class AgentBrowsers {
   private ensureWindow(agentId: string, focus = true): AgentWindow {
     const existing = this.windows.get(agentId);
     if (existing != null) return existing;
-    const window = new BaseWindow({ width: 1200, height: 860, minWidth: 520, minHeight: 360, title: this.title(agentId, "agent"), show: false, backgroundColor: "#ffffff", icon: join(this.deps.distDir, "assets", "app-icon.png") });
+    // Where this agent's window was last, if a screen still shows that place.
+    const placed = placeWindow(
+      this.deps.windowBounds.get(agentId),
+      screen.getAllDisplays().map((display) => display.workArea),
+      WINDOW_SIZE,
+    );
+    const window = new BaseWindow({
+      ...(placed.x != null && placed.y != null ? { x: placed.x, y: placed.y } : {}),
+      width: placed.width,
+      height: placed.height,
+      minWidth: WINDOW_SIZE.minWidth,
+      minHeight: WINDOW_SIZE.minHeight,
+      title: this.title(agentId, "agent"),
+      show: false,
+      backgroundColor: "#ffffff",
+      icon: join(this.deps.distDir, "assets", "app-icon.png"),
+    });
     // No menu: no developer tools, reload or zoom shortcuts the agent's pages could be mistaken for.
     window.setMenu(null);
     const toolbar = new WebContentsView({ webPreferences: { preload: join(this.deps.distDir, "preload", "agent-browser-preload.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false } });
@@ -361,14 +579,26 @@ export class AgentBrowsers {
     toolbar.webContents.on("will-navigate", (event) => event.preventDefault());
     window.contentView.addChildView(toolbar);
     void toolbar.webContents.loadFile(join(this.deps.distDir, "renderer", "agent-browser", "toolbar.html"));
-    const win: AgentWindow = { agentId, window, toolbar, tabs: [], activeId: null, nextTabId: 1, control: "agent", request: null, notes: [], queue: Promise.resolve(), waiters: new Set() };
+    const win: AgentWindow = { agentId, window, toolbar, tabs: [], activeId: null, nextTabId: 1, control: "agent", request: null, notes: [], queue: Promise.resolve(), waiters: new Set(), vaultValues: new Set() };
     this.windows.set(agentId, win);
     window.on("resize", () => this.layout(win));
     window.on("closed", () => this.closed(win));
+    // Its size and place are remembered as the user leaves them. Maximizing on Windows takes the
+    // focus, so a window the agent opens shows unmaximized, and keeps the user's choice for later.
+    let maximized = placed.maximized;
+    const remember = () => {
+      if (!window.isDestroyed() && !window.isMinimized()) this.deps.windowBounds.set(agentId, { bounds: window.getNormalBounds(), maximized });
+    };
+    for (const name of ["resize", "move"] as const) window.on(name as "resize", remember);
+    window.on("close", () => (remember(), this.deps.windowBounds.saveNow()));
+    window.on("maximize", () => ((maximized = true), remember()));
+    window.on("unmaximize", () => ((maximized = false), remember()));
     this.layout(win);
     // The agent's window shows up without taking focus, so the user sees it browse.
-    if (focus) window.show();
-    else window.showInactive();
+    if (focus) {
+      if (placed.maximized) window.maximize();
+      window.show();
+    } else window.showInactive();
     this.changed(win);
     return win;
   }
@@ -391,6 +621,15 @@ export class AgentBrowsers {
   private closed(win: AgentWindow): void {
     if (this.windows.get(win.agentId) !== win) return;
     this.windows.delete(win.agentId);
+    // Its values go, except those on the clipboard now: read_clipboard blanks them while they're there.
+    if (win.vaultValues.size > 0) {
+      for (const value of win.vaultValues) this.clipboardHeld.add(value);
+      win.vaultValues.clear();
+      void clipboard
+        .readText()
+        .then((text) => this.scrubClipboard(text))
+        .catch(() => undefined);
+    }
     for (const tab of win.tabs) if (!tab.contents.isDestroyed()) tab.contents.close();
     if (!win.toolbar.webContents.isDestroyed()) win.toolbar.webContents.close();
     for (const wake of win.waiters) wake();
@@ -433,7 +672,7 @@ export class AgentBrowsers {
       adopt != null
         ? new WebContentsView({ webContents: adopt })
         : new WebContentsView({ webPreferences: { partition: AGENT_BROWSER_PARTITION, sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false, spellcheck: false, safeDialogs: true } });
-    const tab: Tab = { id: win.nextTabId++, view, contents: view.webContents, refs: new RefTable(), world: null, documents: 0, ownsDialogs: false, dialog: null };
+    const tab: Tab = { id: win.nextTabId++, view, contents: view.webContents, refs: new RefTable(), worlds: new Map(), frameOwners: new Map(), documents: 0, ownsDialogs: false, dialog: null, filled: new Set() };
     win.tabs.push(tab);
     win.window.contentView.addChildView(view);
     this.wire(win, tab);
@@ -481,19 +720,23 @@ export class AgentBrowsers {
     });
     contents.on("did-navigate", () => {
       tab.refs.clear();
-      tab.world = null;
+      tab.filled.clear();
+      tab.worlds.clear();
+      tab.frameOwners.clear();
       tab.documents++;
       this.changed(win);
     });
     for (const name of ["did-navigate-in-page", "page-title-updated", "did-start-loading", "did-stop-loading"] as const) contents.on(name as "did-stop-loading", () => this.changed(win));
     contents.on("render-process-gone", () => {
       tab.refs.clear();
-      tab.world = null;
+      tab.worlds.clear();
       win.notes.push(`The page in tab ${tab.id} crashed; open it again with browser_navigate.`);
     });
     contents.debugger.on("detach", () => {
-      tab.world = null;
+      tab.worlds.clear();
     });
+    // A frame that navigates (a sign-in frame moving to its password step) takes its world with it.
+    contents.debugger.on("message", (_event, method, params) => forgetFrameWorld(tab.worlds, method, params));
     this.takeDialogs(win, tab);
     contents.debugger.on("message", (_event, method, params) => {
       if (method !== "Page.javascriptDialogOpening" || tab.ownsDialogs || win.control === "user") return;
@@ -696,6 +939,8 @@ export class AgentBrowsers {
           lead = `Chose “${String(chosen).slice(0, 100)}” in ${ref}.`;
         } else {
           await this.replaceText(tab, backendNodeId, text);
+          // What the agent typed over a vault value is its own.
+          tab.filled.delete(backendNodeId);
           lead = `Typed ${[...text].length} characters into ${ref}.`;
         }
         if (args.submit === true) {
@@ -712,6 +957,8 @@ export class AgentBrowsers {
         ensureSite(tab);
         const chord = parseKeyChord(String(args.key ?? ""));
         if (chord == null) throw new BrowserError(`Unknown key “${String(args.key ?? "").slice(0, 40)}”.`);
+        // Checked again here: a fill may have come in since the call was planned.
+        await this.guardClipboard(win, chord);
         const before = tab.documents;
         await this.press(tab, chord);
         await this.settle(tab);
@@ -747,7 +994,9 @@ export class AgentBrowsers {
         const shot = await this.cdp<{ data: string }>(tab, "Page.captureScreenshot", { format: "jpeg", quality: 80 }).catch(() => {
           throw new BrowserError("Couldn't capture the page. Is the agent browser window on screen?");
         });
-        return { output: await this.pageReply(win, tab, `A screenshot of tab ${tab.id}.`, false), image: { mime: "image/jpeg", base64: shot.data } };
+        const covered = tab.filled.size > 0 || win.vaultValues.size > 0 ? await this.coverVaultValues(win, tab, shot.data) : { base64: shot.data, places: 0 };
+        const lead = `A screenshot of tab ${tab.id}.${covered.places > 0 ? " What shows values from the vault (the filled fields, and anything else holding one) is painted over." : ""}`;
+        return { output: await this.pageReply(win, tab, lead, false), image: { mime: "image/jpeg", base64: covered.base64 } };
       }
       case "browser_back": {
         const tab = this.requireTab(win);
@@ -796,18 +1045,80 @@ export class AgentBrowsers {
     let body = "";
     if (snapshot) {
       const { nodes } = await this.cdp<{ nodes: AXNode[] }>(tab, "Accessibility.getFullAXTree");
+      const frames = await this.readFrames(tab, nodes);
+      const all = [...nodes, ...[...frames.values()].flatMap((content) => ("nodes" in content ? content.nodes : []))];
       const fields = new Map<number, FieldInfo>();
-      const wanted = nodes.filter((node) => node.backendDOMNodeId != null && needsFieldInfo(String(node.role?.value ?? ""))).slice(0, 300);
+      const wanted = all.filter((node) => node.backendDOMNodeId != null && needsFieldInfo(String(node.role?.value ?? ""))).slice(0, 300);
       await Promise.all(
         wanted.map(async (node) => {
           const described = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tab, "DOM.describeNode", { backendNodeId: node.backendDOMNodeId }).catch(() => null);
           if (described != null) fields.set(node.backendDOMNodeId!, fieldInfo(described.node));
         }),
       );
-      body = renderSnapshot(nodes, tab.refs, { rootRef, pageUrl: page.url, fields }).text;
+      body = renderSnapshot(nodes, tab.refs, { rootRef, pageUrl: page.url, fields, frames, filled: tab.filled }).text;
     }
     const notes = win.notes.splice(0);
     return [lead, ...notes, untrustedPage(page, body)].join("\n");
+  }
+
+  /**
+   * What the page's frames hold, by their frame element: the tree of each frame from the page's own
+   * origin (and of frames in those, a few levels down), and for any other frame where it's from.
+   * Each frame's element is noted, so a click inside a frame isn't taken for one on its cover.
+   */
+  private async readFrames(tab: Tab, nodes: AXNode[]): Promise<Map<number, FrameContent>> {
+    const frames = new Map<number, FrameContent>();
+    tab.frameOwners.clear();
+    const isFrame = (node: AXNode) => (node.role?.value === "Iframe" || node.role?.value === "IframePresentational") && node.backendDOMNodeId != null;
+    if (!nodes.some(isFrame)) return frames;
+    const tree = await this.frameTree(tab);
+    const origin = tree.frames.get(tree.mainId)?.origin ?? "";
+    let read = 0;
+    const queue = [{ nodes, depth: 1 }];
+    for (let next = queue.shift(); next != null; next = queue.shift()) {
+      for (const node of next.nodes.filter(isFrame)) {
+        const element = node.backendDOMNodeId!;
+        if (frames.has(element)) continue;
+        const described = await this.cdp<{ node: { frameId?: string; attributes?: string[] } }>(tab, "DOM.describeNode", { backendNodeId: element }).catch(() => null);
+        const frameId = described?.node.frameId;
+        const frame = frameId != null ? tree.frames.get(frameId) : undefined;
+        if (frameId != null) tab.frameOwners.set(frameId, { owner: element, parent: frame?.parent ?? null });
+        if (frameId == null || frame == null || origin === "" || origin === "null" || frame.origin !== origin) {
+          const from = originOf(frame?.url ?? attribute(described?.node.attributes, "src"), tab.contents.getURL());
+          frames.set(element, { unread: from != null ? `from ${from}: its contents aren't read` : "its contents aren't read" });
+          continue;
+        }
+        const content = next.depth <= MAX_FRAME_DEPTH && read < MAX_FRAMES ? await this.cdp<{ nodes: AXNode[] }>(tab, "Accessibility.getFullAXTree", { frameId }).catch(() => null) : null;
+        if (content == null) {
+          frames.set(element, { unread: read >= MAX_FRAMES || next.depth > MAX_FRAME_DEPTH ? "its contents aren't read: the page has too many frames" : "its contents couldn't be read" });
+          continue;
+        }
+        read++;
+        frames.set(element, { frameId, nodes: content.nodes });
+        queue.push({ nodes: content.nodes, depth: next.depth + 1 });
+      }
+    }
+    return frames;
+  }
+
+  /** The page's frames by id: each one's origin and address, and the frame it's in. */
+  private async frameTree(tab: Tab): Promise<{ mainId: string; frames: Map<string, { origin: string; url: string; parent: string | null }> }> {
+    type Node = { frame: { id: string; url: string; securityOrigin?: string }; childFrames?: Node[] };
+    const { frameTree } = await this.cdp<{ frameTree: Node }>(tab, "Page.getFrameTree");
+    const frames = new Map<string, { origin: string; url: string; parent: string | null }>();
+    const walk = (node: Node, parent: string | null) => {
+      frames.set(node.frame.id, { origin: node.frame.securityOrigin ?? "", url: node.frame.url, parent });
+      for (const child of node.childFrames ?? []) walk(child, node.frame.id);
+    };
+    walk(frameTree, null);
+    return { mainId: frameTree.frame.id, frames };
+  }
+
+  /** Whether a frame is one of the page's own origin, whose elements the agent can read and act on. */
+  private async sameOrigin(tab: Tab, frameId: string): Promise<boolean> {
+    const tree = await this.frameTree(tab);
+    const origin = tree.frames.get(tree.mainId)?.origin ?? "";
+    return origin !== "" && origin !== "null" && tree.frames.get(frameId)?.origin === origin;
   }
 
   /** Loads a page; a slow one is reported, not waited for past 30 s. */
@@ -850,45 +1161,48 @@ export class AgentBrowsers {
     return entry.backendNodeId;
   }
 
-  private async world(tab: Tab): Promise<number> {
-    if (tab.world != null) return tab.world;
-    const { frameTree } = await this.cdp<{ frameTree: { frame: { id: string } } }>(tab, "Page.getFrameTree");
-    const { executionContextId } = await this.cdp<{ executionContextId: number }>(tab, "Page.createIsolatedWorld", { frameId: frameTree.frame.id, worldName: WORLD, grantUniveralAccess: false });
-    tab.world = executionContextId;
+  /** Makes an isolated world in the page's document, or (`frameId`) in one of its same-origin frames; `inWorld` keeps it in `tab.worlds`. */
+  private async createWorld(tab: Tab, frameId: string | null): Promise<number> {
+    const target = frameId ?? (await this.cdp<{ frameTree: { frame: { id: string } } }>(tab, "Page.getFrameTree")).frameTree.frame.id;
+    const { executionContextId } = await this.cdp<{ executionContextId: number }>(tab, "Page.createIsolatedWorld", { frameId: target, worldName: WORLD, grantUniveralAccess: false });
     return executionContextId;
   }
 
-  /** Runs `fn` on the element in the isolated world (the page's scripts can't reach or change it). */
-  private async callOn(tab: Tab, backendNodeId: number, fn: string, args: unknown[] = [], others: number[] = []): Promise<any> {
-    for (let attempt = 0; ; attempt++) {
-      const objects: string[] = [];
-      try {
-        const executionContextId = await this.world(tab);
-        for (const id of [backendNodeId, ...others]) objects.push((await this.cdp<{ object: { objectId: string } }>(tab, "DOM.resolveNode", { backendNodeId: id, executionContextId })).object.objectId);
-        const result = await this.cdp<{ result: { value?: unknown }; exceptionDetails?: { text: string } }>(tab, "Runtime.callFunctionOn", {
-          objectId: objects[0],
-          functionDeclaration: fn,
-          arguments: [...args.map((value) => ({ value })), ...objects.slice(1).map((objectId) => ({ objectId }))],
-          returnByValue: true,
-        });
-        if (result.exceptionDetails != null) throw new BrowserError(result.exceptionDetails.text);
-        return result.result.value;
-      } catch (error) {
-        // The isolated world goes with its document; make a new one once.
-        if (attempt === 0 && /context/i.test(String(error))) {
-          tab.world = null;
-          continue;
+  /** Runs `run` in the frame's isolated world, making it again once if it went with its document. */
+  private inWorld<T>(tab: Tab, frameId: string | null, run: (contextId: number) => Promise<T>): Promise<T> {
+    return inWorld(tab.worlds, frameId, () => this.createWorld(tab, frameId), run);
+  }
+
+  /**
+   * Runs `fn` on the element in the isolated world of its frame (the page's scripts can't reach or
+   * change it); `others` are elements of the same frame, passed as arguments.
+   */
+  private async callOn(tab: Tab, backendNodeId: number, fn: string, args: unknown[] = [], others: number[] = [], frameId = tab.refs.frameOf(backendNodeId)): Promise<any> {
+    try {
+      return await this.inWorld(tab, frameId, async (executionContextId) => {
+        const objects: string[] = [];
+        try {
+          for (const id of [backendNodeId, ...others]) objects.push((await this.cdp<{ object: { objectId: string } }>(tab, "DOM.resolveNode", { backendNodeId: id, executionContextId })).object.objectId);
+          const result = await this.cdp<{ result: { value?: unknown }; exceptionDetails?: { text: string } }>(tab, "Runtime.callFunctionOn", {
+            objectId: objects[0],
+            functionDeclaration: fn,
+            arguments: [...args.map((value) => ({ value })), ...objects.slice(1).map((objectId) => ({ objectId }))],
+            returnByValue: true,
+          });
+          if (result.exceptionDetails != null) throw new BrowserError(result.exceptionDetails.text);
+          return result.result.value;
+        } finally {
+          for (const objectId of objects) void this.cdp(tab, "Runtime.releaseObject", { objectId }).catch(() => undefined);
         }
-        if (/No node|Could not find node|does not belong/i.test(String(error))) throw new BrowserError("That element is gone from the page. Take a new snapshot.");
-        throw error;
-      } finally {
-        for (const objectId of objects) void this.cdp(tab, "Runtime.releaseObject", { objectId }).catch(() => undefined);
-      }
+      });
+    } catch (error) {
+      if (/No node|Could not find node|does not belong/i.test(String(error))) throw new BrowserError("That element is gone from the page. Take a new snapshot.");
+      throw error;
     }
   }
 
   private async evaluate(tab: Tab, expression: string): Promise<any> {
-    const result = await this.cdp<{ result: { value?: unknown } }>(tab, "Runtime.evaluate", { expression, contextId: await this.world(tab), returnByValue: true }).catch(() => null);
+    const result = await this.inWorld(tab, null, (contextId) => this.cdp<{ result: { value?: unknown } }>(tab, "Runtime.evaluate", { expression, contextId, returnByValue: true })).catch(() => null);
     return result?.result.value ?? null;
   }
 
@@ -898,25 +1212,40 @@ export class AgentBrowsers {
     return { ref, ...(await this.inspect(tab, backendNodeId)) };
   }
 
-  /** The focused element, for browser_press; null on the page itself. */
+  /**
+   * The focused element, for browser_press: inside an open shadow root, or a same-origin frame, when
+   * the focus is there; null on the page itself. Throws when it can't be told, so a key press isn't
+   * rated as if no field (a password field) had the focus.
+   */
   private async focused(tab: Tab): Promise<BrowserTarget | null> {
-    const { result } = await this.cdp<{ result: { objectId?: string; subtype?: string } }>(tab, "Runtime.evaluate", { expression: "document.activeElement", contextId: await this.world(tab) }).catch(() => ({ result: {} as { objectId?: string } }));
-    if (result.objectId == null) return null;
-    const { node } = await this.cdp<{ node: { backendNodeId: number; localName: string } }>(tab, "DOM.describeNode", { objectId: result.objectId });
-    void this.cdp(tab, "Runtime.releaseObject", { objectId: result.objectId }).catch(() => undefined);
-    if (node.localName === "body" || node.localName === "html") return null;
-    const target = await this.inspect(tab, node.backendNodeId);
-    return { ref: tab.refs.refFor(node.backendNodeId, target.role, target.name), ...target };
+    let frameId: string | null = null;
+    for (let depth = 0; depth <= MAX_FRAME_DEPTH; depth++) {
+      const { result }: { result: { objectId?: string } } = await this.inWorld(tab, frameId, (contextId) => this.cdp<{ result: { objectId?: string } }>(tab, "Runtime.evaluate", { expression: ACTIVE_ELEMENT, contextId })).catch(() => {
+        throw new BrowserError("Couldn't tell which element has the focus. Take a snapshot and try again.");
+      });
+      if (result.objectId == null) return null;
+      const { node }: { node: { backendNodeId: number; localName: string; frameId?: string } } = await this.cdp(tab, "DOM.describeNode", { objectId: result.objectId });
+      void this.cdp(tab, "Runtime.releaseObject", { objectId: result.objectId }).catch(() => undefined);
+      if (node.localName === "body" || node.localName === "html") return null;
+      // A frame of the page's origin has the focus: the element focused in it.
+      if ((node.localName === "iframe" || node.localName === "frame") && node.frameId != null && depth < MAX_FRAME_DEPTH && (await this.sameOrigin(tab, node.frameId))) {
+        frameId = node.frameId;
+        continue;
+      }
+      const target = await this.inspect(tab, node.backendNodeId, frameId);
+      return { ref: tab.refs.refFor(node.backendNodeId, target.role, target.name, frameId), ...target };
+    }
+    return null;
   }
 
-  private async inspect(tab: Tab, backendNodeId: number): Promise<Omit<BrowserTarget, "ref">> {
+  private async inspect(tab: Tab, backendNodeId: number, frameId = tab.refs.frameOf(backendNodeId)): Promise<Omit<BrowserTarget, "ref">> {
     const described = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tab, "DOM.describeNode", { backendNodeId }).catch(() => {
       throw new BrowserError("That element is gone from the page. Take a new snapshot.");
     });
     const field = fieldInfo(described.node);
     const ax = await this.cdp<{ nodes: AXNode[] }>(tab, "Accessibility.getPartialAXTree", { backendNodeId, fetchRelatives: false }).catch(() => ({ nodes: [] as AXNode[] }));
     const axNode = ax.nodes.find((node) => node.backendDOMNodeId === backendNodeId) ?? ax.nodes[0];
-    const facts = ((await this.callOn(tab, backendNodeId, ELEMENT_FACTS)) ?? {}) as { submits?: boolean; editable?: boolean; href?: string };
+    const facts = ((await this.callOn(tab, backendNodeId, ELEMENT_FACTS, [], [], frameId)) ?? {}) as { submits?: boolean; editable?: boolean; href?: string };
     return {
       role: String(axNode?.role?.value ?? field.tag),
       name: clean(axNode?.name?.value),
@@ -939,10 +1268,69 @@ export class AgentBrowsers {
     const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
     const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
     const hit = await this.cdp<{ backendNodeId: number }>(tab, "DOM.getNodeForLocation", { x: Math.round(x), y: Math.round(y), includeUserAgentShadowDOM: true }).catch(() => null);
-    if (hit != null && hit.backendNodeId !== backendNodeId && (await this.callOn(tab, backendNodeId, CONTAINS, [], [hit.backendNodeId])) !== true) {
-      throw new BrowserError(`${ref} is covered by something else at that spot (a dialog, banner or overlay?). Take a snapshot, deal with what covers it, and try again.`);
+    if (hit != null && hit.backendNodeId !== backendNodeId && !this.inFrameElement(tab, tab.refs.frameOf(backendNodeId), hit.backendNodeId)) {
+      // An element in a frame can't be compared with one in another frame: that one covers it.
+      const contains = this.callOn(tab, backendNodeId, CONTAINS, [], [hit.backendNodeId]);
+      if ((await (tab.refs.frameOf(backendNodeId) != null ? contains.catch(() => false) : contains)) !== true) {
+        throw new BrowserError(`${ref} is covered by something else at that spot (a dialog, banner or overlay?). Take a snapshot, deal with what covers it, and try again.`);
+      }
     }
     return { x, y };
+  }
+
+  /**
+   * Paints over, in a screenshot (JPEG, base64), the fields filled from the vault and anything else
+   * on screen that holds one of the window's values: a field Back restored or a show-password toggle
+   * swapped in, a pasted copy, the next page's "Signed in as …". Fails closed: a filled field that's
+   * still on the page but can't be located, or a page that can't be checked, means no screenshot.
+   */
+  private async coverVaultValues(win: AgentWindow, tab: Tab, jpegBase64: string): Promise<{ base64: string; places: number }> {
+    const failed = () => new BrowserError("Couldn't paint over what shows values from the vault, so no screenshot was taken. Take a snapshot instead.");
+    const image = nativeImage.createFromBuffer(Buffer.from(jpegBase64, "base64"));
+    if (image.isEmpty()) throw failed();
+    const { width, height } = image.getSize();
+    // Quads and the scan are in CSS pixels; the capture is in device pixels (zoom included).
+    const ratio = Number(await this.evaluate(tab, "devicePixelRatio"));
+    const scale = Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+    const regions: Region[] = [];
+    let places = 0;
+    for (const backendNodeId of tab.filled) {
+      let quads: number[][];
+      try {
+        quads = (await this.cdp<{ quads: number[][] }>(tab, "DOM.getContentQuads", { backendNodeId })).quads;
+      } catch (error) {
+        // Gone from the page, or not laid out (hidden): nothing of it is on screen.
+        if (/No node|Could not find node|not found|Could not compute/i.test(String(error))) continue;
+        throw failed();
+      }
+      if (quads.length > 0) places++;
+      for (const quad of quads) regions.push(quadRegion(quad, scale));
+    }
+    // What's on screen comes back to main and is matched here: no value goes into the page to look for it.
+    const scan = (await this.inWorld(tab, null, (contextId) => this.cdp<{ result: { value?: ScreenScan }; exceptionDetails?: unknown }>(tab, "Runtime.evaluate", { expression: SCREEN_SCAN, contextId, returnByValue: true })).catch(() => null))?.result.value;
+    if (scan == null || scan.truncated) throw failed();
+    const found = valueRegions(scan, win.vaultValues);
+    places += found.places;
+    for (const region of found.regions) regions.push(scaleRegion(region, scale));
+    if (regions.length === 0) return { base64: jpegBase64, places: 0 };
+    try {
+      const bitmap = image.toBitmap();
+      coverRegions(bitmap, width, height, regions);
+      return { base64: nativeImage.createFromBitmap(bitmap, { width, height }).toJPEG(80).toString("base64"), places };
+    } catch {
+      throw failed();
+    }
+  }
+
+  /** Whether `element` is the frame element `frameId` is in, or one of the frames around that. */
+  private inFrameElement(tab: Tab, frameId: string | null, element: number): boolean {
+    for (let frame = frameId, depth = 0; frame != null && depth <= MAX_FRAME_DEPTH + 1; depth++) {
+      const owner = tab.frameOwners.get(frame);
+      if (owner == null) return false;
+      if (owner.owner === element) return true;
+      frame = owner.parent;
+    }
+    return false;
   }
 
   private async replaceText(tab: Tab, backendNodeId: number, text: string): Promise<void> {
@@ -960,6 +1348,23 @@ export class AgentBrowsers {
   }
 }
 
+/** One attribute's value from DOM.describeNode's flat list (name, value, name, value, …). */
+function attribute(list: string[] | undefined, name: string): string | null {
+  for (let index = 0; list != null && index + 1 < list.length; index += 2) if (list[index].toLowerCase() === name) return list[index + 1];
+  return null;
+}
+
+/** Where a frame the snapshot doesn't read is from: its address's origin (null for about:blank, data: and the like). */
+function originOf(address: string | null | undefined, base: string): string | null {
+  if (address == null || address.length === 0) return null;
+  try {
+    const url = new URL(address, base);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
 function fieldInfo(node: { localName: string; attributes?: string[] }): FieldInfo {
   const attributes = new Map<string, string>();
   const list = node.attributes ?? [];
@@ -971,6 +1376,71 @@ function fieldInfo(node: { localName: string; attributes?: string[] }): FieldInf
     fieldName: `${attributes.get("name") ?? ""} ${attributes.get("id") ?? ""}`.trim(),
   };
 }
+
+// What's on screen, for painting vault values over in a screenshot (a ScreenScan): what each field
+// holds and each text node says, with their boxes in CSS pixels from the top left of the view, through
+// open shadow roots and same-origin frames. Matching is main's: no value is passed into the page. A
+// page with more text than the budget comes back `truncated`, and gets no screenshot.
+const SCREEN_SCAN = `(() => {
+  const out = { fields: [], texts: [], truncated: false };
+  let budget = 500000;
+  let nodes = 50000;
+  const boxes = (list, dx, dy, view) => {
+    const found = [];
+    for (const rect of list) {
+      if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= view.innerWidth || rect.top >= view.innerHeight) continue;
+      found.push({ x: rect.left + dx, y: rect.top + dy, width: rect.width, height: rect.height });
+    }
+    return found;
+  };
+  const visit = (root, dx, dy, view, depth) => {
+    const doc = root.ownerDocument || root;
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node != null; node = walker.nextNode()) {
+      if (--nodes < 0) { out.truncated = true; return; }
+      if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.nodeValue || "";
+        if (text.trim().length === 0) continue;
+        const range = doc.createRange();
+        range.selectNodeContents(node);
+        const rects = boxes(range.getClientRects(), dx, dy, view);
+        if (rects.length === 0) continue;
+        budget -= text.length;
+        if (budget < 0) { out.truncated = true; return; }
+        out.texts.push({ text, rects });
+        continue;
+      }
+      if (node.shadowRoot != null) visit(node.shadowRoot, dx, dy, view, depth);
+      if (out.truncated) return;
+      const tag = node.localName;
+      if (tag === "input" || tag === "textarea" || tag === "select") {
+        const value = tag === "select" ? Array.from(node.selectedOptions || []).map((option) => option.label + "\\n" + option.value).join("\\n") : String(node.value || "");
+        if (value.length === 0) continue;
+        const rects = boxes(node.getClientRects(), dx, dy, view);
+        if (rects.length === 0) continue;
+        budget -= value.length;
+        if (budget < 0) { out.truncated = true; return; }
+        out.fields.push({ value, rects });
+      } else if ((tag === "iframe" || tag === "frame") && depth < ${MAX_FRAME_DEPTH}) {
+        let inner = null;
+        try { inner = node.contentDocument; } catch (error) { inner = null; }
+        if (inner == null || inner.defaultView == null) continue;
+        const box = node.getBoundingClientRect();
+        visit(inner, dx + box.left + node.clientLeft, dy + box.top + node.clientTop, inner.defaultView, depth + 1);
+        if (out.truncated) return;
+      }
+    }
+  };
+  visit(document, 0, 0, window, 0);
+  return out;
+})()`;
+
+// The focused element, through open shadow roots (an input in a web component focuses its host).
+const ACTIVE_ELEMENT = `(() => {
+  let element = document.activeElement;
+  while (element != null && element.shadowRoot != null && element.shadowRoot.activeElement != null) element = element.shadowRoot.activeElement;
+  return element;
+})()`;
 
 // Functions run on an element in the isolated world (`this` is the element).
 const ELEMENT_FACTS = `function () {
@@ -994,6 +1464,21 @@ const SELECT_CONTENTS = `function () {
   const selection = getSelection();
   selection.removeAllRanges();
   selection.addRange(range);
+}`;
+// The vault's: where an element lives (run in the main frame's isolated world, where `document` is the page's).
+const FIELD_HOME = `function () {
+  const doc = this.ownerDocument;
+  return { inPage: doc === document, origin: doc && doc.defaultView ? doc.defaultView.location.origin : "" };
+}`;
+// The vault's dropdown choice: only an option whose label or value is the value itself (no guessing).
+const CHOOSE_EXACT = `function (text) {
+  const want = String(text).trim().toLowerCase();
+  const option = Array.from(this.options).find((o) => o.label.trim().toLowerCase() === want || o.value.trim().toLowerCase() === want);
+  if (option == null) return false;
+  this.value = option.value;
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
 }`;
 const CHOOSE_OPTION = `function (text) {
   const want = String(text).trim().toLowerCase();

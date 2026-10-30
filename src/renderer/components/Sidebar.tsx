@@ -1,7 +1,7 @@
 // Agent roster sidebar. Each row has an actions menu (its … button, or a right-click); agents hidden
 // from the sidebar are listed in a "Hidden agents" group at the end, from which they can be shown again.
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
-import { type AgentSummary, isAgentWorking } from "../../shared/model";
+import { type AgentSummary, isAgentWorking, isSessionRunning } from "../../shared/model";
 import { MOD_LABEL } from "../shortcuts";
 import { app, openConnectApps, openDialog, openSettings, selectAgent, setShowHidden } from "../store/app";
 import { layout, updateLayout } from "../store/layout";
@@ -10,12 +10,14 @@ import { roster } from "../store/roster";
 import { useStore } from "../store/store";
 import { activityText, backgroundText } from "./activity";
 import { AgentMenuItems, Menu } from "./AgentMenu";
-import { Avatar } from "./Avatar";
+import { AgentAvatar } from "./AgentAvatar";
+import { groupActivityText } from "./GroupChat";
 import { Icon } from "./icons";
 
 export function statusLine(agent: AgentSummary): { text: string; tone: "default" | "working" | "attention" } {
   if (agent.awaitingUserResponse != null) return { text: agent.awaitingUserResponse.reason === "approval" ? "Needs your approval" : "Has a question for you", tone: "attention" };
-  if (agent.isRunning) {
+  if (agent.isGroup && agent.isRunning) return { text: groupActivityText(agent) ?? "Replying…", tone: "working" };
+  if (isSessionRunning(agent)) {
     const activity = agent.currentActivity;
     return { text: activity?.kind === "tool" || activity?.kind === "searching" ? activityText(activity) : agent.isComposingMessage ? "Writing…" : "Thinking…", tone: "working" };
   }
@@ -145,7 +147,7 @@ function AgentRow({ agent, selected, cursor, menuOpen, onMenu }: { agent: AgentS
         onClick={() => selectAgent(agent.id)}
         aria-current={selected ? "page" : undefined}
       >
-        <Avatar shape={agent.avatarShape} color={agent.avatarColor} size={32} busy={isAgentWorking(agent)} image={agent.avatarDataUrl} />
+        <AgentAvatar agent={agent} size={32} busy={isAgentWorking(agent)} />
         <span className="agent-row__text">
           <span className="agent-row__top">
             <span className={`agent-row__name${agent.hasUnread ? " agent-row__name--unread" : ""}`}>{agent.name}</span>

@@ -69,11 +69,15 @@ export function AgentMenuItems({ agent, onDone }: { agent: AgentSummary; onDone(
     void Promise.resolve(run()).catch(() => undefined);
   };
   const hidden = agent.isHiddenFromSidebar === true;
+  // A group chat is renamed and given members in its details pane; it has no copy, template or tasks of its own.
+  const group = agent.isGroup;
   return (
     <>
-      <button type="button" role="menuitem" onClick={act(() => openDialog({ kind: "edit-agent", agentId: agent.id }))}>
-        <Icon name="edit" size={14} /> Edit agent
-      </button>
+      {group ? null : (
+        <button type="button" role="menuitem" onClick={act(() => openDialog({ kind: "edit-agent", agentId: agent.id }))}>
+          <Icon name="edit" size={14} /> Edit agent
+        </button>
+      )}
       <button type="button" role="menuitem" onClick={act(() => gateway.updateAgentConfig({ id: agent.id, isPinned: !agent.isPinned }))}>
         <Icon name="pin" size={14} /> {agent.isPinned ? "Unpin" : "Pin to top"}
       </button>
@@ -94,21 +98,27 @@ export function AgentMenuItems({ agent, onDone }: { agent: AgentSummary; onDone(
       <button type="button" role="menuitem" onClick={act(() => openOutline(agent.id))}>
         <Icon name="outline" size={14} /> Show full conversation
       </button>
-      <button type="button" role="menuitem" onClick={act(() => openAsyncTasks(agent.id))}>
-        <Icon name="terminal" size={14} /> Async tasks{(agent.asyncTaskCount ?? 0) > 0 ? ` (${agent.asyncTaskCount})` : ""}
-      </button>
+      {group ? null : (
+        <button type="button" role="menuitem" onClick={act(() => openAsyncTasks(agent.id))}>
+          <Icon name="terminal" size={14} /> Async tasks{(agent.asyncTaskCount ?? 0) > 0 ? ` (${agent.asyncTaskCount})` : ""}
+        </button>
+      )}
       <button type="button" role="menuitem" onClick={act(() => gateway.resetConversation({ id: agent.id }))}>
         <Icon name="refresh" size={14} /> Start fresh conversation
       </button>
-      <button type="button" role="menuitem" onClick={act(() => gateway.copyAgent({ id: agent.id }))}>
-        <Icon name="plus" size={14} /> Duplicate
-      </button>
-      <button type="button" role="menuitem" onClick={act(() => openDialog({ kind: "share-template", agentId: agent.id }))}>
-        <Icon name="share" size={14} /> Share as template…
-      </button>
+      {group ? null : (
+        <>
+          <button type="button" role="menuitem" onClick={act(() => gateway.copyAgent({ id: agent.id }))}>
+            <Icon name="plus" size={14} /> Duplicate
+          </button>
+          <button type="button" role="menuitem" onClick={act(() => openDialog({ kind: "share-template", agentId: agent.id }))}>
+            <Icon name="share" size={14} /> Share as template…
+          </button>
+        </>
+      )}
       <div className="menu__separator" role="separator" />
       <button type="button" role="menuitem" className="menu__danger" onClick={act(() => openDialog({ kind: "delete-agent", agentId: agent.id }))}>
-        <Icon name="trash" size={14} /> Delete agent
+        <Icon name="trash" size={14} /> {group ? "Delete group chat" : "Delete agent"}
       </button>
     </>
   );

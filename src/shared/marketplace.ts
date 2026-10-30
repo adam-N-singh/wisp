@@ -111,6 +111,19 @@ export interface InstalledPluginView {
   skillChanges: { added: string[]; removed: string[]; changed: string[] } | null;
   /** The marketplace no longer lists it; it stays installed until it's uninstalled. */
   delisted: boolean;
+  /** …and its marketplace says it was removed (`renames` maps it to null). */
+  removed: boolean;
+  /** …and its marketplace sets `forceRemoveDeletedPlugins`: it asks for it to be uninstalled, which waits for the user to confirm. */
+  removalRequested: boolean;
+  /** Turned off: its servers stop and agents don't get its skills; its settings and sign-ins stay. */
+  enabled: boolean;
+  /** Its name before its marketplace renamed it (`renames`); the install moved to the new name. */
+  renamedFrom: string | null;
+  /**
+   * The daily check saw newer files for it that no refresh has read yet: Refresh reads them, then
+   * the update is reviewed as any other. Null when there's none, or once `updateAvailable` is true.
+   */
+  updateFound: { commit: string; checkedAt: number; serversChanged: boolean } | null;
 }
 
 /** One of a plugin's skills an update adds, removes or changes, as agents read it (characters that don't show taken out). */
@@ -160,6 +173,12 @@ export interface MarketplaceView {
   pluginCount: number;
   installedCount: number;
   updateCount: number;
+  /** Installed plugins the daily check found newer files for, which a refresh hasn't read yet. */
+  foundUpdateCount: number;
+  /** When the daily check last looked (null before its first look; a refresh counts as one). */
+  checkedAt: number | null;
+  /** Installed plugins it no longer lists and asks to be uninstalled (`forceRemoveDeletedPlugins`), until the user confirms. */
+  removedPlugins: Array<{ pluginId: string; displayName: string }>;
   /** Plugins in repositories of their own not read yet. */
   unfetchedCount: number;
   problems: string[];

@@ -1,6 +1,7 @@
 // Bot avatars: a colored silhouette with a two-eyed face, in one of 26
-// shapes (blob, capsule, hex, …).
-import type { AvatarColor, AvatarShape } from "../../shared/model";
+// shapes (blob, capsule, hex, …). A group chat's avatar stacks two of its members' (AgentAvatar.tsx
+// picks them; this file reads no store, so the desktop-mount pages can use it too).
+import type { AgentSummary, AvatarColor, AvatarShape } from "../../shared/model";
 
 const SHAPES: Record<AvatarShape, string> = {
   arch: "M4 28V14a12 12 0 0 1 24 0v14z",
@@ -56,6 +57,24 @@ export function Avatar({ shape = "blob", color = "gray", size = 28, busy = false
           <rect x="18.2" y="13" width="2.6" height="4.6" rx="1.3" fill="#141414" />
         </svg>
       )}
+    </span>
+  );
+}
+
+type AvatarLook = Pick<AgentSummary, "avatarShape" | "avatarColor" | "avatarDataUrl">;
+
+/** Two members' avatars, the second over the first's corner. */
+export function AvatarStack({ members, size = 28, busy = false }: { members: AvatarLook[]; size?: number; busy?: boolean }) {
+  const small = Math.round(size * 0.7);
+  const [back, front] = members;
+  return (
+    <span className={`avatar avatar-stack${busy ? " avatar--busy" : ""}`} style={{ width: size, height: size }}>
+      <span className="avatar-stack__back">
+        <Avatar shape={back?.avatarShape} color={back?.avatarColor} size={small} image={back?.avatarDataUrl ?? null} />
+      </span>
+      <span className="avatar-stack__front">
+        <Avatar shape={front?.avatarShape} color={front?.avatarColor ?? "gray"} size={small} image={front?.avatarDataUrl ?? null} />
+      </span>
     </span>
   );
 }
