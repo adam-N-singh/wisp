@@ -136,7 +136,10 @@ export function startAgentData(): void {
   if (started) return;
   started = true;
   gateway.subscribe({
-    todos: ({ agentId, todos: list }) => todos.set((state) => ({ ...state, [agentId]: list })),
+    // The agent's main session's; another session's todos are its own.
+    todos: ({ agentId, sessionId, todos: list }) => {
+      if (sessionId == null || sessionId === "") todos.set((state) => ({ ...state, [agentId]: list }));
+    },
     automations: ({ agentId, automations: list }) => setAutomations(agentId, list),
     skills: ({ agentId, skills }) => setSkills(agentId, skills),
     memories: ({ agentId, memories: list }) => setMemories(agentId, list),

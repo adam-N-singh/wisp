@@ -32,6 +32,7 @@ export const SHORTCUTS: readonly ShortcutInfo[] = [
   { id: "commandPalette", section: "Essentials", label: "Jump to an agent, action or message", keys: [[MOD, "K"]] },
   { id: "focusSearch", section: "Essentials", label: "Search agents and messages", keys: [[MOD, SHIFT, "F"]] },
   { id: "newAgent", section: "Essentials", label: "New agent", keys: [[MOD, "N"]] },
+  { id: "newGroupChat", section: "Essentials", label: "New group chat", keys: [[MOD, SHIFT, "N"]] },
   { id: "openSettings", section: "Essentials", label: "Settings", keys: [[MOD, ","]] },
   { id: "keyboardShortcuts", section: "Essentials", label: "Keyboard shortcuts", keys: [[MOD, "/"]] },
   { id: "findInChat", section: "Chat", label: "Find in chat", keys: [[MOD, "F"]] },
@@ -133,6 +134,7 @@ export function onShortcutKeyDown(event: KeyboardEvent): void {
   else if (plain && key === "f") {
     if (view === "chat" && agentId != null) handled(() => openFind(agentId));
   } else if (plain && key === "n") handled(() => openDialog({ kind: "new-agent" }));
+  else if (event.shiftKey && !event.altKey && key === "n") handled(() => openDialog({ kind: "new-group" }));
   else if (!event.altKey && (event.key === "," || event.code === "Comma")) {
     if (!event.shiftKey) handled(() => openSettings());
     else if (agentId != null) handled(() => openDialog({ kind: "edit-agent", agentId }));

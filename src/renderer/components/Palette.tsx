@@ -5,7 +5,7 @@
 // closes.
 import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { type AgentSummary, isAgentWorking, type MessageMatch } from "../../shared/model";
-import type { LibraryPage } from "../../shared/pages";
+import { type LibraryPage, pageId } from "../../shared/pages";
 import { gateway, main } from "../bridge";
 import { agentScore, canHaveAgentBrowser, pageMatches } from "../palette-match";
 import { isModKey, MOD_LABEL, openPalette, shortcutKey, SHORTCUTS } from "../shortcuts";
@@ -15,7 +15,7 @@ import { openInfoTab, updateLayout } from "../store/layout";
 import { allPages, drafts, loadAllPages, openPage, pageKey } from "../store/pages";
 import { allAgents, roster } from "../store/roster";
 import { useStore } from "../store/store";
-import { Avatar } from "./Avatar";
+import { AgentAvatar } from "./AgentAvatar";
 import { focusComposer } from "./Composer";
 import { Icon, type IconName } from "./icons";
 import { Keys } from "./ShortcutsDialog";
@@ -44,6 +44,7 @@ const SETTINGS: Array<{ section: SettingsSection; label: string; keywords?: stri
   { section: "model", label: "Models", keywords: "provider api key chatgpt claude default model" },
   { section: "cloud", label: "Cloud computer", keywords: "e2b sandbox" },
   { section: "permissions", label: "Permissions", keywords: "approvals tools" },
+  { section: "vault", label: "Vault", keywords: "passwords logins contact info address import csv" },
   { section: "mcp", label: "MCP servers", keywords: "tools connectors apps" },
   { section: "about", label: "About", keywords: "version" },
 ];
@@ -51,11 +52,19 @@ const SETTINGS: Array<{ section: SettingsSection; label: string; keywords?: stri
 function paletteActions(agent: AgentSummary | undefined, hiddenCount: number): Action[] {
   const actions: Action[] = [
     { id: "new-agent", label: "New agent", icon: "plus", keywords: "create add bot", shortcut: "newAgent", run: () => openDialog({ kind: "new-agent" }) },
+    { id: "new-group", label: "New group chat", icon: "users", keywords: "create room bots together team members", shortcut: "newGroupChat", run: () => openDialog({ kind: "new-group" }) },
     { id: "add-bot", label: "Add bot from a template", icon: "download", keywords: "import template share file link", run: () => openDialog({ kind: "add-bot" }) },
     { id: "bot-templates", label: "Bot templates", icon: "sparkle", keywords: "starter gallery marketplace templates", run: () => openConnectApps({ tab: "bots" }) },
     { id: "connect-apps", label: "Connect Apps", icon: "plug", keywords: "mcp servers tools connectors integrations plugins github linear notion", shortcut: "openTools", run: () => openConnectApps() },
   ];
-  if (agent != null) {
+  if (agent != null && agent.isGroup) {
+    // A group chat: its conversation and its members; it has no tools, skills or template of its own.
+    actions.push(
+      { id: "find", label: `Find in chat with ${agent.name}`, icon: "search", keywords: "search conversation", shortcut: "findInChat", run: () => (closeSettings(), openFind(agent.id)) },
+      { id: "outline", label: `${agent.name}: Show full conversation`, icon: "outline", keywords: "outline", run: () => openOutline(agent.id) },
+      { id: "members", label: `${agent.name}: Members`, icon: "users", keywords: "add remove bots rename group", run: () => (closeSettings(), updateLayout((state) => ({ ...state, infoPane: { ...state.infoPane, isOpen: true } }))) },
+    );
+  } else if (agent != null) {
     actions.push(
       { id: "find", label: `Find in chat with ${agent.name}`, icon: "search", keywords: "search conversation", shortcut: "findInChat", run: () => (closeSettings(), openFind(agent.id)) },
       { id: "outline", label: `${agent.name}: Show full conversation`, icon: "outline", keywords: "outline thinking tool calls reasoning", run: () => openOutline(agent.id) },
@@ -183,7 +192,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
     const found = mode === "jump" ? pageMatches(pages ?? [], { visible: rosterState.agents, hidden: rosterState.hidden }, needle, needle.length === 0 ? 4 : 8) : [];
     const result: Array<{ title: string; rows: Row[]; note?: string }> = [];
     if (agents.length > 0) result.push({ title: "Agents", rows: agents.map((agent) => ({ kind: "agent", key: `agent:${agent.id}`, agent })) });
-    if (found.length > 0) result.push({ title: "Pages", rows: found.map(({ page, agent }) => ({ kind: "page", key: `page:${agent.id}:${page.page.documentId}`, page, agent })) });
+    if (found.length > 0) result.push({ title: "Pages", rows: found.map(({ page, agent }) => ({ kind: "page", key: `page:${agent.id}:${pageId(page.page)}`, page, agent })) });
     if (actions.length > 0) result.push({ title: "Actions", rows: actions.map((action) => ({ kind: "action", key: `action:${action.id}`, action })) });
     if (messages.status !== "idle") {
       const rows: Row[] = messages.hits.map((hit) => ({ kind: "message", key: `message:${hit.agentId}:${hit.entryId}`, hit, agent: everyone.find((agent) => agent.id === hit.agentId) }));
@@ -213,7 +222,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
     } else if (row.kind === "page") {
       // Its agent's conversation first: the stage belongs to it.
       selectAgent(row.agent.id);
-      openPage(row.agent.id, row.page.page.documentId);
+      openPage(row.agent.id, pageId(row.page.page));
     } else if (row.kind === "action") row.action.run();
     else {
       selectAgent(row.hit.agentId);
@@ -227,7 +236,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
       case "agent":
         return (
           <>
-            <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} busy={isAgentWorking(row.agent)} />
+            <AgentAvatar agent={row.agent} size={28} busy={isAgentWorking(row.agent)} />
             <span className="palette__text">
               <span className="palette__title">
                 <Highlighted text={row.agent.name} query={needle} />
@@ -241,7 +250,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
         return (
           <>
             <span className="palette__icon">
-              <Icon name="file" size={16} />
+              <Icon name={row.page.page.kind === "canvas" ? "code" : "file"} size={16} />
             </span>
             <span className="palette__text">
               <span className="palette__title">
@@ -249,8 +258,9 @@ export function Palette({ mode }: { mode: PaletteMode }) {
               </span>
               <span className="palette__detail">
                 {row.agent.name}
-                {row.page.updatedBy === "user" ? " · edited by you" : ""} · {relativeTime(row.page.updatedAt)}
-                {unsaved[pageKey(row.agent.id, row.page.page.documentId)] != null ? <span className="page-card__unsaved"> · unsaved changes</span> : null}
+                {row.page.page.kind === "canvas" ? " · canvas" : ""}
+                {row.page.updatedBy === "user" ? (row.page.page.kind === "canvas" ? " · restored by you" : " · edited by you") : ""} · {relativeTime(row.page.updatedAt)}
+                {unsaved[pageKey(row.agent.id, pageId(row.page.page))] != null ? <span className="page-card__unsaved"> · unsaved changes</span> : null}
               </span>
             </span>
             {row.agent.isHiddenFromSidebar === true ? <span className="pill">Hidden</span> : null}
@@ -274,7 +284,7 @@ export function Palette({ mode }: { mode: PaletteMode }) {
         return (
           <>
             {row.agent != null ? (
-              <Avatar shape={row.agent.avatarShape} color={row.agent.avatarColor} size={28} />
+              <AgentAvatar agent={row.agent} size={28} />
             ) : (
               <span className="palette__icon">
                 <Icon name="message" size={16} />

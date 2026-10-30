@@ -1,20 +1,24 @@
 // Electron main process: the app's composition root.
-import { writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, nativeTheme, protocol, screen, session, shell } from "electron";
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, nativeTheme, net, protocol, safeStorage, screen, session, shell } from "electron";
 import { autoUpdater } from "electron-updater";
 import { BOT_TEMPLATE_EXTENSION, botTemplateFileName } from "../shared/bot-template";
+import { CanvasLinkGate } from "../shared/canvas";
 import { serveEdge } from "../shared/rpc/runtime";
 import { ipcServerTransport, type PortPeer } from "../shared/rpc/transports";
 import { type BoxLocationState, type BoxModelConfig, boxHostEdge, coordinatorControlEdge, type DeepLink, localHostEdge, mainEdge, type ThemeState } from "../shared/edges";
 import type { PermissionAsk } from "../shared/gateway-protocol";
 import { pageFileName } from "../shared/pages";
+import { vaultItemLabel } from "../shared/vault";
 import { type AgentSummary, type ChatGptStatus, type ClaudeCodeStatus, type CloudSettings, type KeyedProvider, type ModelSettings, OPENAI_BASE_URL } from "../shared/model";
 import { LOCAL_PERMISSIONS } from "../local-exec/policy";
 import { agentWorkspace } from "../local-exec/workspace";
 import { AgentBrowsers } from "./agent-browser";
+import { AgentBrowserBounds } from "./agent-browser-bounds";
 import { AttachmentStore, handleMediaProtocol, MEDIA_SCHEME } from "./attachments";
 import { botTemplateLinkSource, fetchBotTemplate, fetchBoxTemplate, readBotTemplateFile, writeBotTemplateFile } from "./bot-templates";
+import { CANVAS_SCHEME, CanvasFrames, canvasOnPage, handleCanvasProtocol, watchCanvasGestures } from "./canvases";
 import { ChatGptAuth } from "./chatgpt-auth";
 import { detectClaudeCode, openClaudeCodeSignIn } from "./claude-code-cli";
 import { ClientPersistence } from "./client-persistence";
@@ -27,6 +31,8 @@ import { type SecretName, SecretStore } from "./secrets";
 import { SettingsStore } from "./settings";
 import { TrayController } from "./tray";
 import { Updater } from "./updater";
+import { Vault, VaultAudit, VaultFiller } from "./vault";
+import { CSV_MAX_BYTES, parsePasswordExport } from "./vault-csv";
 import { handleVisualizationProtocol, VISUALIZATION_SCHEME } from "./visualizations";
 import { installWebPermissions } from "./web-permissions";
 import { createMainWindow, overlayColors, resolvedDark } from "./windows";
@@ -48,7 +54,7 @@ const boxDataDir = join(userDataDir, "box");
 const settings = new SettingsStore(userDataDir);
 if (!settings.get().hardwareAcceleration) app.disableHardwareAcceleration();
 // Electron takes every privileged scheme in one call, before `app.ready`.
-protocol.registerSchemesAsPrivileged([MEDIA_SCHEME, VISUALIZATION_SCHEME]);
+protocol.registerSchemesAsPrivileged([MEDIA_SCHEME, VISUALIZATION_SCHEME, CANVAS_SCHEME]);
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -151,6 +157,7 @@ async function main(): Promise<void> {
     agentName: (agentId) => rosterCache.find((agent) => agent.id === agentId)?.name ?? "Agent",
     showChat: (agentId) => showMainWindow(agentId),
     onChange: (state) => emitMain?.("agent-browser-changed", state),
+    windowBounds: new AgentBrowserBounds(join(userDataDir, "agent-browser-windows.json")),
   });
   agentBrowsers.install();
 
@@ -230,9 +237,32 @@ async function main(): Promise<void> {
   // local-exec registers each card it asks for (content and request id); the coordinator records the
   // user's answer as it relays it; local-exec then runs a call the box resends only with that answer.
   // A box elsewhere can't approve on the user's behalf, or show different text on the card.
-  const approvals = new Map<string, { ask: PermissionAsk; resolution: "allow-once" | "always" | "deny" | "never" | null; used: boolean; at: number }>();
+  const approvals = new Map<string, { ask: PermissionAsk; resolution: "allow-once" | "always" | "deny" | "never" | null; used: boolean; at: number; vaultSpent?: boolean }>();
   const pruneApprovals = () => {
     for (const [id, approval] of approvals) if (Date.now() - approval.at > 24 * 60 * 60_000 || approvals.size > 500) approvals.delete(id);
+  };
+
+  // ---- the vault: logins and contact info, filled into the agent browser without the model seeing them --
+  // A fill runs only on an Allow once the user gave on this PC for a card that named that item on that
+  // site (its description, `vault:<item>@<origin>`), which local-exec has taken and main now spends.
+  const vault = new Vault(userDataDir, safeStorage);
+  const vaultAudit = new VaultAudit(join(userDataDir, "vault-audit.jsonl"));
+  const vaultFiller = new VaultFiller({
+    vault,
+    audit: vaultAudit,
+    browser: agentBrowsers.vault(),
+    spendApproval: (approvalId, subject) => {
+      const approval = approvals.get(approvalId);
+      if (approval == null || approval.ask.toolId !== "vault" || approval.ask.description !== subject || approval.resolution !== "allow-once" || !approval.used || approval.vaultSpent === true) return false;
+      approval.vaultSpent = true;
+      return true;
+    },
+  });
+  const vaultView = () => ({ available: vault.available(), problem: vault.problem(), items: vault.list(), audit: vaultAudit.view() });
+  const vaultChanged = () => {
+    const view = vaultView();
+    emitMain?.("vault-changed", view);
+    return view;
   };
 
   // ---- child processes ----------------------------------------------------------------
@@ -473,7 +503,8 @@ async function main(): Promise<void> {
             const capture = await grabScreen(2560);
             return capture == null ? null : { pngBase64: capture.png.toString("base64"), width: capture.width, height: capture.height };
           },
-          getClipboardText: () => clipboard.readText(),
+          // A vault value on the clipboard (a site's own Copy button put it there) is blanked for the agent.
+          getClipboardText: async () => agentBrowsers.scrubClipboard(await clipboard.readText()),
           putClipboardText: ({ text }) => clipboard.writeText(text),
           openInBrowser: async ({ url }) => {
             if (!/^https?:\/\//i.test(url)) throw new Error("Only http(s) links can be opened.");
@@ -482,6 +513,15 @@ async function main(): Promise<void> {
           browserPlan: (call) => agentBrowsers.plan(call),
           browserRun: (call) => agentBrowsers.run(call),
           browserCancel: ({ callId }) => agentBrowsers.cancel(callId),
+          vaultList: ({ agentId }) => vaultFiller.list(agentId),
+          vaultPlan: (call) => vaultFiller.plan(call),
+          vaultFill: async (call) => {
+            try {
+              return await vaultFiller.fill(call);
+            } finally {
+              vaultChanged();
+            }
+          },
         },
         peer.server,
       );
@@ -539,6 +579,10 @@ async function main(): Promise<void> {
     const size = source.thumbnail.getSize();
     return { png: source.thumbnail.toPNG(), width: size.width, height: size.height };
   }
+
+  // Canvases, from whichever box is in use (this PC's or a server), and the links they ask to open.
+  handleCanvasProtocol(protocol, new CanvasFrames(() => processes.gatewayAddress(), (url, init) => net.fetch(url, init)));
+  const canvasLinks = new CanvasLinkGate();
 
   // ---- main edge (renderer -> main), main window top frame only ----------------------------
   const mainTargets = () => (mainWindow != null && !mainWindow.isDestroyed() ? [mainWindow.webContents] : []);
@@ -754,11 +798,21 @@ async function main(): Promise<void> {
         writeBotTemplateFile(picked.filePath, template);
         return picked.filePath;
       },
-      savePageFile: async ({ title, source }) => {
-        const picked = await dialog.showSaveDialog(win(), { title: "Save as Markdown", defaultPath: join(app.getPath("documents"), pageFileName(title)), filters: [{ name: "Markdown", extensions: ["md"] }] });
+      savePageFile: async ({ title, source, kind = "document" }) => {
+        const filter = kind === "canvas" ? { name: "HTML", extensions: ["html"] } : { name: "Markdown", extensions: ["md"] };
+        const picked = await dialog.showSaveDialog(win(), { title: `Save as ${filter.name}`, defaultPath: join(app.getPath("documents"), pageFileName(title, kind)), filters: [filter] });
         if (picked.canceled || picked.filePath == null) return null;
         writeFileSync(picked.filePath, source.endsWith("\n") ? source : `${source}\n`);
         return picked.filePath;
+      },
+      openLinkFromCanvas: async ({ url }) => {
+        const verdict = canvasLinks.admit(url, canvasOnPage(win().webContents));
+        if (!verdict.open) {
+          console.error(`[canvas] a link wasn't opened (${verdict.reason})`);
+          return false;
+        }
+        await shell.openExternal(verdict.url);
+        return true;
       },
       getMountState: () => ({ mountedAgentId: desktopMount.mountedId() }),
       mountAgent: async ({ agentId }) => {
@@ -771,13 +825,42 @@ async function main(): Promise<void> {
       },
       getAgentBrowser: ({ agentId }) => agentBrowsers.state(agentId),
       showAgentBrowser: ({ agentId }) => agentBrowsers.show(agentId),
+      readVault: () => vaultView(),
+      readVaultItem: ({ id }) => vault.draft(id),
+      saveVaultItem: async (input) => {
+        const item = await vault.save(input);
+        vaultAudit.append({ event: input.id == null ? "added" : "edited", itemId: item.id, label: vaultItemLabel(item), ...(item.site != null ? { site: item.site } : {}) });
+        return vaultChanged();
+      },
+      deleteVaultItem: async ({ id }) => {
+        const item = await vault.remove(id);
+        vaultAudit.append({ event: "deleted", itemId: item.id, label: vaultItemLabel(item) });
+        return vaultChanged();
+      },
+      // Only a file the user picks: a password export they made in Chrome, Edge or Firefox, parsed here.
+      importVaultCsv: async () => {
+        const picked = await dialog.showOpenDialog(win(), { title: "Import passwords exported from Chrome, Edge or Firefox", properties: ["openFile"], filters: [{ name: "Password export (CSV)", extensions: ["csv"] }] });
+        const path = picked.canceled ? undefined : picked.filePaths[0];
+        if (path == null) return null;
+        if (!/\.csv$/i.test(path)) throw new Error("Pick the .csv file the browser exported.");
+        if (statSync(path).size > CSV_MAX_BYTES) throw new Error("That file is over 5 MB, which is too large for a password export.");
+        const result = await vault.importLogins(parsePasswordExport(readFileSync(path, "utf8")));
+        vaultAudit.append({ event: "imported", count: result.added + result.updated, reason: `${result.format} export` });
+        vaultChanged();
+        return result;
+      },
     },
     ipcServerTransport(ipcMain, mainTargets, fromMainWindow),
     { onError: (method, error) => console.error(`main edge ${method} failed:`, error) },
   );
 
-  // The renderer asks for its boot snapshot synchronously before first paint.
+  // The renderer asks for its boot snapshot synchronously before first paint. Like every edge, only
+  // the main window's own page is answered: its preload runs in other frames too (only to lock them down).
   ipcMain.on("wisp:boot-snapshot-sync", (event) => {
+    if (!fromMainWindow(event)) {
+      event.returnValue = null;
+      return;
+    }
     event.returnValue = {
       mainEdge: "served",
       theme: themeState(),
@@ -789,7 +872,7 @@ async function main(): Promise<void> {
     };
   });
   ipcMain.handle("wisp:coordinator-port-request", (event) => {
-    if (mainWindow != null && event.sender === mainWindow.webContents) processes.attachRenderer(event.sender);
+    if (fromMainWindow(event)) processes.attachRenderer(event.sender);
   });
 
   nativeTheme.on("updated", () => {
@@ -799,6 +882,7 @@ async function main(): Promise<void> {
 
   function openMainWindow(): BrowserWindow {
     const window = createMainWindow({ userDataDir, distDir, spellCheck: settings.get().spellCheck, dark: resolvedDark(settings.get().theme) });
+    watchCanvasGestures(window.webContents, canvasLinks);
     const pushState = () => {
       if (!window.isDestroyed()) emitMain?.("window-state-changed", windowState());
     };

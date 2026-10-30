@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { gzipSync } from "node:zlib";
-import { type BoxHost, startBoxHost } from "../../src/box/host";
-import { parseMarketplaceSource, pluginSource, readMarketplaceFile, readPluginFolder } from "../../src/box/marketplace";
+import { type BoxHost, type BoxHostOptions, startBoxHost } from "../../src/box/host";
+import { currentName, type IndexedPlugin, parseMarketplaceSource, pluginSource, readMarketplaceFile, readPluginFolder } from "../../src/box/marketplace";
 import { basicEnv, blankedEnv } from "../../src/box/mcp";
 import { skillForPrompt } from "../../src/box/skills";
 import { readTarGz, safeRelativePath } from "../../src/box/tarball";
@@ -181,9 +181,16 @@ function marketplaceFiles(version: { description: string; echoServer: string; ec
   };
 }
 
+/** git's ref list as GitHub serves it at /<repo>.git/info/refs?service=git-upload-pack: pkt-lines, HEAD first. */
+function refAdvertisement(head: string): string {
+  const line = (text: string) => `${(Buffer.byteLength(text) + 4).toString(16).padStart(4, "0")}${text}`;
+  return `${line("# service=git-upload-pack\n")}0000${line(`${head} HEAD\0multi_ack thin-pack side-band symref=HEAD:refs/heads/main\n`)}${line(`${head} refs/heads/main\n`)}0000`;
+}
+
 /**
  * A fake GitHub: archives at /<owner>/<repo>/archive/<ref>.tar.gz (redirected to a codeload-like
- * path, as GitHub does), a Streamable HTTP MCP server at /mcp, and a marketplace.json at /market.json.
+ * path, as GitHub does), git's ref list at /<owner>/<repo>.git/info/refs, a Streamable HTTP MCP
+ * server at /mcp, and a marketplace.json at /market.json.
  */
 async function fakeGithub() {
   const repos = new Map<string, { head: string; commits: Map<string, Buffer> }>();
@@ -207,6 +214,13 @@ async function fakeGithub() {
         response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
       });
       return;
+    }
+    const refs = /^\/([^/]+\/[^/]+)\.git\/info\/refs\?service=git-upload-pack$/.exec(url);
+    if (refs != null) {
+      const repo = repos.get(refs[1]);
+      if (repo == null) return void response.writeHead(404).end();
+      response.writeHead(200, { "content-type": "application/x-git-upload-pack-advertisement" });
+      return response.end(refAdvertisement(repo.head));
     }
     const archive = /^\/([^/]+\/[^/]+)\/archive\/(.+)\.tar\.gz$/.exec(url);
     if (archive != null) {
@@ -244,8 +258,9 @@ async function fakeGithub() {
   };
 }
 
-async function bootBox(dataDir: string, github: string): Promise<BoxHost> {
+async function bootBox(dataDir: string, github: string, extra: Partial<BoxHostOptions> = {}): Promise<BoxHost> {
   const box = await startBoxHost({
+    ...extra,
     dataDir,
     version: "test",
     token: TOKEN,
@@ -651,4 +666,322 @@ test("box gateway: an update's review reports what it changes in skills, version
   assert.equal(skills[0].body, "Line one.\nLine 2, changed.");
   assert.deepEqual([(await entry()).plugin!.installed!.version, (await entry()).plugin!.installed!.skillChanges], ["1.1.0", null]);
   await refused("getPluginUpdate", { pluginId: "kit@kits" }, 409, /no newer version/);
+});
+
+test("marketplace renames: chains followed from the oldest name, to a listed plugin or to null", () => {
+  const file = readMarketplaceFile(
+    JSON.stringify({
+      name: "m",
+      owner: { name: "O" },
+      plugins: [
+        { name: "current", source: "./c" },
+        { name: "kept", source: "./k" },
+      ],
+      renames: { oldest: "older", older: "current", gone: null, kept: "current", ghost: "nowhere", loop1: "loop2", loop2: "loop1", "bad name": "current" },
+      forceRemoveDeletedPlugins: true,
+    }),
+    "github",
+  );
+  assert.deepEqual(file.renames, { oldest: "current", older: "current", gone: null });
+  assert.equal(file.forceRemoveDeletedPlugins, true);
+  const problems = file.problems.join("\n");
+  for (const name of ["kept", "ghost", "loop1", "loop2", "bad name"]) assert.match(problems, new RegExp(`renames entry “${name}” was skipped`));
+  const index = { plugins: [{ name: "current" }, { name: "kept" }] as unknown as IndexedPlugin[], renames: file.renames };
+  assert.deepEqual(
+    ["current", "oldest", "gone", "unknown"].map((name) => currentName(index, name)),
+    ["current", "current", null, null],
+  );
+  const plain = readMarketplaceFile(JSON.stringify({ name: "m", plugins: [], renames: ["not", "a", "map"] }), "github");
+  assert.deepEqual([plain.renames, plain.forceRemoveDeletedPlugins], [{}, false]);
+  assert.match(plain.problems.join(" "), /renames isn’t a map/);
+});
+
+test("box gateway: a plugin turned off stops its server and hides its skills, keeping its settings", async () => {
+  const github = await fakeGithub();
+  github.push("acme/market", marketplaceFiles({ description: "Acme’s plugins.", echoServer: ECHO_SERVER, echoArgs: ["--greeting", "${user_config.greeting}"] }));
+  const dataDir = tempDir();
+  let box = await bootBox(dataDir, github.base);
+  const { api, refused } = client(() => box);
+  const { agent } = await api<{ agent: AgentSummary }>("addAgent", { name: "Switcher", description: "" });
+  await api("addMarketplace", { source: "acme/market" });
+  const entry = async () => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === "echo@acme-tools")!;
+  const { serverId } = await api<McpState & { serverId: string }>("connectCatalogApp", { entryId: "echo@acme-tools", values: { greeting: "Hi there", token: "s3cret" }, approvalKey: (await entry()).plugin!.approvalKey });
+  const server = () => api<McpState>("readAppsState", {}).then((state) => state.servers.find((candidate) => candidate.id === serverId));
+  await until(async () => (await server())?.status === "connected");
+  // A setting of its server, which stays while the plugin is off.
+  await api("switchMcpTool", { serverId, toolName: "hello" });
+  const skillNames = async () => (await api<Skill[]>("listAgentSkills", { id: agent.id })).filter((skill) => skill.source === "plugin").map((skill) => skill.name);
+  assert.deepEqual(await skillNames(), ["echo:greet"]);
+  assert.equal((await entry()).plugin!.installed!.enabled, true);
+
+  // Off: its server stops and agents lose its skills; it stays installed, with its values and its server.
+  await api<McpState>("setMcpPluginEnabled", { pluginId: "echo@acme-tools", enabled: false });
+  await until(async () => (await server())?.status === "disconnected");
+  assert.deepEqual(await skillNames(), []);
+  assert.deepEqual(
+    (await api<EffectivePlugin[]>("listInstalledPlugins", {})).map((plugin) => [plugin.pluginId, plugin.isEnabled]),
+    [["echo@acme-tools", false]],
+  );
+  const off = (await entry()).plugin!.installed!;
+  assert.deepEqual([off.enabled, off.values, off.configuredKeys.sort(), off.serverIds], [false, { greeting: "Hi there" }, ["greeting", "token"], [serverId]]);
+  assert.equal((await server())?.enabled, true, "its server’s own switch is left as it was");
+  await api("setMcpPluginEnabled", { pluginId: "echo@acme-tools", enabled: false });
+
+  // Still off after a restart: its server doesn't start.
+  box.close();
+  const started = join(dataDir, "plugin-data", "acme-tools", "echo", "started");
+  rmSync(started, { force: true });
+  box = await bootBox(dataDir, github.base);
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.ok(!existsSync(started), "a plugin turned off doesn’t run at startup");
+  assert.equal((await server())?.status, "disconnected");
+  assert.deepEqual(await skillNames(), []);
+
+  // Back on: the same server with its values and settings, and the skills again.
+  await api("setMcpPluginEnabled", { pluginId: "echo@acme-tools", enabled: true });
+  await until(async () => (await server())?.status === "connected");
+  assert.deepEqual(
+    (await api<McpServerTool[]>("mcpServerTools", { serverId })).map((tool) => [tool.name, tool.description, tool.isDisabled]),
+    [["hello", "Hi there", true]],
+  );
+  assert.deepEqual(await skillNames(), ["echo:greet"]);
+  assert.equal((await entry()).plugin!.installed!.enabled, true);
+  await refused("setMcpPluginEnabled", { pluginId: "nope@acme-tools", enabled: false }, 404, /isn’t installed/);
+});
+
+test("box gateway: a renamed plugin moves to its new name; a removed one goes once the user confirms", async () => {
+  const github = await fakeGithub();
+  const files = {
+    "tool/.mcp.json": JSON.stringify({ mcpServers: { echo: { command: process.execPath, args: ["${CLAUDE_PLUGIN_ROOT}/server.js", "--greeting", "hello"], env: { ECHO_DATA: "${CLAUDE_PLUGIN_DATA}" } } } }),
+    "tool/server.js": ECHO_SERVER,
+    "tool/skills/use/SKILL.md": SKILL("use", "Use the tool.", "USE IT."),
+    "doomed/skills/d/SKILL.md": SKILL("d", "Use d.", "D."),
+    "keep/skills/k/SKILL.md": SKILL("k", "Use k.", "K."),
+  };
+  const market = (body: Record<string, unknown>) => ({ ".claude-plugin/marketplace.json": JSON.stringify({ name: "kits", owner: { name: "K" }, ...body }), ...files });
+  github.push("acme/kits", market({ plugins: ["tool", "doomed", "keep"].map((name) => ({ name, source: `./${name}` })) }));
+  const dataDir = tempDir();
+  let box = await bootBox(dataDir, github.base);
+  const { api, refused } = client(() => box);
+  const { agent } = await api<{ agent: AgentSummary }>("addAgent", { name: "Renamer", description: "" });
+  await api("addMarketplace", { source: "acme/kits" });
+  const plugin = async (id: string) => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((entry) => entry.id === id)?.plugin;
+  let serverId = "";
+  for (const id of ["tool@kits", "doomed@kits", "keep@kits"]) {
+    const installed = await api<McpState & { serverId: string }>("connectCatalogApp", { entryId: id, approvalKey: (await plugin(id))!.approvalKey });
+    if (id === "tool@kits") serverId = installed.serverId;
+  }
+  const server = () => api<McpState>("readAppsState", {}).then((state) => state.servers.find((candidate) => candidate.id === serverId));
+  await until(async () => (await server())?.status === "connected");
+  await api("changeAppInstructions", { serverId, instructions: "Use it gently." });
+  writeFileSync(join(dataDir, "plugin-data", "kits", "tool", "notes.txt"), "kept across the rename");
+  const skills = async () => (await api<Skill[]>("listAgentSkills", { id: agent.id })).filter((skill) => skill.source === "plugin").map((skill) => skill.name);
+
+  // The marketplace renames tool (its folder stays), removes doomed, and asks for removed plugins to be uninstalled.
+  github.push("acme/kits", market({ plugins: [{ name: "power-tool", source: "./tool" }, { name: "keep", source: "./keep" }], renames: { tool: "power-tool", doomed: null, ghost: "nowhere" }, forceRemoveDeletedPlugins: true }));
+  const [refreshed] = await api<MarketplaceView[]>("refreshMarketplace", { id: "kits" });
+  assert.match(refreshed.problems.join(" "), /renames entry “ghost” was skipped/);
+
+  // The same plugin under its new name, not one delisted and another new: its server, settings and data moved with it.
+  assert.equal(await plugin("tool@kits"), undefined);
+  const moved = (await plugin("power-tool@kits"))!;
+  assert.deepEqual([moved.installed?.renamedFrom, moved.installed?.delisted, moved.installed?.updateAvailable, moved.installed?.serverIds], ["tool", false, false, [serverId]]);
+  await until(async () => (await server())?.status === "connected" && (await server())?.command?.includes(join("plugins", "kits", "power-tool")) === true);
+  assert.deepEqual([(await server())!.pluginId, (await server())!.customInstructions], ["power-tool@kits", "Use it gently."]);
+  assert.equal(readFileSync(join(dataDir, "plugin-data", "kits", "power-tool", "notes.txt"), "utf8"), "kept across the rename");
+  await until(async () => !existsSync(join(dataDir, "plugins", "kits", "tool")) && !existsSync(join(dataDir, "plugin-data", "kits", "tool")));
+  assert.deepEqual(await skills(), ["doomed:d", "keep:k", "power-tool:use"]);
+
+  // Removed: it stays installed while the marketplace's request waits for the user.
+  const doomed = (await plugin("doomed@kits"))!.installed!;
+  assert.deepEqual([doomed.delisted, doomed.removed, doomed.removalRequested], [true, true, true]);
+  assert.deepEqual(refreshed.removedPlugins, [{ pluginId: "doomed@kits", displayName: "doomed" }]);
+  assert.equal((await plugin("keep@kits"))!.installed!.removalRequested, false);
+  // Only a plugin the user confirmed, and that the marketplace asks to remove, goes.
+  const [unchanged] = await api<MarketplaceView[]>("removeDeletedPlugins", { id: "kits", pluginIds: ["keep@kits"] });
+  assert.deepEqual([unchanged.installedCount, unchanged.removedPlugins.length], [3, 1]);
+  const [left] = await api<MarketplaceView[]>("removeDeletedPlugins", { id: "kits", pluginIds: ["doomed@kits"] });
+  assert.deepEqual([left.installedCount, left.removedPlugins], [2, []]);
+  assert.equal(await plugin("doomed@kits"), undefined, "uninstalled and no longer listed, it’s gone from the catalog");
+  assert.deepEqual(await skills(), ["keep:k", "power-tool:use"]);
+  await refused("removeDeletedPlugins", { id: "nope", pluginIds: [] }, 404);
+
+  // A restart keeps the new name.
+  box.close();
+  box = await bootBox(dataDir, github.base);
+  assert.equal((await plugin("power-tool@kits"))!.installed!.renamedFrom, "tool");
+  await until(async () => (await server())?.status === "connected");
+});
+
+test("box gateway: the daily check marks plugins with newer files, downloads only what moved and installs nothing", async () => {
+  const github = await fakeGithub();
+  const kits = (tip: string) => ({
+    ".claude-plugin/marketplace.json": JSON.stringify({
+      name: "kits",
+      owner: { name: "K" },
+      plugins: [
+        { name: "kit", source: "./kit" },
+        { name: "remote", source: { source: "github", repo: "acme/remote-kit" } },
+      ],
+    }),
+    "kit/skills/tip/SKILL.md": SKILL("tip", "Use for tips.", tip),
+  });
+  const remote = (far: string) => ({ "skills/far/SKILL.md": SKILL("far", "Use from afar.", far) });
+  const commit1 = github.push("acme/kits", kits("TIP ONE."));
+  const remote1 = github.push("acme/remote-kit", remote("FAR ONE."));
+  github.push("acme/other", { ".claude-plugin/marketplace.json": JSON.stringify({ name: "other", owner: { name: "O" }, plugins: [{ name: "spare", source: "./spare" }] }), "spare/skills/s/SKILL.md": SKILL("s", "Use s.", "S.") });
+  let now = Date.now();
+  const dataDir = tempDir();
+  const box = await bootBox(dataDir, github.base, { marketplaceClock: () => now });
+  const { api } = client(() => box);
+  const { agent } = await api<{ agent: AgentSummary }>("addAgent", { name: "Checker", description: "" });
+  await api("addMarketplace", { source: "acme/kits" });
+  // Nothing is installed from this one, so the check never looks at it.
+  await api("addMarketplace", { source: "acme/other" });
+  await api("refreshMarketplace", { id: "kits", plugin: "remote" });
+  const plugin = async (id: string) => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === id)!.plugin!;
+  for (const id of ["kit@kits", "remote@kits"]) await api("connectCatalogApp", { entryId: id, approvalKey: (await plugin(id)).approvalKey });
+  const view = async () => (await api<MarketplaceView[]>("readMarketplaces", {})).find((candidate) => candidate.id === "kits")!;
+  const tip = async () => (await api<Skill[]>("listAgentSkills", { id: agent.id })).find((skill) => skill.name === "kit:tip")!.body;
+  const DAY = 24 * 3600_000;
+
+  // Not due: adding (a refresh) was less than a day ago, so nothing is asked.
+  let before = github.requests.length;
+  await box.checkPluginUpdates();
+  assert.equal(github.requests.length, before);
+
+  // A day on and nothing moved: it asks for each repository's head commit and downloads nothing.
+  now += DAY + 60_000;
+  before = github.requests.length;
+  await box.checkPluginUpdates();
+  assert.deepEqual(github.requests.slice(before).sort(), ["/acme/kits.git/info/refs?service=git-upload-pack", "/acme/remote-kit.git/info/refs?service=git-upload-pack"]);
+  assert.deepEqual([(await view()).foundUpdateCount, (await view()).checkedAt], [0, now]);
+  assert.ok(!github.requests.some((url) => url.includes("acme/other.git")), "a marketplace with nothing installed isn’t checked");
+  assert.equal((await plugin("kit@kits")).installed!.updateFound, null);
+
+  // Both repositories move: the next day's check marks both plugins and changes nothing else.
+  const commit2 = github.push("acme/kits", kits("TIP TWO."));
+  const remote2 = github.push("acme/remote-kit", remote("FAR TWO."));
+  now += DAY + 60_000;
+  await box.checkPluginUpdates();
+  const kit = (await plugin("kit@kits")).installed!;
+  assert.deepEqual([kit.updateAvailable, kit.updateFound?.commit, kit.updateFound?.serversChanged, kit.updateFound?.checkedAt, kit.commit], [false, commit2, false, now, commit1]);
+  const far = (await plugin("remote@kits")).installed!;
+  assert.deepEqual([far.updateFound?.commit, far.commit], [remote2, remote1]);
+  assert.deepEqual([(await view()).foundUpdateCount, (await view()).updateCount, (await view()).commit], [2, 0, commit1], "the index stays as the last refresh read it");
+  assert.equal(await tip(), "TIP ONE.", "nothing was installed");
+  assert.ok(!readdirSync(join(dataDir, "marketplaces")).some((name) => name.startsWith(".check")), "its scratch folder is gone");
+
+  // Within the day there's no new look. Refresh reads the updates, which are reviewed and applied as before.
+  before = github.requests.length;
+  now += 3600_000;
+  await box.checkPluginUpdates();
+  assert.equal(github.requests.length, before);
+  await api("refreshMarketplace", { id: "kits" });
+  const read = (await plugin("kit@kits")).installed!;
+  assert.deepEqual([read.updateAvailable, read.updateFound, (await view()).foundUpdateCount, (await view()).updateCount], [true, null, 0, 2]);
+  await api("applyPluginInstall", { pluginId: "kit@kits", values: {}, update: true });
+  assert.equal(await tip(), "TIP TWO.");
+});
+
+test("box startup: a plugins.json it can't read whole costs no plugin its files, and plugins' data is never cleaned up", async () => {
+  const github = await fakeGithub();
+  github.push("acme/market", marketplaceFiles({ description: "Acme’s plugins.", echoServer: ECHO_SERVER, echoArgs: ["--greeting", "${user_config.greeting}"] }));
+  const dataDir = tempDir();
+  let box = await bootBox(dataDir, github.base);
+  const { api } = client(() => box);
+  await api("addMarketplace", { source: "acme/market" });
+  const entry = async (id: string) => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === id)!;
+  const { serverId } = await api<McpState & { serverId: string }>("connectCatalogApp", { entryId: "echo@acme-tools", values: { greeting: "Hi there" }, approvalKey: (await entry("echo@acme-tools")).plugin!.approvalKey });
+  await api("connectCatalogApp", { entryId: "notes@acme-tools", approvalKey: (await entry("notes@acme-tools")).plugin!.approvalKey });
+  const server = () => api<McpState>("readAppsState", {}).then((state) => state.servers.find((candidate) => candidate.id === serverId));
+  await until(async () => (await server())?.status === "connected");
+  const echoRoot = join(dataDir, "plugins", "acme-tools", "echo");
+  const notesRoot = join(dataDir, "plugins", "acme-tools", "notes");
+  const echoData = join(dataDir, "plugin-data", "acme-tools", "echo");
+  const notesData = join(dataDir, "plugin-data", "acme-tools", "notes");
+  mkdirSync(notesData, { recursive: true });
+  writeFileSync(join(notesData, "kept.txt"), "the user’s");
+  const pluginsJson = join(dataDir, "plugins.json");
+  const saved = readFileSync(pluginsJson, "utf8");
+  const reboot = async (plugins: string | null) => {
+    box.close();
+    if (plugins == null) rmSync(pluginsJson);
+    else writeFileSync(pluginsJson, plugins);
+    box = await bootBox(dataDir, github.base);
+  };
+  const everything = () => [echoRoot, notesRoot, echoData, join(notesData, "kept.txt")].every((path) => existsSync(path));
+
+  // Unreadable, missing, or with an entry that doesn't check out: nothing is taken for a leftover, and the server mcp.json names still runs.
+  await reboot("{ not json");
+  assert.ok(everything(), "an unreadable plugins.json deletes nothing");
+  await until(async () => (await server())?.status === "connected");
+  await reboot(null);
+  assert.ok(everything(), "a missing plugins.json deletes nothing");
+  const parsed = JSON.parse(saved) as { plugins: Array<Record<string, unknown>> };
+  await reboot(JSON.stringify({ ...parsed, plugins: parsed.plugins.map((plugin) => (plugin.name === "notes" ? { ...plugin, commit: "../escape" } : plugin)) }));
+  assert.ok(everything(), "an entry that fails its checks keeps its files, and the others theirs");
+
+  // Read whole again: the plugins are back as they were.
+  await reboot(saved);
+  assert.deepEqual((await api<EffectivePlugin[]>("listInstalledPlugins", {})).map((plugin) => plugin.pluginId), ["echo@acme-tools", "notes@acme-tools"]);
+
+  // Whole, it cleans up: an old commit no server points at goes, one an MCP server still runs from (an update cut short) stays,
+  // and a plugin it doesn't list loses its files but never its data.
+  const current = readdirSync(echoRoot)[0];
+  const stale = join(echoRoot, "aaaaaaaaaaaa");
+  const running = join(echoRoot, "bbbbbbbbbbbb");
+  for (const folder of [stale, running]) mkdirSync(folder, { recursive: true });
+  box.close();
+  const mcp = JSON.parse(readFileSync(join(dataDir, "mcp.json"), "utf8")) as { servers: Array<{ id: string; args: string[] }> };
+  for (const config of mcp.servers) if (config.id === serverId) config.args = config.args.map((arg) => arg.replace(join(echoRoot, current), running));
+  writeFileSync(join(dataDir, "mcp.json"), JSON.stringify(mcp));
+  await reboot(JSON.stringify({ ...parsed, plugins: parsed.plugins.filter((plugin) => plugin.name !== "notes") }));
+  assert.deepEqual([existsSync(join(echoRoot, current)), existsSync(stale), existsSync(running)], [true, false, true]);
+  assert.deepEqual([existsSync(notesRoot), existsSync(join(notesData, "kept.txt")), existsSync(echoData)], [false, true, true]);
+});
+
+test("box gateway: /<plugin>:<skill> runs the plugin's skill exactly, and an agent's own skill can't take a plugin's command, even one turned off", async () => {
+  const github = await fakeGithub();
+  github.push("acme/market", marketplaceFiles({ description: "Acme’s plugins.", echoServer: ECHO_SERVER, echoArgs: ["--greeting", "${user_config.greeting}"] }));
+  const box = await bootBox(tempDir(), github.base);
+  const { api, refused } = client(() => box);
+  const { agent } = await api<{ agent: AgentSummary }>("addAgent", { name: "Clasher", description: "" });
+  const spec = (name: string, body = "OWN STEPS.") => ({ name, description: `Use for ${name}.`, body, trigger: null });
+  // Made before the plugin came, this one shares the command its skill will have.
+  await api("addAgentSkill", { id: agent.id, spec: spec("notes triage") });
+  await api("addMarketplace", { source: "acme/market" });
+  const notes = (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === "notes@acme-tools")!;
+  await api("connectCatalogApp", { entryId: "notes@acme-tools", approvalKey: notes.plugin!.approvalKey });
+
+  // Turned off, its skills' commands are still the plugin's: a new skill can't take one, nor a renamed one.
+  await api("setMcpPluginEnabled", { pluginId: "notes@acme-tools", enabled: false });
+  await refused("addAgentSkill", { id: agent.id, spec: spec("notes summarize") }, 400, /installed plugin notes has a skill named “notes:summarize”/);
+  await api("addAgentSkill", { id: agent.id, spec: spec("weekly notes") });
+  let skills = await api<Skill[]>("listAgentSkills", { id: agent.id });
+  const weekly = skills.find((skill) => skill.name === "weekly notes")!;
+  await refused("editAgentSkill", { id: agent.id, skillId: weekly.id, spec: spec("Notes: Summarize") }, 400, /installed plugin notes/);
+  // The one made first keeps its name while it's edited.
+  const older = skills.find((skill) => skill.name === "notes triage")!;
+  await api("editAgentSkill", { id: agent.id, skillId: older.id, spec: spec("notes triage", "OWN STEPS, EDITED.") });
+  await api("setMcpPluginEnabled", { pluginId: "notes@acme-tools", enabled: true });
+
+  // With a colon it's the plugin's skill; with a dash, the agent's own skill wins the command they share.
+  skills = await api<Skill[]>("listAgentSkills", { id: agent.id });
+  const plugin = skills.find((skill) => skill.name === "notes:triage")!;
+  assert.equal(skillForPrompt("/notes:triage now", skills)?.id, plugin.id);
+  assert.equal(skillForPrompt("/notes-triage now", skills)?.id, older.id);
+  await api("deliverMessage", { agentId: agent.id, prompt: "/notes:triage", clientNonce: "c1" });
+  const ran = async (nonce: string) => {
+    let found: TranscriptEntry | undefined;
+    await until(async () => (found = (await api<{ entries: TranscriptEntry[] }>("readTranscriptEnd", { id: agent.id, limit: 30 })).entries.find((item) => item.kind === "message" && item.role === "user" && item.clientNonce === nonce)) != null);
+    return found as TranscriptEntry & { skill?: { name: string; body: string }; content: string };
+  };
+  assert.equal((await ran("c1")).skill?.name, "notes:triage");
+  // Run now sends a plugin's skill as Claude Code writes it.
+  await api("runAgentSkillNow", { id: agent.id, skillId: plugin.id });
+  await until(async () => (await api<{ entries: TranscriptEntry[] }>("readTranscriptEnd", { id: agent.id, limit: 30 })).entries.some((item) => item.kind === "message" && item.role === "user" && item.content === "/notes:triage" && item.clientNonce == null));
+  // Both runs answered before the box closes.
+  await until(async () => (await api<{ entries: TranscriptEntry[] }>("readTranscriptEnd", { id: agent.id, limit: 30 })).entries.filter((item) => item.kind === "message" && item.role === "assistant" && !item.isStreaming).length >= 2);
+  await until(async () => !(await api<AgentSummary[]>("rosterAgents", {})).some((row) => row.id === agent.id && row.isRunning));
 });

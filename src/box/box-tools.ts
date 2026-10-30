@@ -1,19 +1,22 @@
 // Tools that run inside the box host itself (no access to the user's
 // computer): the agent's todo list, questions to the user, web fetches,
-// automations, skills, memory, visualizations in the chat and the documents it writes. Tools that touch the user's machine live in the local-exec daemon.
+// automations, skills, memory, visualizations in the chat and the documents and canvases it writes. Tools that touch the user's machine live in the local-exec daemon.
 import type { ToolSpec } from "./models";
+import { canvasAddress, canvasIdFromAddress } from "../shared/canvas";
 import { type AgentTodo, type Automation, type ChoiceOption, MAX_MEMORY_TEXT, type VisualizationMessage } from "../shared/model";
-import { documentTitle, MAX_PAGE_SOURCE } from "../shared/pages";
+import { canvasTitle, cleanPageTitle, documentTitle, MAX_PAGE_SOURCE } from "../shared/pages";
 import { clampVisualizationHeight, MAX_VISUALIZATION_HTML } from "../shared/visualization";
 import type { BoxStore, PageRecord } from "./store";
 import { describeCron, isValidCron } from "./cron";
 import { addMemory, editMemory, findMemory, forgetMemory, MemoryError } from "./memory";
-import { createDocument, editDocument, PageError, readDocument } from "./pages";
+import { createDocument, editDocument, PageError, readCanvas, readDocument, writeCanvas } from "./pages";
 import { buildAutomation } from "./scheduler";
 import { findSkill } from "./skills";
 
 export interface BoxToolContext {
   agentId: string;
+  /** The session the call came from ("" is the agent's main one): its todos are its own. */
+  sessionId: string;
   store: BoxStore;
   signal: AbortSignal;
   emitTodos(todos: AgentTodo[]): void;
@@ -22,7 +25,7 @@ export interface BoxToolContext {
   askUser(prompt: string, options: ChoiceOption[], allowCustom: boolean): Promise<string>;
   /** Posts a visualization card in the conversation. */
   showVisualization(visual: VisualizationMessage): void;
-  /** A document the agent wrote: its card is posted (or updated in place) and clients hear of the change. */
+  /** A document or canvas the agent wrote: its card is posted (or updated in place) and clients hear of the change. */
   pageChanged(record: PageRecord, source: string, change: "created" | "edited"): void;
 }
 
@@ -83,6 +86,22 @@ const pageTitle = (args: Record<string, any>, context: { agentId: string; store:
 
 const documentId = { type: "string", description: "The document's id, as create_document returned it (doc-…)." };
 
+const canvasFailure = (error: unknown): BoxToolResult => {
+  if (!(error instanceof PageError)) throw error;
+  return { output: error.code === "missing" ? `${error.message} Use a canvas_id that write_canvas returned in this conversation, or leave it out to write a new canvas.` : error.message, isError: true };
+};
+
+/** The canvas a read_canvas call names: by its id, or by the address write_canvas gave. */
+const canvasArg = (args: Record<string, any>, agentId: string): string | null => {
+  if (typeof args.canvas_id === "string" && args.canvas_id.length > 0) return args.canvas_id;
+  const named = typeof args.url === "string" ? canvasIdFromAddress(args.url) : null;
+  return named != null && named.storeId === agentId ? named.canvasId : null;
+};
+
+/** write_canvas's and read_canvas's result, with the canvas's revision. */
+const canvasResult = (agentId: string, record: PageRecord) =>
+  JSON.stringify({ canvas_id: record.id, title: record.title, url: canvasAddress(agentId, record.id), revision: record.revisions[record.revisions.length - 1].n });
+
 export const BOX_TOOLS: Record<string, BoxTool> = {
   todo_write: {
     spec: tool(
@@ -116,7 +135,7 @@ export const BOX_TOOLS: Record<string, BoxTool> = {
         status: TODO_STATUSES.includes(item.status) ? item.status : "pending",
         updatedAt: now,
       }));
-      context.store.setTodos(context.agentId, todos);
+      context.store.setTodos(context.agentId, todos, context.sessionId);
       context.emitTodos(todos);
       const done = todos.filter((todo) => todo.status === "completed").length;
       return { output: `Todo list saved: ${done}/${todos.length} completed.` };
@@ -249,6 +268,77 @@ export const BOX_TOOLS: Record<string, BoxTool> = {
         return { output: `Saved “${record.title}” as revision ${revision}. Its card in the chat shows the change.` };
       } catch (error) {
         return pageFailure(error);
+      }
+    },
+  },
+
+  write_canvas: {
+    spec: tool(
+      "write_canvas",
+      `Write a canvas for the user: an interactive page they open beside the chat and use there, such as a tool, a calculator, a game, a dashboard or a form that works something out. contents is one self-contained HTML document (or just what goes in <body>) with inline <style> and <script>; nothing compiles or bundles it. It runs sandboxed: nothing loads from the network (no fetch, no external scripts, stylesheets, fonts or images; use inline SVG, <canvas> or data: URIs), it can't reach the app or keep anything between openings (no storage or cookies), and a link opens in the browser only when the user clicks it. It fills the page stage beside the chat: lay it out to the frame's width and height. Use the theme's colors so it reads in light and dark mode: CSS variables --viz-text, --viz-muted, --viz-border, --viz-surface, --viz-accent and --viz-series-1 to --viz-series-6, also in window.WispViz.tokens and window.WispViz.series. A card for it appears in the chat. To change it, call write_canvas again with its canvas_id and the whole new contents: each write is a revision the user can look back at and restore. Once the user has restored one, read the canvas with read_canvas and send base_revision with your next write. At most ${Math.round(MAX_PAGE_SOURCE / 1024)} KB. For a chart that belongs in the conversation use show_visualization, and for text the user will edit create_document.`,
+      {
+        type: "object",
+        properties: {
+          contents: { type: "string", description: "The canvas's HTML, whole: a write replaces what it showed." },
+          canvas_id: { type: "string", description: "The canvas to replace, as write_canvas returned it (canvas-…); leave it out for a new canvas." },
+          title: { type: "string", description: "Its title. A new canvas without one takes its <title> (or first <h1>); an existing one keeps its own unless you give another." },
+          base_revision: { type: "integer", description: "The revision your HTML replaces, as read_canvas or your last write gave it. Needed once the user has restored an older revision (the write is refused otherwise, so their restore isn't undone); a stale one is refused." },
+        },
+        required: ["contents"],
+      },
+    ),
+    summary: (args, context) => {
+      const existing = typeof args.canvas_id === "string" ? context.store.getPage(context.agentId, args.canvas_id) : undefined;
+      const given = cleanPageTitle(String(args.title ?? ""));
+      const title = given.length > 0 ? given : (existing?.title ?? (typeof args.contents === "string" ? canvasTitle(args.contents) : null) ?? "a canvas");
+      return `${existing != null ? "Updated" : "Made"} ${quote(title)}`;
+    },
+    async run(args, context) {
+      const contents = typeof args.contents === "string" ? args.contents : "";
+      const canvasId = typeof args.canvas_id === "string" && args.canvas_id.length > 0 ? args.canvas_id : undefined;
+      try {
+        const baseRevision = Number.isInteger(args.base_revision) ? (args.base_revision as number) : undefined;
+        const { record, source, created, changed } = writeCanvas(context.store, context.agentId, { contents, canvasId, title: typeof args.title === "string" ? args.title : undefined, baseRevision });
+        const revision = record.revisions[record.revisions.length - 1].n;
+        if (!changed) return { output: `${canvasResult(context.agentId, record)}\n“${record.title}” already shows that (revision ${revision}).` };
+        context.pageChanged(record, source, created ? "created" : "edited");
+        return {
+          output: created
+            ? `${canvasResult(context.agentId, record)}\nMade “${record.title}” as canvas ${record.id} (revision 1). The user sees its card below this step and opens it beside the chat; don't repeat its contents in your reply. To change it, call write_canvas with this canvas_id and the whole new contents.`
+            : `${canvasResult(context.agentId, record)}\nSaved “${record.title}” as revision ${revision}. Its card in the chat shows the change, and the stage shows it to the user if they have it open.`,
+        };
+      } catch (error) {
+        return canvasFailure(error);
+      }
+    },
+  },
+
+  read_canvas: {
+    spec: tool(
+      "read_canvas",
+      "Read one of your canvases as it is now: its HTML, title, address and revision. The user can restore an older revision of a canvas: read it before you write it again if they may have (a message that starts with [I changed … since my last message] says which pages they changed).",
+      {
+        type: "object",
+        properties: {
+          canvas_id: { type: "string", description: "The canvas's id, as write_canvas returned it (canvas-…)." },
+          url: { type: "string", description: "Or its address, as write_canvas returned it (wisp-canvas://…)." },
+        },
+      },
+    ),
+    summary: (args, context) => {
+      const id = canvasArg(args, context.agentId);
+      const record = id != null ? context.store.getPage(context.agentId, id) : undefined;
+      return `Read ${record != null ? quote(record.title) : "a canvas"}`;
+    },
+    async run(args, context) {
+      const id = canvasArg(args, context.agentId);
+      if (id == null) return { output: "Name the canvas: its canvas_id, or the url write_canvas returned.", isError: true };
+      try {
+        const { record, source, revision } = readCanvas(context.store, context.agentId, id);
+        const by = record.revisions[record.revisions.length - 1].by === "user" ? "the user" : "you";
+        return { output: `${canvasResult(context.agentId, record)}\n“${record.title}”, revision ${revision}, last changed by ${by}:\n\n${source}` };
+      } catch (error) {
+        return canvasFailure(error);
       }
     },
   },

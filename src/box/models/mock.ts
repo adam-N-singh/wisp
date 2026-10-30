@@ -6,7 +6,24 @@
 //   "/echo <text>"              -> streams the text back as its reply, word by word
 //                                  (Markdown, math and diagrams to look at in the app)
 //   anything else               -> streams an acknowledgement word by word
+// In a group chat (src/box/rooms.ts) the message is the room's new messages, one per line after
+// its author: the mock takes the person's newest line, without its @mentions, as what was said to
+// it ("/tool" and the others work there too) and answers as "<its name> here. …"; with no line from
+// the person, it passes.
 import type { ModelRequest, ResolvedModel, StreamEvent } from "./types";
+
+/** In a group chat's turn: the mock's own name, and what the person said last (null when only bots spoke). */
+function roomTurn(prompt: string, system: string): { name: string; said: string | null } | null {
+  const room = /^\[Group chat [^\n]*\]\n([\s\S]*)$/.exec(prompt);
+  if (room == null) return null;
+  const name = /^You are (.+?), an AI agent/m.exec(system)?.[1] ?? "Mock";
+  const line = room[1]
+    .split("\n")
+    .filter((text) => text.startsWith("User: ") || text.startsWith("User ("))
+    .pop();
+  const said = line?.replace(/^User[^:]*: /, "").replace(/@(?:everyone|[^\s@]+)\s*/gi, "").trim() ?? null;
+  return { name, said };
+}
 
 export async function* streamMock(request: ModelRequest, model?: Extract<ResolvedModel, { kind: "mock" }>): AsyncGenerator<StreamEvent> {
   const last = request.items[request.items.length - 1];
@@ -19,10 +36,17 @@ export async function* streamMock(request: ModelRequest, model?: Extract<Resolve
   const lastUser = [...request.items].reverse().find((item) => item.kind === "user");
   const text = lastUser?.kind === "user" ? lastUser.parts.filter((part) => part.type === "text").map((part) => (part.type === "text" ? part.text : "")).join("\n") : "";
   // User messages start with a "[Sent …]" line, and a note on the pages the user changed after it; the command is what follows.
-  const prompt = text
+  const message = text
     .replace(/^\[Sent [^\]]*\]\n?/, "")
     .replace(/^\[I changed (this page|these pages) since my last message: [^\n]*\]\n?/, "")
     .trim();
+  const room = roomTurn(message, request.system);
+  if (room != null && (room.said == null || room.said.length === 0)) {
+    yield { type: "text", delta: "[pass]" };
+    yield { type: "done", finishReason: "stop" };
+    return;
+  }
+  const prompt = room?.said ?? message;
   const toolMatch = /^\/tool\s+([a-z0-9_-]+)\s*(\{[\s\S]*\})?\s*$/i.exec(prompt);
   if (toolMatch != null && request.tools.some((tool) => tool.function.name === toolMatch[1])) {
     yield { type: "reasoning", delta: `The user asked me to run ${toolMatch[1]}.` };
@@ -44,6 +68,11 @@ export async function* streamMock(request: ModelRequest, model?: Extract<Resolve
   const echoMatch = /^\/echo\s+([\s\S]+)$/.exec(prompt);
   if (echoMatch != null) {
     yield* streamWords(echoMatch[1], request.signal);
+    yield { type: "done", finishReason: "stop" };
+    return;
+  }
+  if (room != null) {
+    yield* streamWords(`${room.name} here. You said: "${prompt}".`, request.signal);
     yield { type: "done", finishReason: "stop" };
     return;
   }

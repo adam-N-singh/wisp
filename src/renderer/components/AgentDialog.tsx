@@ -234,7 +234,11 @@ export function DeleteAgentDialog({ agentId }: { agentId: string }) {
   const [busy, setBusy] = useState(false);
   return (
     <Modal title={`Delete ${agent?.name ?? "agent"}?`} onClose={closeDialog}>
-      <p className="muted">This removes the agent, its conversation, todos and automations. Files in its workspace folder stay on disk.</p>
+      <p className="muted">
+        {agent?.isGroup === true
+          ? "This removes the group chat and its conversation, and each bot’s conversation for it. The bots stay, with their own chats."
+          : "This removes the agent, its conversation, todos and automations. Files in its workspace folder stay on disk."}
+      </p>
       <div className="modal__actions">
         <button type="button" className="button button--ghost" onClick={closeDialog}>
           Cancel

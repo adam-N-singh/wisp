@@ -2,12 +2,14 @@
 // folder and the offline mock model, then drives the main flows through the UI.
 // Usage: node test/e2e/run.mjs   (after `node scripts/build.mjs`)
 import { _electron as electron } from "playwright";
+import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { driveAgentBrowser, startTestSite } from "./agent-browser-step.mjs";
+import { driveVault, startLoginSite } from "./vault-step.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const userData = mkdtempSync(join(tmpdir(), "wisp-e2e-"));
@@ -198,6 +200,116 @@ try {
     await page.getByLabel("Conversation with Wisp").getByText('You said: "What did I change?"', { exact: false }).waitFor({ timeout: 20_000 });
   });
 
+  await step("canvases: an agent's canvas runs on the stage, its button changes the page, a link opens only from a click, and a second write_canvas is revision 2", async () => {
+    // Links the canvas opens are caught here instead of reaching the browser.
+    const caught = await app.evaluate(({ shell }) => {
+      globalThis.__canvasLinks = [];
+      try {
+        shell.openExternal = async (url) => void globalThis.__canvasLinks.push(url);
+      } catch {
+        // read-only: the link checks below are skipped
+      }
+      return String(shell.openExternal).includes("__canvasLinks");
+    });
+    const waitUntil = async (check, what) => {
+      const started = Date.now();
+      while (!(await check())) {
+        if (Date.now() - started > 10_000) throw new Error(`timed out: ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    };
+    const counter = (label) =>
+      `<!doctype html><html><head><title>Counter</title><style>body { padding: 24px; } button { font-size: 18px; }</style></head><body>` +
+      `<h1>Clicks</h1><p id="out">0 clicks so far</p><button id="more">${label}</button> <button id="later">Open later</button> <a href="https://example.com/docs">Docs</a>` +
+      `<script>let n = 0; document.getElementById("more").onclick = () => { n++; document.getElementById("out").textContent = n + " clicks so far"; };` +
+      `document.getElementById("later").onclick = () => setTimeout(() => window.open("https://example.com/later"), 1600);</script></body></html>`;
+    await send(`/tool write_canvas ${JSON.stringify({ contents: counter("Add one") })}`);
+    const card = page.getByRole("button", { name: "Open Counter" });
+    await card.waitFor({ timeout: 20_000 });
+    await card.getByText("Canvas ·", { exact: false }).waitFor();
+    await card.click();
+    const stage = page.getByRole("region", { name: "Page: Counter" });
+    await stage.getByText("Canvas · Revision 1 · Made by Wisp", { exact: false }).waitFor({ timeout: 10_000 });
+    const frame = page.frameLocator('iframe[title="Counter"]');
+    await frame.getByRole("button", { name: "Add one" }).click({ timeout: 10_000 });
+    await frame.getByRole("button", { name: "Add one" }).click();
+    await frame.getByText("2 clicks so far").waitFor({ timeout: 5_000 });
+    assert.equal(await page.locator('iframe[title="Counter"]').getAttribute("sandbox"), "allow-scripts allow-pointer-lock");
+    await page.screenshot({ path: join(shots, "05e-canvas-stage.png") });
+    if (caught) {
+      // A click on a link opens it; a window.open long after the click doesn't.
+      await frame.getByRole("link", { name: "Docs" }).click();
+      await waitUntil(async () => (await app.evaluate(() => globalThis.__canvasLinks)).includes("https://example.com/docs"), "the clicked link opened");
+      await frame.getByRole("button", { name: "Open later" }).click();
+      await stage.getByText("The canvas asked to open a link", { exact: false }).waitFor({ timeout: 10_000 });
+      assert.deepEqual(await app.evaluate(() => globalThis.__canvasLinks), ["https://example.com/docs"]);
+    } else console.log("       (shell.openExternal is read-only here: the link checks were skipped)");
+
+    // The agent writes it again: revision 2 shows on the stage at once.
+    const conversation = await page.getByLabel("Conversation with Wisp").innerText();
+    const canvasId = /"canvas_id":\s*"(canvas-[0-9a-f]+)"/.exec(conversation)?.[1];
+    if (canvasId == null) throw new Error("write_canvas's result names no canvas_id");
+    await send(`/tool write_canvas ${JSON.stringify({ canvas_id: canvasId, contents: counter("Add two") })}`);
+    await stage.getByText("Canvas · Revision 2 · Made by Wisp", { exact: false }).waitFor({ timeout: 20_000 });
+    await frame.getByRole("button", { name: "Add two" }).waitFor({ timeout: 10_000 });
+    await page.getByRole("button", { name: "Open Counter" }).getByText("revision 2", { exact: false }).waitFor();
+    // History: back to revision 1 and restore it, as the user's revision 3.
+    await stage.getByRole("button", { name: "History" }).click();
+    await page.getByRole("menuitem", { name: /^Revision 1/ }).click();
+    await stage.getByText("You’re looking at revision 1", { exact: false }).waitFor();
+    await frame.getByRole("button", { name: "Add one" }).waitFor({ timeout: 10_000 });
+    await stage.getByRole("button", { name: "Restore this revision" }).click();
+    await stage.getByText("Canvas · Revision 3 · Restored by you", { exact: false }).waitFor({ timeout: 10_000 });
+    await frame.getByRole("button", { name: "Add one" }).waitFor({ timeout: 10_000 });
+    await stage.getByRole("button", { name: "Close the page" }).click();
+    await stage.waitFor({ state: "hidden" });
+    // Ctrl+K finds canvases too.
+    const palette = page.getByRole("dialog", { name: "Jump to" });
+    await page.keyboard.press("Control+k");
+    await palette.getByRole("combobox", { name: "Jump to" }).fill("counter");
+    await palette.getByRole("group", { name: "Pages" }).getByRole("option", { name: /^Counter/ }).click();
+    await stage.getByText("Canvas · Revision 3", { exact: false }).waitFor({ timeout: 10_000 });
+    await stage.getByRole("button", { name: "Close the page" }).click();
+    await stage.waitFor({ state: "hidden" });
+  });
+
+  await step("canvases: no app bridge or WebRTC in a canvas or its srcdoc child, a javascript: child stays blocked, and the window keeps its sandbox", async () => {
+    // The main window: still sandboxed and isolated; the preload runs in every frame, only to lock the others down.
+    const prefs = await app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find((candidate) => candidate.webContents.getURL().includes("/renderer/index.html"));
+      const web = window?.webContents.getLastWebPreferences();
+      return { sandbox: web?.sandbox, contextIsolation: web?.contextIsolation, nodeIntegration: web?.nodeIntegration, nodeIntegrationInSubFrames: web?.nodeIntegrationInSubFrames, webrtc: window?.webContents.getWebRTCIPHandlingPolicy() };
+    });
+    assert.deepEqual(prefs, { sandbox: true, contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, webrtc: "disable_non_proxied_udp" });
+    const contents = String.raw`<!doctype html><title>Isolation</title>
+<p id="top">waiting</p><p id="child">waiting</p><p id="js">waiting</p>
+<script>
+function seen(where) { return where + ": desktop " + typeof window.desktop + ", RTCPeerConnection " + typeof window.RTCPeerConnection + ", webkitRTCPeerConnection " + typeof window.webkitRTCPeerConnection; }
+document.getElementById("top").textContent = seen("top");
+addEventListener("message", function (event) { if (event.data && event.data.k) document.getElementById(event.data.k).textContent = event.data.v; });
+var child = document.createElement("iframe");
+child.srcdoc = "<script>parent.postMessage({ k: 'child', v: 'child: desktop ' + typeof window.desktop + ', RTCPeerConnection ' + typeof window.RTCPeerConnection + ', webkitRTCPeerConnection ' + typeof window.webkitRTCPeerConnection }, '*')<\/script>";
+document.body.appendChild(child);
+var js = document.createElement("iframe");
+js.src = "javascript:'<script>parent.postMessage({ k: \"js\", v: \"javascript child ran, RTCPeerConnection \" + typeof window.RTCPeerConnection }, \"*\")<\/script>'";
+document.body.appendChild(js);
+setTimeout(function () { if (document.getElementById("js").textContent === "waiting") document.getElementById("js").textContent = "javascript child blocked"; }, 2000);
+</script>`;
+    await send(`/tool write_canvas ${JSON.stringify({ contents })}`);
+    const card = page.getByRole("button", { name: "Open Isolation" });
+    await card.waitFor({ timeout: 20_000 });
+    await card.click();
+    const stage = page.getByRole("region", { name: "Page: Isolation" });
+    const frame = page.frameLocator('iframe[title="Isolation"]');
+    await frame.getByText("top: desktop undefined, RTCPeerConnection undefined, webkitRTCPeerConnection undefined").waitFor({ timeout: 10_000 });
+    await frame.getByText("child: desktop undefined, RTCPeerConnection undefined, webkitRTCPeerConnection undefined").waitFor({ timeout: 10_000 });
+    await frame.getByText("javascript child blocked").waitFor({ timeout: 10_000 });
+    // The app's own page still has its bridge.
+    assert.equal(await page.evaluate(() => typeof window.desktop), "object");
+    await stage.getByRole("button", { name: "Close the page" }).click();
+    await stage.waitFor({ state: "hidden" });
+  });
+
   await step("background command: approved, shown in Async tasks with its output and stopped there; one that ends wakes the agent", async () => {
     const powershell = process.platform === "win32";
     const conversation = page.getByLabel("Conversation with Wisp");
@@ -254,6 +366,15 @@ try {
     }
   });
 
+  await step("vault: a login saved in Settings (and a Chrome export imported) is refused on another site, and fills on its own after Allow once on this PC; the page gets it, the agent and the transcript never see it", async () => {
+    const site = await startLoginSite();
+    try {
+      await driveVault({ app, page, send, site, userData, boxDir: join(userData, "box"), conversation: () => page.getByLabel("Conversation with Wisp"), screenshot: (name) => page.screenshot({ path: join(shots, name) }) });
+    } finally {
+      await site.close();
+    }
+  });
+
   await step("info pane shows overview and automations tabs", async () => {
     await page.getByRole("tab", { name: "Automations" }).click();
     await page.getByRole("button", { name: "New automation" }).click();
@@ -267,7 +388,7 @@ try {
 
   await step("settings view renders all sections", async () => {
     await page.getByRole("button", { name: "Settings", exact: true }).click();
-    for (const section of ["Models", "Cloud computer", "Permissions", "MCP servers", "About", "General"]) {
+    for (const section of ["Models", "Cloud computer", "Permissions", "Vault", "MCP servers", "About", "General"]) {
       await page.getByRole("button", { name: section, exact: true }).click();
     }
     await page.getByRole("heading", { name: "General" }).waitFor();
@@ -396,6 +517,70 @@ try {
     const workspaceFile = join(userData, "box", "workspaces", agents[0].id, "notes", "hello.txt");
     if (!existsSync(workspaceFile)) throw new Error("write_file did not create the workspace file");
     if (!existsSync(join(userData, "window-state.json"))) throw new Error("window-state.json missing");
+  });
+
+  await step("group chat: two mock bots both reply, then only the one @mentioned (picked from the @ menu); a member's page opens beside the group", async () => {
+    await page.getByLabel("New agent").click();
+    await page.getByPlaceholder("Research assistant").fill("Scout");
+    await page.getByRole("button", { name: "Create agent" }).click();
+    await page.getByRole("heading", { name: "Scout", level: 1 }).waitFor({ timeout: 20_000 });
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+Shift+N" : "Control+Shift+N");
+    const dialog = page.getByRole("dialog", { name: "New group chat" });
+    await dialog.getByRole("checkbox", { name: /^Wisp/ }).check();
+    await dialog.getByRole("checkbox", { name: /^Scout/ }).check();
+    await dialog.getByRole("button", { name: "Create group chat" }).click();
+    await page.getByRole("heading", { name: "Wisp, Scout", level: 1 }).waitFor({ timeout: 20_000 });
+    const room = page.getByLabel("Conversation with Wisp, Scout");
+    const message = () => page.getByRole("textbox", { name: "Message group" });
+    await room.getByText("Wisp and Scout joined").waitFor({ timeout: 10_000 });
+    if ((await page.locator(".agent-row .avatar-stack").count()) !== 1) throw new Error("the group chat's row has no stacked avatar");
+
+    // No mention: every bot gets a turn, each post under its own name.
+    await message().fill("hello both");
+    await message().press("Enter");
+    await room.getByText('Wisp here. You said: "hello both".').waitFor({ timeout: 20_000 });
+    await room.getByText('Scout here. You said: "hello both".').waitFor({ timeout: 20_000 });
+    if ((await room.locator(".message__author", { hasText: /^Scout$/ }).count()) !== 1) throw new Error("Scout's post doesn't carry its name");
+    await page.locator('[aria-label="Bots are replying"]').waitFor({ state: "detached", timeout: 20_000 });
+
+    // "@Sc" offers Scout (and not Wisp); Enter puts the mention in.
+    await message().fill("@Sc");
+    const menu = page.getByRole("listbox", { name: "Mention" });
+    await menu.getByRole("option", { name: /Scout/ }).waitFor({ timeout: 5_000 });
+    if ((await menu.getByRole("option", { name: /Wisp/ }).count()) !== 0) throw new Error("the @ menu offered Wisp for “@Sc”");
+    await message().press("Enter");
+    if ((await message().inputValue()) !== "@Scout ") throw new Error(`the @ menu wrote “${await message().inputValue()}”`);
+    await page.keyboard.type("only you");
+    await message().press("Enter");
+    await room.getByText('Scout here. You said: "only you".').waitFor({ timeout: 20_000 });
+    await page.locator('[aria-label="Bots are replying"]').waitFor({ state: "detached", timeout: 20_000 });
+    if ((await room.getByText('Wisp here. You said: "only you"').count()) !== 0) throw new Error("Wisp replied though only Scout was mentioned");
+
+    // The details pane lists the members; each bot answered in its own room session, and its own chat is untouched.
+    if (!(await page.getByRole("complementary", { name: "Group chat details" }).isVisible())) await page.getByRole("button", { name: "Toggle details" }).click();
+    const members = page.getByRole("region", { name: "Members" });
+    await members.getByText("Wisp", { exact: true }).waitFor({ timeout: 5_000 });
+    await members.getByText("Scout", { exact: true }).waitFor({ timeout: 5_000 });
+    await page.screenshot({ path: join(shots, "11-group-chat.png") });
+    const rows = JSON.parse(readFileSync(join(userData, "box", "agents.json"), "utf8")).agents;
+    const group = rows.find((row) => row.isGroup);
+    const scout = rows.find((row) => row.name === "Scout");
+    if (group == null || scout == null) throw new Error("the group chat isn't in the box roster");
+    if (!existsSync(join(userData, "box", "sessions", scout.id, `group~${group.id}.jsonl`))) throw new Error("Scout's room session isn't on disk");
+    if (existsSync(join(userData, "box", "transcripts", `${scout.id}.jsonl`))) throw new Error("Scout's own chat got the room's messages");
+
+    // A document Scout writes in the group shows its card there, which opens Scout's page beside the group's chat.
+    await message().fill('@Scout /tool create_document {"title":"Room plan","markdown":"# Room plan\\n\\nWritten in the group."}');
+    await message().press("Enter");
+    const pageCard = room.getByRole("button", { name: "Open Room plan" });
+    await pageCard.waitFor({ timeout: 20_000 });
+    await page.locator('[aria-label="Bots are replying"]').waitFor({ state: "detached", timeout: 20_000 });
+    await pageCard.click();
+    await page.getByText(/Written by Scout/).waitFor({ timeout: 10_000 });
+    await page.getByRole("heading", { name: "Wisp, Scout", level: 1 }).waitFor({ timeout: 5_000 });
+    await page.screenshot({ path: join(shots, "11b-group-chat-page.png") });
+    await page.keyboard.press("Escape");
+    await page.getByText(/Written by Scout/).waitFor({ state: "detached", timeout: 10_000 });
   });
 } catch {
   if (page != null) await page.screenshot({ path: join(shots, "failure.png") }).catch(() => undefined);

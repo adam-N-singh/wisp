@@ -51,14 +51,19 @@ export function createMainWindow(options: { userDataDir: string; distDir: string
     ...(process.platform === "darwin" ? { trafficLightPosition: { x: 14, y: 13 } } : { titleBarOverlay: overlayColors(options.dark) }),
     icon: join(options.distDir, "assets", "app-icon.png"),
     webPreferences: {
-      preload: join(options.distDir, "preload", "preload.cjs"),
+      preload: join(options.distDir, "preload", "main-window.cjs"),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // The preload runs in every frame: in agents' visualizations and canvases, and frames they make,
+      // it only takes WebRTC out (src/preload/main-window.ts). Sandboxed, so still no Node anywhere.
+      nodeIntegrationInSubFrames: true,
       spellcheck: options.spellCheck,
       backgroundThrottling: false,
     },
   });
+  // Defense in depth for frames the preload doesn't reach: WebRTC sends no UDP outside a proxy.
+  window.webContents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
   if (saved?.isMaximized) window.maximize();
 
   window.once("ready-to-show", () => window.show());
@@ -83,9 +88,18 @@ export function createMainWindow(options: { userDataDir: string; distDir: string
   window.webContents.on("will-navigate", (event, url) => {
     if (!url.startsWith(pathToFileURL(join(options.distDir, "renderer")).href)) event.preventDefault();
   });
-  // Frames in the page (agents' visualizations) stay on their own scheme.
+  // Frames in the page (agents' visualizations and canvases) stay on their own scheme. A canvas loads
+  // into a new, blank frame (the stage makes one per revision and theme), so it can't navigate itself.
   window.webContents.on("will-frame-navigate", (event) => {
-    if (!event.isMainFrame && !event.url.startsWith("wisp-visualization://")) event.preventDefault();
+    if (event.isMainFrame || event.url.startsWith("wisp-visualization://")) return;
+    let from = "";
+    try {
+      from = event.frame?.url ?? "";
+    } catch {
+      // a frame being torn down
+    }
+    if (event.url.startsWith("wisp-canvas://") && (from === "" || from === "about:blank")) return;
+    event.preventDefault();
   });
 
   void window.loadFile(join(options.distDir, "renderer", "index.html"));

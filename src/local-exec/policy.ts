@@ -33,6 +33,12 @@ export const LOCAL_PERMISSIONS: LocalToolInfo[] = [
     description: "Click, type and press keys in the agent browser. Typing, form submits and clicks that look like purchases, posts or sends ask once per site; password and payment fields always ask.",
     defaultPermission: "guarded",
   },
+  {
+    id: "vault",
+    label: "Fill from the vault",
+    description: "List the vault (labels only) and fill saved logins and contact info into the agent browser. Every fill asks, for that item on that site; Blocked turns fills off.",
+    defaultPermission: "guarded",
+  },
 ];
 
 export interface PolicyInput {

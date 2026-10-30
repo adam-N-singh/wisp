@@ -38,7 +38,8 @@ const nodeTarget = { platform: "node", format: "cjs", target: "node22", bundle: 
 
 const entries = [
   { in: "src/main/main.ts", out: "dist/main/main.cjs", external: ["electron"], shim: true },
-  { in: "src/preload/preload.ts", out: "dist/preload/preload.cjs", external: ["electron"], shim: false },
+  // The main window's: preload.ts in its own page, the WebRTC lockdown in every other frame.
+  { in: "src/preload/main-window.ts", out: "dist/preload/main-window.cjs", external: ["electron"], shim: false },
   { in: "src/preload/panel-preload.ts", out: "dist/preload/panel-preload.cjs", external: ["electron"], shim: false },
   { in: "src/preload/overlay-preload.ts", out: "dist/preload/overlay-preload.cjs", external: ["electron"], shim: false },
   { in: "src/preload/agent-browser-preload.ts", out: "dist/preload/agent-browser-preload.cjs", external: ["electron"], shim: false },

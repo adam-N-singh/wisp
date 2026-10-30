@@ -1,4 +1,6 @@
-// Transcript replicas, one per opened agent. Events are applied only when they
+// Transcript replicas, one per opened conversation: an agent's main session, or another of its
+// sessions, keyed `transcript:<agentId>` and `transcript:<agentId>\0<sessionId>`.
+// An event's session is its stamp's replica key. Events are applied only when they
 // continue the replica: same epoch and sequence === last + 1. Anything else
 // (a gap, a new epoch) triggers a resync from the tail.
 // Sends are optimistic: a local row shows immediately and is dropped once the
@@ -6,9 +8,12 @@
 // too: the entry changes at once, the box's `updated` event replaces it, and a
 // failed call puts it back.
 import type { SendPromptArgs } from "../../shared/edges";
-import type { MessageEntry, MessageFeedback, OrderedStamp, Reaction, TranscriptEntry, TranscriptEvent } from "../../shared/model";
+import { MAIN_SESSION, type MessageEntry, type MessageFeedback, type OrderedStamp, parseReplicaKey, type Reaction, type TranscriptEntry, type TranscriptEvent, transcriptReplicaKey } from "../../shared/model";
 import { gateway } from "../bridge";
 import { Store } from "./store";
+
+/** The session argument a gateway call carries: none for the main session, so its calls stay as they were. */
+const sessionArg = (sessionId: string) => (sessionId === MAIN_SESSION ? {} : { sessionId });
 
 /** The message a reply answers, and what it quotes from it. */
 export interface ReplyTarget {
@@ -32,6 +37,7 @@ export interface PendingSend {
 
 export interface Replica {
   agentId: string;
+  sessionId: string;
   status: "loading" | "ready" | "error";
   error?: string;
   epoch: string | null;
@@ -44,15 +50,17 @@ export interface Replica {
 }
 
 const PAGE = 120;
+/** By replica key. */
 const replicas = new Map<string, Store<Replica>>();
 
-const empty = (agentId: string): Replica => ({ agentId, status: "loading", epoch: null, sequence: 0, entries: [], loadingOlder: false, pending: [], unreadAnchorId: null });
+const empty = (agentId: string, sessionId: string): Replica => ({ agentId, sessionId, status: "loading", epoch: null, sequence: 0, entries: [], loadingOlder: false, pending: [], unreadAnchorId: null });
 
-export function replicaStore(agentId: string): Store<Replica> {
-  let store = replicas.get(agentId);
+export function replicaStore(agentId: string, sessionId: string = MAIN_SESSION): Store<Replica> {
+  const key = transcriptReplicaKey(agentId, sessionId);
+  let store = replicas.get(key);
   if (store == null) {
-    store = new Store(empty(agentId));
-    replicas.set(agentId, store);
+    store = new Store(empty(agentId, sessionId));
+    replicas.set(key, store);
   }
   return store;
 }
@@ -76,38 +84,40 @@ function adopt(store: Store<Replica>, page: { entries: TranscriptEntry[]; nextBe
   }));
 }
 
-export async function openTranscript(agentId: string): Promise<void> {
-  const store = replicaStore(agentId);
+export async function openTranscript(agentId: string, sessionId: string = MAIN_SESSION): Promise<void> {
+  const store = replicaStore(agentId, sessionId);
   if (store.get().status !== "ready") store.set((replica) => ({ ...replica, status: "loading" }));
   try {
-    adopt(store, await gateway.followTranscript({ id: agentId, limit: PAGE }));
+    adopt(store, await gateway.followTranscript({ id: agentId, limit: PAGE, ...sessionArg(sessionId) }));
   } catch (error) {
     store.set((replica) => ({ ...replica, status: "error", error: error instanceof Error ? error.message : String(error) }));
   }
 }
 
-async function resync(agentId: string): Promise<void> {
-  const store = replicaStore(agentId);
+async function resync(agentId: string, sessionId: string): Promise<void> {
+  const store = replicaStore(agentId, sessionId);
   try {
-    adopt(store, await gateway.readTranscriptEnd({ id: agentId, limit: Math.max(PAGE, store.get().entries.length) }));
+    adopt(store, await gateway.readTranscriptEnd({ id: agentId, limit: Math.max(PAGE, store.get().entries.length), ...sessionArg(sessionId) }));
   } catch {
     // a later event or reopen will retry
   }
 }
 
+/** By replica key. */
 const olderLoads = new Map<string, Promise<void>>();
 
 /** Loads the page before the oldest loaded entry; callers during a load share it. */
-export function loadOlder(agentId: string): Promise<void> {
-  const running = olderLoads.get(agentId);
+export function loadOlder(agentId: string, sessionId: string = MAIN_SESSION): Promise<void> {
+  const key = transcriptReplicaKey(agentId, sessionId);
+  const running = olderLoads.get(key);
   if (running != null) return running;
-  const store = replicaStore(agentId);
+  const store = replicaStore(agentId, sessionId);
   const { nextBeforeSeq } = store.get();
   if (nextBeforeSeq == null) return Promise.resolve();
   store.set((replica) => ({ ...replica, loadingOlder: true }));
   const load = (async () => {
     try {
-      const page = await gateway.readTranscriptEnd({ id: agentId, beforeSeq: nextBeforeSeq, limit: PAGE });
+      const page = await gateway.readTranscriptEnd({ id: agentId, beforeSeq: nextBeforeSeq, limit: PAGE, ...sessionArg(sessionId) });
       store.set((replica) => {
         const known = new Set(replica.entries.map((entry) => entry.id));
         return { ...replica, loadingOlder: false, entries: sortBySeq([...page.entries.filter((entry) => !known.has(entry.id)), ...replica.entries]), nextBeforeSeq: page.nextBeforeSeq };
@@ -115,10 +125,10 @@ export function loadOlder(agentId: string): Promise<void> {
     } catch {
       store.set((replica) => ({ ...replica, loadingOlder: false }));
     } finally {
-      olderLoads.delete(agentId);
+      olderLoads.delete(key);
     }
   })();
-  olderLoads.set(agentId, load);
+  olderLoads.set(key, load);
   return load;
 }
 
@@ -126,8 +136,8 @@ export function loadOlder(agentId: string): Promise<void> {
  * Loads older pages, at most 20, until the entry (a search hit, say) is in the replica; false if
  * it still isn't (or no longer exists).
  */
-export async function revealEntry(agentId: string, entryId: string, seq: number): Promise<boolean> {
-  const store = replicaStore(agentId);
+export async function revealEntry(agentId: string, entryId: string, seq: number, sessionId: string = MAIN_SESSION): Promise<boolean> {
+  const store = replicaStore(agentId, sessionId);
   if (store.get().status === "loading") {
     await new Promise<void>((resolve) => {
       const off = store.subscribe(() => {
@@ -141,15 +151,18 @@ export async function revealEntry(agentId: string, entryId: string, seq: number)
     const { entries, nextBeforeSeq } = store.get();
     if (entries.some((entry) => entry.id === entryId)) return true;
     if (nextBeforeSeq == null || (entries.length > 0 && entries[0].seq <= seq)) return false;
-    await loadOlder(agentId);
+    await loadOlder(agentId, sessionId);
     if (store.get().nextBeforeSeq === nextBeforeSeq) return false; // the page didn't load
   }
   return store.get().entries.some((entry) => entry.id === entryId);
 }
 
 export function applyTranscriptEvent(event: TranscriptEvent): void {
-  const agentId = event.type === "snapshot" ? event.activeAgentId : event.agentId;
-  const store = replicas.get(agentId);
+  // The stamp says which replica: the agent's main session, or another of its sessions.
+  const named = parseReplicaKey(event.ordered.replicaKey);
+  const agentId = named?.agentId ?? (event.type === "snapshot" ? event.activeAgentId : event.agentId);
+  const sessionId = named?.sessionId ?? MAIN_SESSION;
+  const store = replicas.get(transcriptReplicaKey(agentId, sessionId));
   if (store == null || store.get().status === "loading") return; // not opened yet; the tail read will include it
   const replica = store.get();
   const stamp = event.ordered;
@@ -163,7 +176,7 @@ export function applyTranscriptEvent(event: TranscriptEvent): void {
     return;
   }
   if (stamp.epoch !== replica.epoch || stamp.sequence > replica.sequence + 1) {
-    void resync(agentId);
+    void resync(agentId, sessionId);
     return;
   }
   if (stamp.sequence <= replica.sequence) return; // already applied
@@ -181,14 +194,14 @@ export function applyTranscriptEvent(event: TranscriptEvent): void {
   store.set({ ...replica, sequence: stamp.sequence, entries, pending });
 }
 
-/** `voiceMemo`: the one attachment is a recording and `content` its transcript. `reply`: the message it answers. */
+/** `voiceMemo`: the one attachment is a recording and `content` its transcript. `reply`: the message it answers. `sessionId`: the conversation, the main one by default. */
 export function deliverMessage(
   agentId: string,
   content: string,
   attachments: Array<{ path: string; name: string }>,
-  { voiceMemo, reply }: { voiceMemo?: SendPromptArgs["voiceMemo"]; reply?: ReplyTarget } = {},
+  { voiceMemo, reply, sessionId = MAIN_SESSION }: { voiceMemo?: SendPromptArgs["voiceMemo"]; reply?: ReplyTarget; sessionId?: string } = {},
 ): void {
-  const store = replicaStore(agentId);
+  const store = replicaStore(agentId, sessionId);
   const clientNonce = crypto.randomUUID();
   const attempt = async () => {
     store.set((replica) => ({ ...replica, pending: replica.pending.map((send) => (send.clientNonce === clientNonce ? { ...send, state: "sending", error: undefined } : send)) }));
@@ -203,6 +216,7 @@ export function deliverMessage(
         sendSource: "chat",
         ...(voiceMemo != null ? { voiceMemo } : {}),
         ...(reply != null ? { replyToId: reply.entryId, replyQuote: reply.quote } : {}),
+        ...sessionArg(sessionId),
       });
     } catch (error) {
       store.set((replica) => ({ ...replica, pending: replica.pending.map((send) => (send.clientNonce === clientNonce ? { ...send, state: "failed", error: error instanceof Error ? error.message : String(error) } : send)) }));
@@ -237,8 +251,8 @@ export function cancelReply(agentId: string): void {
 }
 
 /** Shows a change to an entry before the box confirms it; its `updated` event replaces the entry, and a failed call puts it back. */
-async function optimistic(agentId: string, entryId: string, change: (entry: TranscriptEntry) => TranscriptEntry, call: () => Promise<unknown>): Promise<void> {
-  const store = replicaStore(agentId);
+async function optimistic(agentId: string, sessionId: string, entryId: string, change: (entry: TranscriptEntry) => TranscriptEntry, call: () => Promise<unknown>): Promise<void> {
+  const store = replicaStore(agentId, sessionId);
   const before = store.get().entries.find((entry) => entry.id === entryId);
   if (before == null) return;
   const after = change(before);
@@ -253,9 +267,10 @@ async function optimistic(agentId: string, entryId: string, change: (entry: Tran
 }
 
 /** Adds the user's emoji to the entry, or takes it back if it's already there. */
-export function toggleReaction(agentId: string, entryId: string, emoji: string): Promise<void> {
+export function toggleReaction(agentId: string, entryId: string, emoji: string, sessionId: string = MAIN_SESSION): Promise<void> {
   return optimistic(
     agentId,
+    sessionId,
     entryId,
     (entry) => {
       const reactions: Reaction[] = entry.reactions ?? [];
@@ -263,14 +278,22 @@ export function toggleReaction(agentId: string, entryId: string, emoji: string):
       const next = mine ? reactions.filter((reaction) => !(reaction.emoji === emoji && reaction.by === "user")) : [...reactions, { emoji, by: "user" }];
       return { ...entry, reactions: next.length > 0 ? next : undefined };
     },
-    () => gateway.setReaction({ agentId, entryId, emoji }),
+    () => gateway.setReaction({ agentId, entryId, emoji, ...sessionArg(sessionId) }),
   );
 }
 
 /** Good, Bad, the reasons for Bad, or taking the vote back, as `rateReply` records them. */
-export function voteOnReply(agentId: string, entryId: string, action: "up" | "down" | "submit" | "revert", categories?: MessageFeedback["categories"], comment?: string): Promise<void> {
+export function voteOnReply(
+  agentId: string,
+  entryId: string,
+  action: "up" | "down" | "submit" | "revert",
+  categories?: MessageFeedback["categories"],
+  comment?: string,
+  sessionId: string = MAIN_SESSION,
+): Promise<void> {
   return optimistic(
     agentId,
+    sessionId,
     entryId,
     (entry) => {
       if (entry.kind !== "message") return entry;
@@ -288,12 +311,12 @@ export function voteOnReply(agentId: string, entryId: string, action: "up" | "do
                 : undefined;
       return { ...entry, feedback };
     },
-    () => gateway.rateReply({ agentId, entryId, action, ...(categories != null ? { categories: [...categories] } : {}), ...(comment != null ? { comment } : {}) }),
+    () => gateway.rateReply({ agentId, entryId, action, ...(categories != null ? { categories: [...categories] } : {}), ...(comment != null ? { comment } : {}), ...sessionArg(sessionId) }),
   );
 }
 
-export function discardPending(agentId: string, clientNonce: string): void {
-  replicaStore(agentId).set((replica) => ({ ...replica, pending: replica.pending.filter((send) => send.clientNonce !== clientNonce) }));
+export function discardPending(agentId: string, clientNonce: string, sessionId: string = MAIN_SESSION): void {
+  replicaStore(agentId, sessionId).set((replica) => ({ ...replica, pending: replica.pending.filter((send) => send.clientNonce !== clientNonce) }));
 }
 
 export function lastAssistantText(entries: TranscriptEntry[]): string {
@@ -309,7 +332,10 @@ export function startTranscripts(): void {
     transcript: applyTranscriptEvent,
     "gateway-link": ({ state }) => {
       if (state !== "connected") return;
-      for (const [agentId, store] of replicas) if (store.get().status !== "loading") void resync(agentId);
+      for (const store of replicas.values()) {
+        const { agentId, sessionId, status } = store.get();
+        if (status !== "loading") void resync(agentId, sessionId);
+      }
     },
   });
 }

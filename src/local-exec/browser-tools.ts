@@ -58,7 +58,7 @@ export const BROWSER_TOOLS: Record<BrowserToolName, LocalTool> = {
   browser_snapshot: {
     descriptor: {
       name: "browser_snapshot",
-      description: `Read the page in your agent browser: its text and elements, one per line, with a ref (like [ref=e7]) on each one you can click or type into. Read it before acting and again after the page changes; refs stay the same while the page is open. Pass ref to read one part (a form, main or region) of a long page. Password, payment card and one-time code fields never show their contents. ${UNTRUSTED}`,
+      description: `Read the page in your agent browser: its text and elements, one per line, with a ref (like [ref=e7]) on each one you can click or type into. Read it before acting and again after the page changes; refs stay the same while the page is open. Pass ref to read one part (a form, main or region) of a long page. Password, payment card and one-time code fields, and fields filled from the vault, never show their contents. ${UNTRUSTED}`,
       parameters: object({ ref: { type: "string", description: "Read only this element and what's inside it." } }),
       permissionId: "browser",
       readOnly: true,
@@ -88,7 +88,7 @@ export const BROWSER_TOOLS: Record<BrowserToolName, LocalTool> = {
     descriptor: {
       name: "browser_type",
       description:
-        "Type text into a field in your agent browser by its ref, replacing what's in it; for a dropdown, text is the option to choose. submit presses Enter afterwards. Typing asks the user, once per site. Never type passwords, card numbers or one-time codes: call browser_wait_for_user and let the user sign in.",
+        "Type text into a field in your agent browser by its ref, replacing what's in it; for a dropdown, text is the option to choose. submit presses Enter afterwards. Typing asks the user, once per site. Never type passwords, card numbers or one-time codes: fill a saved login with request_credential (see vault_list), or call browser_wait_for_user and let the user sign in.",
       parameters: object({ ref, text: { type: "string" }, submit: { type: "boolean", description: "Press Enter after typing (submits most forms)." } }, ["ref", "text"]),
       permissionId: "browser.act",
       readOnly: false,

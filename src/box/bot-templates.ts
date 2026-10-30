@@ -274,7 +274,7 @@ export function importTemplate(store: BoxStore, agentId: string, template: BotTe
       const found = skillFromMarkdown(skill.content, skill.name);
       if ("reason" in found) throw new Error(found.reason);
       const spec = { ...found.spec, description: skill.description.trim() || found.spec.description, sourceRef: null, trigger: skill.schedule != null ? { isEnabled: false, schedule: skill.schedule } : null };
-      const added = store.putSkill(buildSkill(agentId, spec, store.listSkills(agentId)), found.extra);
+      const added = store.putSkill(buildSkill(agentId, spec, store.skillNamesInUse(agentId)), found.extra);
       setup.skills.push({ name: added.name, description: added.description, content: skill.content });
     } catch (error) {
       setup.skipped.push({ kind: "skill", name: skill.name, reason: error instanceof Error ? error.message : String(error) });

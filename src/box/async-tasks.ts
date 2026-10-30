@@ -38,7 +38,7 @@ import {
   type ShellState,
 } from "../shared/background-shell";
 import type { ToolResult } from "../shared/gateway-protocol";
-import type { AgentSummary, AsyncTaskInfo, AsyncTaskOutput, CloudComputerStatus, EndedAsyncTask, StopAllAsyncTasksResult } from "../shared/model";
+import { type AgentSummary, type AsyncTaskInfo, type AsyncTaskOutput, type CloudComputerStatus, type EndedAsyncTask, MAIN_SESSION, type StopAllAsyncTasksResult } from "../shared/model";
 import { CLOUD_PID_PLACEHOLDER, CLOUD_TERMINALS, type CloudComputer } from "./cloud-computer";
 import type { CloudShells } from "./cloud-tools";
 import type { BoxStore } from "./store";
@@ -50,6 +50,8 @@ export interface AsyncTaskRecord {
   /** "local:<shell id>" or "cloud:<shell id>"; the id `readAsyncTasks` gives it. */
   key: string;
   agentId: string;
+  /** The session its tool call came from, when not the agent's main one (a group chat member's): that session hears how it ended. */
+  sessionId?: string;
   kind: AsyncTaskInfo["kind"];
   computer: "local" | "cloud";
   shellId: number;
@@ -236,16 +238,18 @@ export class AsyncTasks implements CloudShells {
    * A command's status, from the tool call that started it, a daemon's report or a check here.
    * Its record only moves forward: once ended it stays as it ended.
    */
-  noteShell(computer: "local" | "cloud", status: BackgroundShellStatus, machine: string | null, options: { told?: boolean; stoppedBy?: "agent" } = {}): AsyncTaskRecord | null {
+  noteShell(computer: "local" | "cloud", status: BackgroundShellStatus, machine: string | null, options: { told?: boolean; stoppedBy?: "agent"; sessionId?: string } = {}): AsyncTaskRecord | null {
     const key = `${computer}:${status.id}`;
     let record = this.records.get(key);
     if (record != null && record.agentId !== status.agentId) return null;
     const isNew = record == null;
+    const sessionId = options.sessionId != null && options.sessionId !== MAIN_SESSION ? options.sessionId : undefined;
     if (record == null) {
       if (this.deps.store.getAgent(status.agentId) == null) return null;
       record = {
         key,
         agentId: status.agentId,
+        ...(sessionId != null ? { sessionId } : {}),
         kind: "shell",
         computer,
         shellId: status.id,
@@ -264,6 +268,9 @@ export class AsyncTasks implements CloudShells {
         notified: false,
       };
       this.records.set(key, record);
+    } else if (sessionId != null && record.sessionId == null && !record.notified) {
+      // The daemon's report got here before the answer to the tool call that started it.
+      record.sessionId = sessionId;
     }
     if (options.stoppedBy != null) {
       record.stoppedBy ??= options.stoppedBy;
@@ -418,7 +425,7 @@ export class AsyncTasks implements CloudShells {
 
   // ---- the cloud computer's commands (CloudShells, for cloud-tools.ts) -------------------------------
 
-  async startCloud(agentId: string, command: string, cwd: string): Promise<BackgroundShellStatus> {
+  async startCloud(agentId: string, command: string, cwd: string, sessionId?: string): Promise<BackgroundShellStatus> {
     const cloud = this.requireCloud();
     const id = pickShellId((candidate) => this.records.has(`cloud:${candidate}`));
     const logPath = `${CLOUD_TERMINALS}/${id}.txt`;
@@ -427,7 +434,7 @@ export class AsyncTasks implements CloudShells {
     const header = logHeader({ pid: CLOUD_PID_PLACEHOLDER, cwd, command, state: "running", startedAt, runningForMs: 0 });
     const { pid } = await cloud.startBackground({ command, cwd, logPath, header });
     const status: BackgroundShellStatus = { id, agentId, command, cwd, pid, logPath, state: "running", exitCode: null, startedAt, endedAt: null, origin: "spawned" };
-    this.noteShell("cloud", status, cloud.status().sandboxId);
+    this.noteShell("cloud", status, cloud.status().sandboxId, sessionId != null ? { sessionId } : {});
     this.schedulePoll();
     return status;
   }

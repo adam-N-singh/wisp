@@ -6,9 +6,19 @@
 // plugin's approvalKey, a hash of the commit and of every server's command, arguments,
 // environment, address and headers as written, so the box starts only what the confirmation
 // showed. A refresh reads newer commits but never moves an installed plugin: the user updates it,
-// and confirms again when its servers changed.
+// and confirms again when its servers changed. A plugin the marketplace renamed (`renames`) moves
+// to its new name at the refresh that reads it; one it removed stays until the user uninstalls it,
+// which a marketplace with `forceRemoveDeletedPlugins` asks for and the user confirms.
+//
+// A plugin can be turned off without uninstalling it: its servers stop and agents don't get its
+// skills, while its values, its servers' settings and their sign-ins stay for when it's back on.
+//
+// Once a day the box checks the marketplaces it has plugins installed from, on its own clock (no
+// client asks, so nothing wakes a remote box for it): it asks GitHub for the head commit, downloads
+// only what moved into a scratch folder, and notes which installed plugins have newer files. It
+// changes nothing else; Refresh reads them, and the update is reviewed as any other.
 import { createHash, randomBytes } from "node:crypto";
-import { cpSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import {
   type CatalogPlugin,
@@ -27,9 +37,11 @@ import {
 import type { McpCatalogEntry, McpServerConfig, McpServerSummary } from "../shared/model";
 import {
   approvalKeyOf,
+  currentName,
   fetchPlugin,
   type IndexedPlugin,
   indexMarketplace,
+  type MarketplaceCheck,
   type MarketplaceHosts,
   type MarketplaceIndex,
   MarketplaceError,
@@ -38,6 +50,7 @@ import {
   parseMarketplaceSource,
   fileChanges,
   type PluginFiles,
+  remoteHead,
   skillChanges,
   resolveServer,
   sameSource,
@@ -75,17 +88,26 @@ export interface PluginHostDeps {
   skillsChanged(): void;
   /** Marketplaces or installed plugins changed. */
   changed(): void;
+  /** The clock the daily check goes by. */
+  now(): number;
   log(line: string): void;
 }
 
 /** How many plugins in repositories of their own a refresh reads at once. */
 const FETCH_CONCURRENCY = 4;
+/** The daily check: how old a marketplace's last look (a check or a refresh) gets, how often the box sees which are due, and its first look after the box starts. */
+const CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
+const CHECK_TICK_MS = 60 * 60 * 1000;
+const CHECK_FIRST_DELAY_MS = 5 * 60 * 1000;
 /** Brand-like colors for plugins' monograms. */
 const COLORS = ["#4f46e5", "#0f766e", "#b45309", "#be123c", "#7c3aed", "#0369a1", "#15803d", "#c2410c", "#334155", "#a21caf"];
 
 export class PluginHost {
   /** Per marketplace: the refresh or fetch running now, so they never overlap. */
   private readonly running = new Map<string, Promise<unknown>>();
+  /** Marketplaces the daily check is looking at now. */
+  private readonly checking = new Set<string>();
+  private checkTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly deps: PluginHostDeps) {}
 
@@ -93,8 +115,33 @@ export class PluginHost {
     return this.deps.store;
   }
 
-  /** At startup: the installed plugins' skills. */
+  /**
+   * At startup: the installed plugins' skills, and what an unfinished add, check, rename or update
+   * left. Scratch folders always go. A plugin's installed files go only when plugins.json was read
+   * whole and names neither the plugin nor that commit, and no MCP server still points into them;
+   * otherwise a file the box couldn't read would cost every plugin its files. Plugins' data
+   * (plugin-data/) is never deleted here: only uninstalling deletes it.
+   */
   load(): void {
+    const marketplaces = join(this.store.dataDir, "marketplaces");
+    for (const entry of readdirSync(marketplaces)) if (/^\.(check|pending)-/.test(entry)) this.removeFolder(join(marketplaces, entry));
+    if (this.store.installedPluginsWhole) {
+      const folders = (path: string) => (existsSync(path) ? readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name) : []);
+      const used = this.store.mcpServers().flatMap((server) => (server.transport === "stdio" ? [server.command, ...server.args, ...Object.values(server.env)] : []));
+      const inUse = (folder: string) => used.some((value) => value.includes(folder));
+      const root = join(this.store.dataDir, "plugins");
+      for (const marketplace of folders(root)) {
+        for (const name of folders(join(root, marketplace))) {
+          const owner = this.store.installedPlugins().find((plugin) => plugin.marketplaceId === marketplace && plugin.name === name);
+          const current = owner != null ? this.store.pluginFolder(marketplace, name, owner.commit) : null;
+          for (const commit of folders(join(root, marketplace, name))) {
+            const folder = join(root, marketplace, name, commit);
+            if (folder !== current && !inUse(folder)) this.removeFolder(folder);
+          }
+          if (owner == null && readdirSync(join(root, marketplace, name)).length === 0) this.removeFolder(join(root, marketplace, name));
+        }
+      }
+    }
     this.loadSkills();
   }
 
@@ -120,6 +167,9 @@ export class PluginHost {
           pluginCount: plugins.length,
           installedCount: installed.length,
           updateCount: installed.filter((plugin) => this.updateOf(plugin) != null).length,
+          foundUpdateCount: installed.filter((plugin) => this.foundUpdate(plugin) != null).length,
+          checkedAt: Math.max(record.check?.at ?? 0, index?.indexedAt ?? 0) || null,
+          removedPlugins: installed.filter((plugin) => this.removalRequested(plugin)).map((plugin) => ({ pluginId: plugin.pluginId, displayName: plugin.plugin.displayName })),
           unfetchedCount: plugins.filter((plugin) => plugin.source.kind === "github" && plugin.files == null && plugin.error == null).length,
           problems: index?.problems ?? [],
           error: record.error,
@@ -186,14 +236,67 @@ export class PluginHost {
         throw new PluginError("unreachable", error.message);
       }
       if (index.name !== id) index.problems.unshift(`Its marketplace.json now names it “${index.name}”; it stays listed as “${id}”.`);
+      this.applyRenames(id, index);
       const installed = new Set(this.store.installedPlugins().filter((plugin) => plugin.marketplaceId === id).map((plugin) => plugin.name));
       await this.fetchInto(id, index, index.plugins.filter((plugin) => installed.has(plugin.name) && plugin.source.kind === "github" && plugin.files == null));
       this.store.setMarketplaceIndex(id, index);
       for (const entry of readdirSync(this.store.marketplaceDir(id))) {
         if (entry !== index.snapshot && entry !== "index.json") rmSync(join(this.store.marketplaceDir(id), entry), { recursive: true, force: true });
       }
-      this.store.putMarketplace({ ...record, error: null });
+      // What the daily check found, this read has now.
+      this.store.putMarketplace({ ...this.requireMarketplace(id), error: null, check: null });
     }).finally(() => this.deps.changed());
+    return this.marketplaces();
+  }
+
+  /**
+   * Installed plugins the marketplace renamed move to their new name, as Claude Code moves their
+   * settings: their files and data, values, servers (same ids, so their settings and sign-ins stay)
+   * and whether they're on. One whose new name another installed plugin has stays as it is.
+   */
+  private applyRenames(marketplaceId: string, index: MarketplaceIndex): void {
+    let moved = false;
+    for (const installed of this.store.installedPlugins()) {
+      if (installed.marketplaceId !== marketplaceId) continue;
+      const name = currentName(index, installed.name);
+      if (name == null || name === installed.name) continue;
+      const pluginId = pluginIdOf(name, marketplaceId);
+      const clash = this.store.getInstalledPlugin(pluginId) ?? this.sameName(name, pluginId);
+      if (clash != null) {
+        index.problems.push(`It renamed “${installed.name}” to “${name}”, but you also have a plugin named “${name}”${clash.marketplaceId !== marketplaceId ? `, from ${this.label(clash.marketplaceId)}` : ""}, so the one you installed stays under its old name.`);
+        continue;
+      }
+      const from = { root: this.store.pluginFolder(marketplaceId, installed.name, installed.commit), data: this.store.pluginDataFolder(marketplaceId, installed.name) };
+      const to = { root: this.store.pluginFolder(marketplaceId, name, installed.commit), data: this.store.pluginDataFolder(marketplaceId, name) };
+      rmSync(to.root, { recursive: true, force: true });
+      cpSync(from.root, to.root, { recursive: true });
+      if (existsSync(from.data)) {
+        rmSync(to.data, { recursive: true, force: true });
+        cpSync(from.data, to.data, { recursive: true });
+      }
+      const next: InstalledPlugin = { ...installed, pluginId, name, renamedFrom: installed.name, plugin: { ...installed.plugin, name }, serverIds: { ...installed.serverIds } };
+      this.store.deleteInstalledPlugin(installed.pluginId);
+      this.store.putInstalledPlugin(next);
+      // Their pluginId and ${CLAUDE_PLUGIN_ROOT} are the new ones now: the servers restart from the new folder.
+      this.putServers(next, this.serverConfigs(next));
+      this.removeFolder(join(this.store.dataDir, "plugins", marketplaceId, installed.name));
+      this.removeFolder(from.data);
+      this.deps.log(`plugin ${installed.pluginId} was renamed to ${pluginId} by its marketplace`);
+      moved = true;
+    }
+    if (moved) this.afterPluginsChanged();
+  }
+
+  /**
+   * Uninstalls the plugins of `pluginIds` that the marketplace removed and asks to be uninstalled
+   * (`forceRemoveDeletedPlugins`): the user confirmed those, so any others stay.
+   */
+  removeDeleted(id: string, pluginIds: string[]): MarketplaceView[] {
+    this.requireMarketplace(id);
+    const confirmed = new Set(pluginIds);
+    const removed = this.store.installedPlugins().filter((plugin) => plugin.marketplaceId === id && confirmed.has(plugin.pluginId) && this.removalRequested(plugin));
+    for (const plugin of removed) this.uninstall(plugin.pluginId, false);
+    if (removed.length > 0) this.afterPluginsChanged();
     return this.marketplaces();
   }
 
@@ -344,7 +447,27 @@ export class PluginHost {
       serversChanged: update?.serversChanged ?? false,
       skillChanges: skills != null ? { added: names(skills, "added"), removed: names(skills, "removed"), changed: names(skills, "changed") } : null,
       delisted: !listed,
+      removed: !listed && this.store.marketplaceIndex(installed.marketplaceId)?.renames?.[installed.name] === null,
+      removalRequested: this.removalRequested(installed),
+      enabled: installed.enabled !== false,
+      renamedFrom: installed.renamedFrom ?? null,
+      updateFound: update == null ? this.foundUpdate(installed) : null,
     };
+  }
+
+  /** The marketplace no longer has it, under its name or another, and asks for it to be uninstalled. */
+  private removalRequested(installed: InstalledPlugin): boolean {
+    const index = this.store.marketplaceIndex(installed.marketplaceId);
+    return index?.forceRemoveDeletedPlugins === true && currentName(index, installed.name) == null;
+  }
+
+  /** Newer files the daily check saw for it, while the marketplace's index doesn't have them yet. */
+  private foundUpdate(installed: InstalledPlugin): InstalledPluginView["updateFound"] {
+    const check = this.store.getMarketplace(installed.marketplaceId)?.check;
+    const found = check?.updates[installed.pluginId];
+    if (check == null || found == null || found.commit === installed.commit) return null;
+    if (this.indexed(installed.marketplaceId, installed.name)?.files?.commit === found.commit) return null;
+    return { commit: found.commit, checkedAt: check.at, serversChanged: found.serversChanged };
   }
 
   /** What updating to the last refresh's files changes: the version, the skills with their texts, the servers and the other files. */
@@ -521,13 +644,31 @@ export class PluginHost {
     return this.store.installedPlugins().find((plugin) => Object.values(plugin.serverIds).includes(serverId));
   }
 
+  /** Turns an installed plugin off (its servers stop and agents lose its skills, its settings and sign-ins kept) or back on. */
+  setEnabled(pluginId: string, enabled: boolean): void {
+    const installed = this.store.getInstalledPlugin(pluginId);
+    if (installed == null) throw new PluginError("not-found", "That plugin isn’t installed.");
+    if ((installed.enabled !== false) === enabled) return;
+    const next: InstalledPlugin = { ...installed };
+    delete next.enabled;
+    if (!enabled) next.enabled = false;
+    this.store.putInstalledPlugin(next);
+    this.afterPluginsChanged();
+  }
+
+  /** The box's servers as they should run: a turned-off plugin's stay stopped, with their settings as they are. */
+  runnable(configs: McpServerConfig[]): McpServerConfig[] {
+    const off = new Set(this.store.installedPlugins().filter((plugin) => plugin.enabled === false).flatMap((plugin) => Object.values(plugin.serverIds)));
+    return off.size === 0 ? configs : configs.map((config) => (config.enabled && off.has(config.id) ? { ...config, enabled: false } : config));
+  }
+
   effective(): EffectivePlugin[] {
     return this.store.installedPlugins().map((installed) => ({
       pluginId: installed.pluginId,
       name: installed.name,
       displayName: installed.plugin.displayName,
       installMode: "user",
-      isEnabled: true,
+      isEnabled: installed.enabled !== false,
       mcpServerNames: installed.plugin.servers.map((server) => server.name),
       configuredVariableKeys: Object.entries(installed.values).filter(([, value]) => value.length > 0).map(([key]) => key),
     }));
@@ -555,6 +696,87 @@ export class PluginHost {
 
   skillInfos(): PluginSkillInfo[] {
     return this.store.pluginSkills().map((skill) => ({ name: skill.name, description: skill.description, pluginId: skill.pluginId, pluginName: skill.pluginName }));
+  }
+
+  // ---- the daily check -----------------------------------------------------------------------
+
+  /** Looks every hour for marketplaces due a check; the box's own timer, so no client ever has to ask. */
+  startChecks(): void {
+    if (this.checkTimer != null) return;
+    const tick = () => void this.checkDue().catch((error: unknown) => this.deps.log(`plugin update check failed: ${message(error)}`));
+    this.checkTimer = setTimeout(() => {
+      tick();
+      this.checkTimer = setInterval(tick, CHECK_TICK_MS);
+      this.checkTimer.unref();
+    }, CHECK_FIRST_DELAY_MS);
+    this.checkTimer.unref();
+  }
+
+  stopChecks(): void {
+    if (this.checkTimer != null) clearTimeout(this.checkTimer);
+    this.checkTimer = null;
+  }
+
+  /** Checks each marketplace with an installed plugin whose last look (a check or a refresh) is a day old. */
+  async checkDue(): Promise<void> {
+    for (const record of this.store.marketplaces()) {
+      if (this.running.has(record.id) || this.checking.has(record.id)) continue;
+      if (!this.store.installedPlugins().some((plugin) => plugin.marketplaceId === record.id)) continue;
+      const last = Math.max(record.check?.at ?? 0, this.store.marketplaceIndex(record.id)?.indexedAt ?? 0);
+      if (this.deps.now() - last >= CHECK_EVERY_MS) await this.check(record.id).catch((error: unknown) => this.deps.log(`checking ${record.id} for plugin updates failed: ${message(error)}`));
+    }
+  }
+
+  /**
+   * One marketplace's check: which installed plugins have newer files, compared as an update is
+   * (their files' hash and their servers). It reads the head commits first and downloads only what
+   * moved, into a scratch folder it deletes; the index, the installed plugins and their servers
+   * aren't touched. A check that fails is logged and tried again the next day.
+   */
+  private async check(id: string): Promise<void> {
+    const record = this.requireMarketplace(id);
+    const index = this.store.marketplaceIndex(id);
+    const installed = this.store.installedPlugins().filter((plugin) => plugin.marketplaceId === id);
+    if (index == null || installed.length === 0) return;
+    this.checking.add(id);
+    const scratch = join(this.store.dataDir, "marketplaces", `.check-${randomBytes(4).toString("hex")}`);
+    let updates: MarketplaceCheck["updates"] | null = {};
+    try {
+      // The marketplace's own repository: what the last refresh read still stands while its head hasn't moved.
+      const head = record.source.kind === "github" ? await remoteHead(this.deps.hosts, record.source.repo, record.source.ref) : null;
+      const latest = head != null && head === index.commit ? index : await indexMarketplace(record.source, scratch, this.deps.hosts, null);
+      for (const plugin of installed) {
+        const name = currentName(latest, plugin.name);
+        let newer = name != null ? latest.plugins.find((candidate) => candidate.name === name) : undefined;
+        if (newer == null || (latest === index && newer.source.kind !== "github")) continue;
+        if (newer.source.kind === "github") {
+          // A plugin in a repository of its own: read only when its commit or its entry moved past what's installed and indexed.
+          const at = newer.source.sha ?? (await remoteHead(this.deps.hosts, newer.source.repo, newer.source.ref));
+          const indexedAt = latest === index ? (newer.files?.commit ?? null) : null;
+          if (at != null && JSON.stringify(newer.entry) === JSON.stringify(plugin.plugin.entry) && (at === plugin.commit || at === indexedAt)) continue;
+          newer = await fetchPlugin(newer, scratch, "check", this.deps.hosts);
+        }
+        if (newer.files == null) continue;
+        const serversChanged = serversKeyOf(newer.servers) !== serversKeyOf(plugin.plugin.servers);
+        if (newer.files.hash === plugin.hash && !serversChanged) continue;
+        // The index already has these files: the plugin's page shows that update as it is.
+        if (this.indexed(id, plugin.name)?.files?.hash === newer.files.hash) continue;
+        updates[plugin.pluginId] = { commit: newer.files.commit, serversChanged };
+      }
+    } catch (error) {
+      if (!(error instanceof MarketplaceError)) throw error;
+      this.deps.log(`checking ${id} for plugin updates failed: ${error.message}`);
+      updates = null;
+    } finally {
+      this.checking.delete(id);
+      this.removeFolder(scratch);
+    }
+    // A refresh or a removal meanwhile read or dropped it: that stands.
+    const current = this.store.getMarketplace(id);
+    if (current == null || this.store.marketplaceIndex(id)?.indexedAt !== index.indexedAt) return;
+    const previous = current.check?.updates ?? {};
+    this.store.putMarketplace({ ...current, check: { at: this.deps.now(), updates: updates ?? previous } });
+    if (updates != null && JSON.stringify(updates) !== JSON.stringify(previous)) this.deps.changed();
   }
 
   private checkApproval(pluginId: string, plugin: IndexedPlugin, approvalKey: string | undefined, required: boolean): void {
@@ -634,10 +856,11 @@ export class PluginHost {
     }
   }
 
-  /** Installed plugins' skills, read from their installed files. */
+  /** Installed plugins' skills, read from their installed files; a plugin turned off gives none. */
   private loadSkills(): void {
     const skills: PluginSkill[] = [];
     for (const installed of this.store.installedPlugins()) {
+      if (installed.enabled === false) continue;
       const folder = this.store.pluginFolder(installed.marketplaceId, installed.name, installed.commit);
       const sensitive = new Set(installed.plugin.options.filter((option) => option.sensitive).map((option) => option.key));
       const fill = (text: string) =>
@@ -678,6 +901,8 @@ export class PluginHost {
     return github != null && /^[0-9a-f]{40}$/.test(installed.commit) ? `https://github.com/${github.repo}/blob/${installed.commit}/${github.path !== "" ? `${github.path}/` : ""}${path}` : null;
   }
 }
+
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /** The names of the skills an update changes this way. */
 const names = (skills: PluginSkillChange[], change: PluginSkillChange["change"]) => skills.filter((skill) => skill.change === change).map((skill) => skill.name);

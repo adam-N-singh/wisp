@@ -22,13 +22,16 @@ import type { ToolSpec } from "./models";
 
 /** Background commands on the cloud computer (the box's async tasks, async-tasks.ts). */
 export interface CloudShells {
-  startCloud(agentId: string, command: string, cwd: string): Promise<BackgroundShellStatus>;
+  /** `sessionId`: the session the call came from, which hears how the command ended (none: the main one). */
+  startCloud(agentId: string, command: string, cwd: string, sessionId?: string): Promise<BackgroundShellStatus>;
   awaitCloud(agentId: string, shellId: number, options: { blockUntilMs?: unknown; regex: string | null; signal: AbortSignal }): Promise<AwaitOutcome>;
   stopCloud(agentId: string, shellId: number, by: "agent" | "user"): Promise<BackgroundShellStatus>;
 }
 
 export interface CloudToolContext {
   agentId: string;
+  /** The session the call came from, when not the agent's main one. */
+  sessionId?: string;
   cloud: CloudComputer;
   signal: AbortSignal;
   progress(chunk: string): void;
@@ -92,7 +95,7 @@ export const CLOUD_TOOLS: Record<string, CloudTool> = {
       const cwd = resolveCloudPath(args.cwd, context.agentId);
       if (args.background === true) {
         await context.cloud.ensureDir(cwd);
-        return { output: startedText(await requireShells(context).startCloud(context.agentId, String(args.command ?? ""), cwd)) };
+        return { output: startedText(await requireShells(context).startCloud(context.agentId, String(args.command ?? ""), cwd, context.sessionId)) };
       }
       const timeoutMs = Math.min(Math.max(Number(args.timeout_ms) || 120_000, 1_000), 600_000);
       const result = await context.cloud.exec(String(args.command ?? ""), { cwd, timeoutMs, signal: context.signal, onOutput: context.progress });

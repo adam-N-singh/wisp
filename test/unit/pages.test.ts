@@ -27,6 +27,7 @@ import {
   type PageDocument,
   pageEditsNote,
   pageFileName,
+  pageId,
 } from "../../src/shared/pages";
 
 const cleanup: Array<() => void> = [];
@@ -247,7 +248,7 @@ test("tools: create_document posts a page card after its call, edit_document upd
   // A whole document read back is kept and replayed uncut (the usual limit is 20 000 characters).
   const big = `# Big\n\n${"All work and no play. ".repeat(5_000)}`;
   const bigPage = (await runTool(harness, store, "create_document", { title: "Big", markdown: big }, "c5")).added;
-  const bigId = cards(bigPage)[0].message.page.documentId;
+  const bigId = pageId(cards(bigPage)[0].message.page);
   const bigRead = await runTool(harness, store, "read_document", { document_id: bigId }, "c6");
   assert.ok(bigRead.call.detail!.output.endsWith(big));
   assert.ok(JSON.stringify(harness.buildConversation("a1")).includes(JSON.stringify(big).slice(1, -1)));
@@ -384,7 +385,7 @@ test("gateway: read-only while the agent writes, 409s on a stale revision, the l
   await api("deliverMessage", { agentId: id, prompt: "Write the plan", clientNonce: "g1" });
   await until(async () => (await row()).awaitingUserResponse?.reason === "question");
   const [doc] = await api<LibraryPage[]>("libraryDocuments", { agentId: id });
-  const locator = { storeId: id, documentId: doc.page.documentId };
+  const locator = { storeId: id, documentId: pageId(doc.page) };
   assert.deepEqual([doc.title, doc.revision, doc.updatedBy, doc.page.kind], ["Trip plan", 1, "agent", "document"]);
   assert.deepEqual(pageEvents.map((event) => [event.change, event.by]), [["created", "agent"]]);
 
@@ -417,15 +418,15 @@ test("gateway: read-only while the agent writes, 409s on a stale revision, the l
   // The model reads the note at the start of the user's next message.
   await api("deliverMessage", { agentId: id, prompt: "What do you think?", clientNonce: "g2" });
   await until(async () => !(await row()).isRunning && seen.length === 2);
-  assert.match(seen[1], new RegExp(`^\\[Sent [^\\]]+\\]\\n\\[I changed this page since my last message: “Trip plan” \\(${doc.page.documentId}, now revision 2\\)\\.`));
+  assert.match(seen[1], new RegExp(`^\\[Sent [^\\]]+\\]\\n\\[I changed this page since my last message: “Trip plan” \\(${pageId(doc.page)}, now revision 2\\)\\.`));
 
   const restored = await api<PageDocument>("restorePageRevision", { locator, revision: 1, baseRevision: 2 });
   assert.deepEqual([restored.revision, restored.source, restored.updatedBy], [3, PLAN, "user"]);
   await refused("restorePageRevision", { locator, revision: 1, baseRevision: 2 }, 409, "page/stale");
-  assert.deepEqual((await api<LibraryPage[]>("libraryPages", { includeDocuments: true })).map((page) => page.page.documentId), [doc.page.documentId]);
+  assert.deepEqual((await api<LibraryPage[]>("libraryPages", { includeDocuments: true })).map((page) => pageId(page.page)), [pageId(doc.page)]);
   assert.deepEqual(await api("libraryPages", { includeDocuments: false }), []);
   await refused("readPage", { locator: { storeId: id, documentId: "../../etc" } }, 400);
-  await refused("readPage", { locator: { storeId: "no-such-agent", documentId: doc.page.documentId } }, 404);
+  await refused("readPage", { locator: { storeId: "no-such-agent", documentId: pageId(doc.page) } }, 404);
 
   // Deleting the page keeps its card, marked deleted.
   assert.equal(await api("deletePage", { locator }), null);

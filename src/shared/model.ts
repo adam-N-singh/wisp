@@ -21,6 +21,40 @@ export interface OrderedStamp {
   sequence: number;
 }
 
+// ---- sessions ----------------------------------------------------------------
+// An agent has more than one conversation: its main one, the chat the user has with it, and one per
+// group chat it's in (`group:<roomId>`), later one per task thread (`task:<taskId>[:<parent>]`).
+// Memory, skills, apps, the workspace and the computer are the agent's; the run, a pending question
+// or approval, todos, the Claude Code session and turn numbers are each session's.
+
+/** The main session's id. */
+export const MAIN_SESSION = "";
+const SESSION_ID = /^(group|task):[\w-]{1,100}(:[\w:-]{1,200})?$/;
+
+/** "", or `group:<roomId>` / `task:<id>` made of letters, digits, `_`, `-` and `:`. */
+export function isSessionId(value: string): boolean {
+  return value === MAIN_SESSION || SESSION_ID.test(value);
+}
+
+export const groupSessionId = (roomId: AgentId) => `group:${roomId}`;
+
+/** The room a `group:<roomId>` session belongs to. */
+export function roomIdOf(sessionId: string): AgentId | null {
+  return sessionId.startsWith("group:") && SESSION_ID.test(sessionId) ? sessionId.slice(6) : null;
+}
+
+/** `transcript:<agentId>` for the main session, `transcript:<agentId>\0<sessionId>` for the others. */
+export function transcriptReplicaKey(agentId: AgentId, sessionId: string = MAIN_SESSION): string {
+  return sessionId === MAIN_SESSION ? `transcript:${agentId}` : `transcript:${agentId}\u0000${sessionId}`;
+}
+
+export function parseReplicaKey(key: string): { agentId: AgentId; sessionId: string } | null {
+  if (!key.startsWith("transcript:")) return null;
+  const rest = key.slice("transcript:".length);
+  const split = rest.indexOf("\u0000");
+  return split < 0 ? { agentId: rest, sessionId: MAIN_SESSION } : { agentId: rest.slice(0, split), sessionId: rest.slice(split + 1) };
+}
+
 // ---- roster ----------------------------------------------------------------
 
 export interface CurrentActivity {
@@ -49,10 +83,23 @@ export interface AgentSummary {
   updatedAt: number;
   lastActivityAt?: number;
   lastViewedAt?: number;
+  /** A session is running a turn: the main one, or another (`runningSessionIds`). */
   isRunning: boolean;
+  /** The main session's live state; other sessions' is their own. */
   isComposingMessage: boolean;
   currentActivity?: CurrentActivity;
   awaitingUserResponse: { reason: "approval" | "question"; reasonCopy?: string; since: number; tabId: string } | null;
+  /**
+   * While a session other than the main one runs: every running session, the main one ("") too.
+   * Missing otherwise, when `isRunning` is the main session's alone (see isSessionRunning).
+   */
+  runningSessionIds?: string[];
+  /** Sessions other than the main one waiting for the user's approval or answer (the main one's is `awaitingUserResponse`). */
+  awaitingSessionIds?: string[];
+  /** On a group chat's row: the member taking its turn now. */
+  activeGroupMemberId?: AgentId;
+  /** On a group chat's row: the turns its latest message gave members, in order (src/box/rooms.ts). */
+  groupTurns?: AgentGroupTurn[];
   lastTurnSettlement?: { clientNonce: string; outcome: "success" | "cancelled" | "error"; settledAtMs: number; errorCode?: string } | null;
   hasUnread: boolean;
   unreadCount?: number;
@@ -93,6 +140,26 @@ export interface AgentSummary {
 /** Running a turn, or with background work still running: what the app shows as working. */
 export function isAgentWorking(agent: Pick<AgentSummary, "isRunning" | "asyncTaskCount">): boolean {
   return agent.isRunning || (agent.asyncTaskCount ?? 0) > 0;
+}
+
+/** How a member's turn in a group chat ended. */
+export type GroupTurnOutcome = "SENT" | "PASS" | "SKIPPED" | "TIMEOUT" | "CANCELLED" | "ERROR";
+
+/** A member's turn in a group chat. */
+export interface AgentGroupTurn {
+  roomId: AgentId;
+  isComposingMessage: boolean;
+  isRunningTurn?: boolean | null;
+  currentActivity?: CurrentActivity;
+  /** Whose turn it is, the bot hop it's on (0 answers the person; each @mention by a member is one more), and how it ended (missing while it waits or runs). */
+  memberId: AgentId;
+  hop: number;
+  outcome?: GroupTurnOutcome;
+}
+
+/** The session is running a turn; for the main session, what its chat shows as working. */
+export function isSessionRunning(agent: Pick<AgentSummary, "isRunning" | "runningSessionIds">, sessionId: string = MAIN_SESSION): boolean {
+  return agent.runningSessionIds == null ? sessionId === MAIN_SESSION && agent.isRunning : agent.runningSessionIds.includes(sessionId);
 }
 
 // ---- transcript ---------------------------------------------------------------
@@ -188,6 +255,17 @@ export interface MessageEntry extends EntryBase {
    * task ended. The outline lists it as a `hidden` user item.
    */
   suppressed?: "quiet-wake";
+  /** In a group chat: the member that posted an assistant message. */
+  fromAgent?: MessageAuthor;
+  /** In a member's group session, the room's last entry this turn's message brings it up to. */
+  roomThroughSeq?: number;
+}
+
+/** Who wrote a message, when it isn't the conversation's own agent. */
+export interface MessageAuthor {
+  id: AgentId;
+  name: string;
+  kind?: "agent" | "cloud-agent" | "group" | null;
 }
 
 export interface ToolCallDetail {
@@ -231,7 +309,9 @@ export interface NoticeEntry extends EntryBase {
 
 export type TimelineEvent =
   | { type: "automation-changed"; action: "created" | "updated" | "deleted" | "ran"; automationId: string; automationName: string }
-  | { type: "name-changed"; from: string; to: string };
+  | { type: "name-changed"; from: string; to: string }
+  /** Bots joined or left a group chat (by name). */
+  | { type: "members-changed"; added: string[]; removed: string[] };
 
 export interface EventEntry extends EntryBase {
   kind: "event";
@@ -282,7 +362,7 @@ export interface VisualizationMessage {
 }
 
 /**
- * A page the agent wrote (create_document), as a card that opens it on the page stage
+ * A page the agent wrote (create_document, write_canvas), as a card that opens it on the page stage
  * (src/shared/pages.ts). Its changes update the card in place.
  */
 export interface PageMessage {
@@ -312,6 +392,13 @@ export interface SendMessageEntry extends EntryBase {
   respondedValue?: string;
   widgetDismissed?: boolean | null;
   streaming?: boolean | null;
+  /** In a group chat: the member whose card this is. */
+  fromAgent?: MessageAuthor;
+  /**
+   * In a group chat, a member's approval or question shown in the room. It's answered in the
+   * member's own session, on that session's entry; the room's copy follows it.
+   */
+  forwarded?: { agentId: AgentId; sessionId: string; entryId: string };
 }
 
 export type TranscriptEntry = MessageEntry | ToolCallEntry | UserAttachmentEntry | NoticeEntry | EventEntry | SendMessageEntry;
@@ -573,6 +660,15 @@ export function skillCommand(name: string): string {
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The command with its first colon kept: "notes:summarize" for a plugin's skill, as Claude Code
+ * writes it. Typed that way, it names that skill exactly; skillCommand folds the colon into a dash.
+ */
+export function qualifiedSkillCommand(name: string): string {
+  const colon = name.indexOf(":");
+  return colon < 0 ? skillCommand(name) : `${skillCommand(name.slice(0, colon))}:${skillCommand(name.slice(colon + 1))}`;
 }
 
 // ---- memory -----------------------------------------------------------------

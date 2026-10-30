@@ -491,6 +491,26 @@ textarea {
   object-fit: cover;
 }
 
+/* A group chat's: two members, the second over the first's corner. */
+.avatar-stack__back,
+.avatar-stack__front {
+  position: absolute;
+  display: flex;
+}
+
+.avatar-stack__back {
+  left: 0;
+  top: 0;
+}
+
+.avatar-stack__front {
+  right: 0;
+  bottom: 0;
+  border-radius: 40%;
+  background: var(--wisp-bg-pane);
+  box-shadow: 0 0 0 1.5px var(--wisp-bg-pane);
+}
+
 @keyframes avatar-bob {
   0%,
   100% {
@@ -1477,6 +1497,110 @@ button.reply-quote:hover {
 
 .message--assistant > .avatar {
   margin-top: 2px;
+}
+
+/* A group chat member's name over its post, or over the card it raised. */
+.message__author {
+  display: block;
+  margin-bottom: 2px;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--wisp-text-secondary);
+}
+
+.message--card .message__body > .permission-card,
+.message--card .message__body > .widget-card {
+  margin: 0;
+}
+
+/* ---- group chats ---------------------------------------------------------- */
+
+.member-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--wisp-border-tertiary-translucent);
+  border-radius: var(--radius-lg);
+  padding: 6px;
+}
+
+.member-picker__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--radius-base);
+  cursor: pointer;
+}
+
+.member-picker__row:hover {
+  background: var(--wisp-bg-hover);
+}
+
+.member-picker__name {
+  font-weight: var(--font-weight-medium);
+}
+
+.member-picker__role {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+}
+
+.group-rename {
+  display: flex;
+  gap: 6px;
+}
+
+.group-rename input {
+  flex: 1;
+  min-width: 0;
+}
+
+.member-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.member-list__row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.member-list__open {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  border-radius: var(--radius-base);
+  background: none;
+  color: var(--wisp-text-primary);
+  text-align: left;
+}
+
+.member-list__open:hover {
+  background: var(--wisp-bg-hover);
+}
+
+.member-list__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-list__add {
+  width: 100%;
 }
 
 .message__body {
@@ -2525,11 +2649,89 @@ button.reply-quote:hover {
   padding: 28px 32px 48px;
 }
 
+/* Changes: a revision beside the one before it. */
+.page-changes {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 20px 32px 48px;
+}
+
+.page-changes__summary {
+  margin: 0 0 12px;
+  color: var(--wisp-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.page-diff {
+  margin: 0;
+  padding: 8px 0;
+  border: 1px solid var(--wisp-border-tertiary-translucent);
+  border-radius: var(--radius-lg);
+  background: var(--wisp-bg-quaternary);
+  font-size: var(--font-size-sm);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.page-diff__line,
+.page-diff__skip {
+  display: block;
+  padding: 0 12px 0 0;
+  text-decoration: none;
+}
+
+.page-diff__mark {
+  display: inline-block;
+  width: 24px;
+  text-align: center;
+  color: var(--wisp-text-tertiary);
+  user-select: none;
+}
+
+.page-diff__line--add {
+  background: var(--wisp-bg-success-secondary);
+}
+
+.page-diff__line--del {
+  background: var(--wisp-bg-danger-secondary);
+}
+
+.page-diff__skip {
+  padding-left: 24px;
+  color: var(--wisp-text-tertiary);
+  font-style: italic;
+}
+
+.button--pressed {
+  background: var(--wisp-bg-active);
+  color: var(--wisp-text-primary);
+}
+
 .page-stage__placeholder {
   margin: auto;
   padding: 24px;
   text-align: center;
   color: var(--wisp-text-tertiary);
+}
+
+/* A canvas fills the stage below its header and banners. */
+.page-stage__canvas {
+  display: block;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: none;
+  background: transparent;
+}
+
+.page-stage__canvas--loading {
+  background: var(--wisp-bg-quaternary);
+}
+
+.page-banner__input {
+  flex: 1;
+  min-width: 160px;
 }
 
 .page-editor {
@@ -3748,6 +3950,95 @@ button.reply-quote:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---- Settings → Vault ---------------------------------------------------------- */
+
+.vault__bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+.vault__tabs,
+.vault__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.vault__empty {
+  padding: 12px 0;
+}
+
+.vault-form {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--wisp-border-tertiary-translucent);
+  background: var(--wisp-bg-elevated);
+}
+
+.vault-form h3 {
+  margin: 0;
+}
+
+.vault-list,
+.vault-fills {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.vault-list__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--wisp-border-quaternary-translucent);
+  color: var(--wisp-icon-secondary);
+}
+
+.vault-list__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.vault-list__label {
+  color: var(--wisp-text-primary);
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.vault-list__meta {
+  margin-top: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--wisp-text-tertiary);
+}
+
+.vault-fills li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--wisp-border-quaternary-translucent);
+  font-size: var(--font-size-sm);
+}
+
+/* The credential-request card in the chat (CredentialCard.tsx). */
+.credential-card__item {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.credential-card__site {
+  font-size: var(--font-size-sm);
+  color: var(--wisp-text-secondary);
 }
 
 .mcp-list {
@@ -5602,6 +5893,36 @@ button.reply-quote:hover {
 .plugin-update--review {
   border: 1px solid var(--wisp-border-warn-primary);
   background: var(--wisp-bg-warn-secondary);
+}
+
+/* An installed plugin with a new version, on its catalog card. */
+.app-card__badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--wisp-bg-accent-secondary);
+  color: var(--wisp-text-accent-primary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+/* The plugin page's on/off switch, where Installed was. */
+.plugin-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--wisp-text-secondary);
+  cursor: pointer;
+}
+
+.plugin-off {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-lg);
+  background: var(--wisp-bg-secondary);
+  font-size: var(--font-size-sm);
 }
 
 .plugin-unread {

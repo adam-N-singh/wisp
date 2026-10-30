@@ -19,6 +19,7 @@ import {
 } from "../shared/background-shell";
 import type { BrowserPlanInfo, BrowserRunReply, BrowserToolName } from "../shared/agent-browser";
 import type { LocalToolDescriptor } from "../shared/gateway-protocol";
+import type { VaultFillReply, VaultListReply, VaultPlanInfo } from "../shared/vault";
 import type { LocalToolAction, Risk } from "../shared/model";
 import { type BackgroundShells, killProcessTree } from "./background";
 import { classifyBash } from "./bash-classify";
@@ -26,6 +27,7 @@ import { BROWSER_TOOLS } from "./browser-tools";
 import { classifyPowerShell } from "./powershell-classify";
 import { dirScope, isInside } from "./policy";
 import { mentionsSensitiveLocation } from "./sensitive";
+import { VAULT_TOOLS } from "./vault-tools";
 
 /** Reads inside the agent's workspace are read-only; elsewhere they ask; credential stores are dangerous. */
 function readRisk(path: string, workspace: string): { risk: Risk; reasons: string[] } {
@@ -46,6 +48,8 @@ export interface ToolContext {
   plan?: ToolPlan;
   /** The user's answer, when the call comes back after asking them (ToolOutput.askUser). */
   answer?: string | null;
+  /** The approval this call runs on, when the user gave one on this PC (main checks it again for a vault fill). */
+  approvalId?: string | null;
   host: {
     grabScreen(): Promise<{ pngBase64: string; width: number; height: number } | null>;
     getClipboardText(): Promise<string>;
@@ -56,6 +60,12 @@ export interface ToolContext {
       plan(call: { agentId: string; tool: BrowserToolName; args: Record<string, unknown> }): Promise<BrowserPlanInfo>;
       run(call: { agentId: string; tool: BrowserToolName; args: Record<string, unknown>; expectSite: string | null; callId: string; answer: string | null }): Promise<BrowserRunReply>;
       cancel(call: { callId: string }): Promise<void>;
+    };
+    /** The vault, which main keeps and fills from (src/main/vault.ts); no value ever comes back. */
+    vault: {
+      list(call: { agentId: string }): Promise<VaultListReply>;
+      plan(call: { agentId: string; itemId: string; fields: Record<string, string>; submit: boolean }): Promise<VaultPlanInfo>;
+      fill(call: { agentId: string; itemId: string; fields: Record<string, string>; submit: boolean; expectSite: string | null; approvalId: string | null; callId: string }): Promise<VaultFillReply>;
     };
   };
 }
@@ -69,6 +79,8 @@ export interface ToolPlan {
   action: LocalToolAction;
   target: string;
   title: string;
+  /** Goes on the card as its description; a vault fill's names the item and site main checks. */
+  description?: string;
 }
 
 export interface ToolOutput {
@@ -504,6 +516,7 @@ export const LOCAL_TOOLS: Record<string, LocalTool> = {
   },
 
   ...BROWSER_TOOLS,
+  ...VAULT_TOOLS,
 };
 
 function killTree(child: ChildProcess): void {
