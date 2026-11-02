@@ -235,8 +235,15 @@ export function PluginPage({ entry, servers }: { entry: McpCatalogEntry; servers
           {installed.updateFound != null ? (
             <div className={`plugin-update${installed.updateFound.serversChanged ? " plugin-update--review" : ""}`}>
               <span>
-                The daily check, {new Date(installed.updateFound.checkedAt).toLocaleString()}, saw a new version at <span className="mono">{short(installed.updateFound.commit)}</span>.
-                {installed.updateFound.serversChanged ? " It runs or reaches something else." : ""} Refresh its marketplace to read it, then review the update; nothing updates by itself.
+                The daily check, {new Date(installed.updateFound.checkedAt).toLocaleString()},{" "}
+                {installed.updateFound.commit === installed.commit ? (
+                  "saw its marketplace change what it runs, at the same commit."
+                ) : (
+                  <>
+                    saw a new version at <span className="mono">{short(installed.updateFound.commit)}</span>.{installed.updateFound.serversChanged ? " It runs or reaches something else." : ""}
+                  </>
+                )}{" "}
+                Refresh its marketplace to read it, then review the update; nothing updates by itself.
               </span>
               <button type="button" className="button button--small" disabled={busy != null} onClick={() => void run("refresh", () => gateway.refreshMarketplace({ id: plugin.marketplaceId }).then(setMarketplaces))}>
                 <Icon name="refresh" size={12} /> {busy === "refresh" ? "Refreshing…" : "Refresh"}

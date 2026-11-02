@@ -804,6 +804,8 @@ export interface McpServerSummary {
   /** Enabled flag, and whether the box uses an OAuth sign-in for this server. */
   enabled: boolean;
   signedIn: boolean;
+  /** It comes with a plugin the user turned off, so it's off (`enabled` false) until the plugin is back on, whatever its own switch says. */
+  pluginOff?: boolean;
 }
 
 /**

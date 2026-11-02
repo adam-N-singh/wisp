@@ -8,7 +8,7 @@
 // mine, and a save names the revision the edits were made on, so the box refuses one that would
 // write over a change the user hasn't seen. Every "page-changed" says whether the user may edit the
 // page now, so it turns read-only while the agent writes it and editable when that run ends.
-import { type DocumentEditRight, type LibraryPage, type PageChangedEvent, type PageDocument, pageId, pageKindOf, pageLocatorFor } from "../../shared/pages";
+import { type DocumentEditRight, type LibraryPage, newerPage, type PageChangedEvent, type PageDocument, pageId, pageKindOf, pageLocatorFor } from "../../shared/pages";
 import { gateway } from "../bridge";
 import { readSlice, readSlices, removeSlice, sliceKey, writeSlice } from "./slices";
 import { Store } from "./store";
@@ -80,6 +80,22 @@ function setCanvas(key: string, change: (current: LoadedCanvas) => LoadedCanvas)
 
 /** What a page view (`canvasPage`, a restore) says about the page, without its text. */
 const pageOf = ({ page, title, createdAt, updatedAt, revision, updatedBy }: LibraryPage): LibraryPage => ({ page, title, createdAt, updatedAt, revision, updatedBy });
+
+/**
+ * "page-changed" events heard for each canvas, so a read that an event overtook keeps what the
+ * event said: a canvas never goes back to an older revision (`newerPage`), which the stage would
+ * show, and which a restore would then be refused on.
+ */
+const canvasEvents = new Map<string, number>();
+
+/** Puts in what a read or a restore said about a canvas, unless what's known already is newer. */
+function putCanvasView(key: string, view: LibraryPage, editRight: DocumentEditRight | undefined, eventsBefore: number): void {
+  const overtaken = (canvasEvents.get(key) ?? 0) !== eventsBefore;
+  setCanvas(key, (current) => {
+    const canvas = newerPage(current.canvas, pageOf(view), overtaken);
+    return { ...current, status: "ready", canvas, editRight: overtaken && current.editRight != null ? current.editRight : (editRight ?? current.editRight) };
+  });
+}
 
 /** A draft as its slice keeps it: the page it belongs to as well. */
 interface StoredDraft extends Draft {
@@ -153,9 +169,10 @@ export async function loadCanvas(agentId: string, canvasId: string): Promise<voi
   const key = pageKey(agentId, canvasId);
   setCanvas(key, (current) => ({ ...current, status: current.canvas != null ? current.status : "loading" }));
   const locator = { storeId: agentId, canvasId };
+  const eventsBefore = canvasEvents.get(key) ?? 0;
   try {
     const [view, editRight] = await Promise.all([gateway.canvasPage({ locator }), gateway.pageEditAccess({ locator })]);
-    setCanvas(key, () => ({ status: "ready", canvas: pageOf(view), editRight }));
+    putCanvasView(key, view, editRight, eventsBefore);
   } catch (cause) {
     const failure = pageFailure(cause);
     setCanvas(key, (current) => (failure.code === "page/not-found" ? { status: "missing" } : { ...current, status: current.canvas != null ? "ready" : "error", error: failure.message }));
@@ -226,9 +243,10 @@ export async function saveDraft(agentId: string, documentId: string): Promise<st
 }
 
 export async function restorePageRevision(agentId: string, id: string, revision: number, baseRevision: number): Promise<string | null> {
+  const eventsBefore = canvasEvents.get(pageKey(agentId, id)) ?? 0;
   try {
     const doc = await gateway.restorePageRevision({ locator: pageLocatorFor(agentId, id), revision, baseRevision });
-    if (doc.page.kind === "canvas") setCanvas(pageKey(agentId, id), (current) => ({ ...current, status: "ready", canvas: pageOf(doc) }));
+    if (doc.page.kind === "canvas") putCanvasView(pageKey(agentId, id), doc, undefined, eventsBefore);
     else setDocument(pageKey(agentId, id), (current) => ({ ...current, status: "ready", doc }));
     return null;
   } catch (cause) {
@@ -284,10 +302,15 @@ function applyPageChanged(event: PageChangedEvent): void {
   const id = pageId(page.page);
   const key = pageKey(agentId, id);
   if (page.page.kind === "canvas") {
-    // The event says all the stage shows; the frame reads the new revision itself.
+    // The event says all the stage shows; the frame reads the new revision itself. One that comes
+    // after a read's answer with a newer revision (they come by different routes) changes nothing.
+    canvasEvents.set(key, (canvasEvents.get(key) ?? 0) + 1);
     if (canvases.get()[key] == null) return;
     if (event.change === "deleted") return setCanvas(key, () => ({ status: "missing" }));
-    setCanvas(key, (current) => ({ ...current, status: "ready", canvas: page, editRight: event.editRight ?? current.editRight }));
+    setCanvas(key, (current) => {
+      const canvas = newerPage(current.canvas, page);
+      return canvas === current.canvas && current.status === "ready" ? current : { ...current, status: "ready", canvas, editRight: event.editRight ?? current.editRight };
+    });
     if (event.editRight == null) void refreshEditRight(agentId, id);
     return;
   }

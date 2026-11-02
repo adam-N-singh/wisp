@@ -8,20 +8,25 @@ import { type BoxServer, startBoxServer } from "../../src/box-server/server";
 import type { ClaudeCodeEngine, EngineHost } from "../../src/box/claude-code";
 import { Harness } from "../../src/box/harness";
 import { McpManager } from "../../src/box/mcp";
+import { BOX_TOOLS } from "../../src/box/box-tools";
 import { createDocument, PageError, pageEditsSince, readCanvas, retitleCanvas, restoreRevision, revisionList, writeCanvas } from "../../src/box/pages";
 import { BoxStore } from "../../src/box/store";
 import { CanvasFrames } from "../../src/main/canvases";
+import { allowPermission, appPagePrefix } from "../../src/main/web-permissions";
 import {
   CANVAS_CSP,
   CANVAS_GESTURE_MS,
   CANVAS_HEADERS,
+  CANVAS_LINK_INTERVAL_MS,
   CANVAS_LINK_MESSAGE,
   CANVAS_PERMISSIONS_POLICY,
   canvasAddress,
   canvasDocument,
   canvasFrameUrl,
   CanvasLinkGate,
+  CanvasRefusalLog,
   parseCanvasFrameUrl,
+  rateLimit,
 } from "../../src/shared/canvas";
 import type { BoxModelConfig } from "../../src/shared/edges";
 import { removeGlobals, WEBRTC_GLOBALS } from "../../src/shared/frame-lockdown";
@@ -141,6 +146,67 @@ test("canvas text and addresses: titles, excerpts, file names, the note, and fra
   assert.ok(shell.startsWith('<!doctype html>\n<html lang="en" data-theme="dark">'));
   assert.ok(shell.indexOf("color-scheme: dark") < shell.indexOf("window.open = function") && shell.indexOf("window.open = function") < shell.indexOf("<title>Counter</title>"));
   assert.ok(shell.includes(CANVAS_LINK_MESSAGE) && shell.includes("--viz-accent: #4d9bff") && shell.endsWith(COUNTER));
+});
+
+test("canvas text is read in one pass: 256 KB of openers that never close take milliseconds, not minutes, and read as before", () => {
+  // Each took longer with every opener: 16 K characters of `<` took about 0.2 s, so 256 KB about 48 s.
+  for (const unit of ["<!--", "<", "<script>", "<style", "<svg ", "<title>", "<title", "<head", "<h1>", "</title", "</script"]) {
+    const html = unit.repeat(Math.floor(MAX_PAGE_SOURCE / unit.length));
+    const started = process.hrtime.bigint();
+    canvasExcerpt(html);
+    canvasTitle(html);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1_000, `${JSON.stringify(unit)} × ${html.length} took ${ms.toFixed(0)} ms`);
+  }
+  // What the page shows: comments, script, style, SVG and tags out, entities read; a hidden element or a
+  // comment that never closes hides the rest, as on the page; a tag only named like one isn't hidden.
+  assert.equal(canvasExcerpt("a <!-- hidden --> b <SCRIPT>x</script > c <svg><text>t</text></svg> d &lt;e&gt; &amp; f"), "a b c d <e> & f");
+  assert.equal(canvasExcerpt("shown <!-- never closed <p>hidden</p>"), "shown");
+  assert.equal(canvasExcerpt("shown <script>never closed"), "shown");
+  assert.equal(canvasExcerpt("<scripted>shown</scripted> <noscripts>too</noscripts>"), "shown too");
+  assert.equal(canvasExcerpt("a < b and c"), "a < b and c", "a `<` with no `>` after it is text");
+  assert.equal(canvasExcerpt("<head><title>T</title><style>x</style></head><title>Again</title><p>Body</p><title>never closed"), "Body never closed");
+  assert.equal(canvasTitle("<TITLE lang=en> Big &amp; <b>bold</b> </title >"), "Big & bold");
+  assert.equal(canvasTitle("<title>never closed <h1>Heading</h1>"), "Heading", "an unclosed <title> gives way to the first <h1>");
+  assert.equal(canvasTitle("<titles>no</titles><h1>Yes</h1>"), "Yes");
+  assert.equal(canvasTitle(`<title>${"x".repeat(MAX_PAGE_SOURCE)}</title>`), null, "only what a page may hold is read");
+  // write_canvas's activity line is written before the call's size check: past the limit, the HTML isn't read for a title.
+  const summary = (contents: string) => BOX_TOOLS.write_canvas.summary({ contents }, { agentId: "a1", store: undefined as unknown as BoxStore });
+  assert.equal(summary(`<title>Fits</title>${"<".repeat(1_000)}`), "Made “Fits”");
+  assert.equal(summary(`<title>Too big</title>${"<!--".repeat(MAX_PAGE_SOURCE)}`), "Made “a canvas”");
+});
+
+test("a canvas asking to open links in a loop: heard twice a second on the page and in main, and its refusals logged once a minute", () => {
+  const looked = rateLimit(CANVAS_LINK_INTERVAL_MS);
+  const heard = [0, 1, 100, 499, 500, 501, 999, 1_000, 1_500].filter((at) => looked(at));
+  assert.deepEqual(heard, [0, 500, 1_000, 1_500]);
+  assert.equal(looked(10), true, "a clock that went back starts over");
+  // A thousand requests a second for ten seconds reach main twenty times.
+  const calls = rateLimit(CANVAS_LINK_INTERVAL_MS);
+  assert.equal(Array.from({ length: 10_000 }, (_, ms) => calls(ms)).filter(Boolean).length, 20);
+
+  const log = new CanvasRefusalLog();
+  assert.equal(log.note("no-gesture", 1_000), "[canvas] a link wasn't opened (no-gesture)");
+  const quiet = Array.from({ length: 500 }, (_, index) => log.note("too many requests", 1_000 + index * 100)).filter((line) => line != null);
+  assert.deepEqual(quiet, [], "nothing more within the minute");
+  assert.equal(log.note("scheme", 61_000), "[canvas] a link wasn't opened (scheme); 500 more refused since the last line");
+  assert.equal(log.note("scheme", 121_001), "[canvas] a link wasn't opened (scheme)");
+});
+
+test("pointer lock: only a canvas's own frame in the main window may lock the pointer; nothing else", () => {
+  const prefix = appPagePrefix(join(tmpdir(), "wisp-dist"));
+  const ask = (url: string, where: { inMainWindow?: boolean; mainWindowFrame?: boolean } = {}) =>
+    allowPermission({ permission: "pointerLock", url, mediaTypes: [], mainWindowFrame: where.mainWindowFrame ?? false, inMainWindow: where.inMainWindow ?? true }, prefix);
+  const canvas = canvasFrameUrl("a1", "canvas-abc123", "dark", 2);
+  assert.equal(ask(canvas), true, "a canvas on the stage (Chromium asks only from a click or key in it, and Esc lets go)");
+  assert.equal(ask(canvasFrameUrl("a1", "canvas-abc123", "light")), true);
+  assert.equal(ask(canvas, { inMainWindow: false }), false, "another window");
+  assert.equal(ask(canvas, { mainWindowFrame: true }), false, "the app's own page");
+  assert.equal(ask(`${prefix}index.html`, { mainWindowFrame: true }), false, "the app never locks the pointer itself");
+  assert.equal(ask("wisp-visualization://doc/x.html?theme=dark"), false, "a visualization (its frame isn't allowed to ask either)");
+  assert.equal(ask("about:srcdoc"), false, "a frame a canvas made");
+  assert.equal(ask("wisp-canvas://frame/user/canvas-abc123?theme=dark"), false);
+  assert.equal(ask("https://example.com/"), false);
 });
 
 test("the link gate opens http, https, mailto and tel links only within a second of a real click or key, one link per gesture, with a canvas on the page", () => {

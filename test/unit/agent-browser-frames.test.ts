@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { AgentBrowserBounds, placeWindow } from "../../src/main/agent-browser-bounds";
-import { type AXNode, type FieldInfo, type FrameContent, RefTable, renderSnapshot } from "../../src/main/agent-browser-snapshot";
+import { type AXNode, type FieldInfo, fieldsToDescribe, type FrameContent, MAX_EMPTY_FIELDS, MAX_FIELDS_HOLDING, RefTable, renderSnapshot } from "../../src/main/agent-browser-snapshot";
 
 const cleanup: Array<() => void> = [];
 after(() => {
@@ -126,6 +126,36 @@ test("agent browser snapshots read same-origin frames in their place, with refs 
   const plain = renderSnapshot(PAGE, new RefTable()).text;
   assert.equal((plain.match(/\[its contents aren't read\]/g) ?? []).length, 3);
   assert.ok(!plain.includes("Email"));
+});
+
+test("agent browser snapshots: a card field in a frame past hundreds of the page's fields keeps its number out", () => {
+  // 400 empty fields on the page, then a frame whose card field is labelled only "Number".
+  const page = tree(["RootWebArea", "Big form", { kids: [...Array.from({ length: 400 }, (_, index): Spec => ["textbox", `Field ${index}`]), ["Iframe", "Pay"]] }], 1000);
+  const pay = tree(["RootWebArea", "Pay", { kids: [["textbox", "Number", { value: { value: "4242 4242 4242 4242" } }], ["textbox", "Name on card", { value: { value: "Ada Lovelace" } }]] }], 5000);
+  const frames = new Map<number, FrameContent>([[backendOf(page, "Pay"), { frameId: "P", nodes: pay }]]);
+  const number = backendOf(pay, "Number");
+  const holder = backendOf(pay, "Name on card");
+
+  // Fields with something in them are described first, wherever they are; empty ones fill the rest.
+  const wanted = fieldsToDescribe([...page, ...pay]).map((node) => node.backendDOMNodeId);
+  assert.deepEqual(wanted.slice(0, 2), [number, holder]);
+  assert.equal(wanted.length, 2 + MAX_EMPTY_FIELDS);
+  const many = Array.from({ length: MAX_FIELDS_HOLDING + 5 }, (_, index): AXNode => ({ nodeId: String(index), role: { value: "textbox" }, value: { value: "x" }, backendDOMNodeId: index + 1 }));
+  assert.equal(fieldsToDescribe(many).length, MAX_FIELDS_HOLDING);
+
+  // Described as main reads it (autocomplete cc-number), the field shows as a card field.
+  const described = new Map<number, FieldInfo>([
+    [number, { tag: "input", inputType: "text", autocomplete: "cc-number", fieldName: "n" }],
+    [holder, { tag: "input", inputType: "text", autocomplete: "cc-name", fieldName: "holder" }],
+  ]);
+  const shown = renderSnapshot(page, new RefTable(), { fields: described, frames }).text;
+  assert.match(shown, /textbox "Number" \[payment card\] \[ref=e\d+\]$/m);
+  assert.match(shown, /textbox "Name on card" \[ref=e\d+\]: Ada Lovelace/);
+  // Not described (past a cap, or gone mid-read): its name alone can't tell, so what's in it stays out.
+  const unread = renderSnapshot(page, new RefTable(), { fields: new Map(), frames }).text;
+  assert.match(unread, /textbox "Number" \[value not shown\] \[ref=e\d+\]$/m);
+  assert.doesNotMatch(unread, /4242|Ada/);
+  assert.match(unread, /textbox "Field 0" \[ref=e\d+\]$/m, "an empty field has nothing to hide");
 });
 
 test("agent browser windows open where they were, on a screen that still shows them", () => {

@@ -41,6 +41,44 @@ export const CANVAS_LINK_MESSAGE = "wisp-canvas:open-link";
 export const CANVAS_LINK_SCHEMES: readonly string[] = ["http:", "https:", "mailto:", "tel:"];
 /** How long after a click or key press a canvas may open a link. */
 export const CANVAS_GESTURE_MS = 1_000;
+/**
+ * How often a canvas's link requests are looked at, on the page and again in main: a canvas posting
+ * them in a loop would otherwise re-render the stage and call main for each one. Any more are
+ * dropped unread; a click opens one link anyway.
+ */
+export const CANVAS_LINK_INTERVAL_MS = 500;
+/** How often main logs the links it refused: once, then a count at most once a minute. */
+export const CANVAS_REFUSAL_LOG_MS = 60_000;
+
+/** A rate limit: true for the first call, then for at most one call per interval (a clock that went back starts over). */
+export function rateLimit(intervalMs: number): (nowMs?: number) => boolean {
+  let last = Number.NEGATIVE_INFINITY;
+  return (nowMs = Date.now()) => {
+    if (nowMs >= last && nowMs - last < intervalMs) return false;
+    last = nowMs;
+    return true;
+  };
+}
+
+/** main's log of the links canvases asked for and it didn't open: the first refusal, then how many more, at most once per interval. */
+export class CanvasRefusalLog {
+  private loggedAtMs = Number.NEGATIVE_INFINITY;
+  private unlogged = 0;
+
+  constructor(private readonly intervalMs = CANVAS_REFUSAL_LOG_MS) {}
+
+  /** The line to log for this refusal, or null when one was logged within the interval. */
+  note(reason: string, nowMs = Date.now()): string | null {
+    if (nowMs >= this.loggedAtMs && nowMs - this.loggedAtMs < this.intervalMs) {
+      this.unlogged++;
+      return null;
+    }
+    const more = this.unlogged;
+    this.loggedAtMs = nowMs;
+    this.unlogged = 0;
+    return `[canvas] a link wasn't opened (${reason})${more > 0 ? `; ${more} more refused since the last line` : ""}`;
+  }
+}
 
 export type CanvasTheme = "light" | "dark";
 

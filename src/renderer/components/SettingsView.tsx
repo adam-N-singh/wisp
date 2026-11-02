@@ -913,11 +913,14 @@ function McpServerRow({ server }: { server: McpServerSummary }) {
       <div className="mcp-server__head">
         <span className={`status-dot status-dot--${server.status}`} />
         <span className="mcp-server__name">{serverLabel(server)}</span>
-        <span className="muted">{server.status === "connected" ? `${server.toolCount} tools${server.disabledToolCount > 0 ? `, ${server.disabledToolCount} off` : ""}` : MCP_STATUS[server.status]}</span>
+        <span className="muted">
+          {server.pluginOff === true ? "Off: its plugin is turned off" : server.status === "connected" ? `${server.toolCount} tools${server.disabledToolCount > 0 ? `, ${server.disabledToolCount} off` : ""}` : MCP_STATUS[server.status]}
+        </span>
         <button type="button" className="button button--ghost button--small" onClick={() => openConnectApps({ appId: server.pluginId, serverId: server.id })}>
           Manage
         </button>
-        <Toggle checked={server.enabled} label={`Enable ${server.name}`} onChange={(value) => void gateway.setMcpServerEnabled({ serverId: server.id, enabled: value }).then(update)} />
+        {/* A turned-off plugin's server is off until the plugin is back on (Manage); its own switch waits. */}
+        <Toggle checked={server.enabled} disabled={server.pluginOff === true} label={`Enable ${server.name}`} onChange={(value) => void gateway.setMcpServerEnabled({ serverId: server.id, enabled: value }).then(update)} />
         {/* A marketplace plugin's server goes when the plugin is uninstalled (Manage). */}
         {server.pluginId?.includes("@") === true ? null : (
           <button type="button" className="icon-button" aria-label={`Remove ${server.name}`} onClick={() => void gateway.dropMcpServer({ serverId: server.id }).then(update)}>

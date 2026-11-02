@@ -7,15 +7,18 @@
 //     aren't kept. Without safeStorage nothing new is saved. Only a missing vault.json is an empty
 //     vault: one that can't be read is never written over (`problem()` says why).
 //   - `VaultAudit` appends each fill (and each change to the vault) to `vault-audit.jsonl`, a hash
-//     chain with no values in it: each line carries the hash of the one before.
+//     chain with no values in it: each line carries the hash of the one before, and the last line's
+//     seq and hash are sealed in `vault-audit.jsonl.head`, so a log cut short, emptied, deleted or
+//     rewritten doesn't check out. A line cut short as the app stopped is dropped (and logged).
 //   - `VaultFiller` answers the daemon's vault tools (src/local-exec/vault-tools.ts). It reads the
 //     page's real origin from the agent browser, refuses a login on another site, checks every field
 //     (a password only into a password field, nothing into a card field or another frame), and fills
-//     only on an approval the user gave in the app on this PC for that item on that site, spent once.
+//     only on an approval the user gave in the app on this PC for that item on that site, in that
+//     tab and document, into the fields as the card showed them, spent once.
 //     Values go from here to the page (src/main/agent-browser.ts), never to the daemon, the box, the
 //     transcript or the model: results say "Filled 2 fields on shop.example".
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, truncateSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type BrowserTarget, sensitiveField, siteLabel, siteOf } from "../shared/agent-browser";
 import {
@@ -40,6 +43,7 @@ import {
   type VaultListReply,
   type VaultPlanInfo,
   vaultSiteMatches,
+  VAULT_MAX_VALUE,
 } from "../shared/vault";
 import { describeTarget } from "../local-exec/browser-policy";
 import { scrubValues } from "./agent-browser-mask";
@@ -77,7 +81,7 @@ export interface VaultItemInput {
 }
 
 const MAX_ITEMS = 5_000;
-const MAX_VALUE = 4_000;
+const MAX_VALUE = VAULT_MAX_VALUE;
 
 export class VaultError extends Error {}
 
@@ -214,7 +218,7 @@ export class Vault {
   async importLogins(parsed: ParsedExport): Promise<VaultImportResult> {
     this.readable();
     if (!this.available()) throw new VaultError("This computer's secure storage isn't available, so the vault can't keep anything new.");
-    const result: VaultImportResult = { format: parsed.format, added: 0, updated: 0, unchanged: 0, skipped: parsed.skipped, notesDropped: 0 };
+    const result: VaultImportResult = { format: parsed.format, added: 0, updated: 0, unchanged: 0, skipped: parsed.skipped, tooLong: parsed.tooLong, notesDropped: parsed.notesTooLong };
     const now = Date.now();
     for (const login of parsed.logins) {
       const notes = containsPaymentCard(login.notes) ? "" : login.notes;
@@ -297,7 +301,7 @@ const newId = () => `v${randomBytes(6).toString("hex")}`;
 
 // ---- the audit log ----------------------------------------------------------------------------
 
-export type VaultAuditEvent = "fill" | "fill-refused" | "added" | "edited" | "deleted" | "imported";
+export type VaultAuditEvent = "fill" | "fill-refused" | "added" | "edited" | "deleted" | "imported" | "recovered";
 
 export interface VaultAuditEntry {
   event: VaultAuditEvent;
@@ -305,6 +309,8 @@ export interface VaultAuditEntry {
   label?: string;
   site?: string;
   fields?: string[];
+  /** Fields whose value was sent but whose fill didn't finish: they may hold it. */
+  maybe?: string[];
   agentId?: string;
   count?: number;
   reason?: string;
@@ -313,6 +319,8 @@ export interface VaultAuditEntry {
 export interface VaultAuditRecord extends VaultAuditEntry {
   seq: number;
   at: string;
+  /** Written while a sealed head was kept: the head's absence means it was deleted. */
+  sealed?: true;
   prev: string;
   hash: string;
 }
@@ -340,29 +348,132 @@ export function verifyAuditChain(text: string): { ok: boolean; records: VaultAud
   return { ok: true, records, brokenAt: null };
 }
 
+/** What `VaultAudit` says about its log against the sealed head: null when they agree. */
+export function auditHeadProblem(records: VaultAuditRecord[], head: { seq: number; hash: string } | "missing" | "unreadable"): string | null {
+  const last = records[records.length - 1];
+  if (head === "unreadable") return "The log's sealed head can't be read (it was changed, or saved under another account), so its latest entries can't be checked.";
+  if (head === "missing") return last?.sealed === true ? "The log's sealed head is missing (it was deleted outside the app), so its latest entries can't be checked." : null;
+  if (last == null) return head.seq > 0 ? `The log is gone or empty, though it had ${head.seq} ${head.seq === 1 ? "entry" : "entries"}: it was deleted or emptied outside the app.` : null;
+  if (last.seq < head.seq) {
+    const gone = head.seq - last.seq;
+    return `The log's last ${gone === 1 ? "entry was" : `${gone} entries were`} removed outside the app (it had ${head.seq}).`;
+  }
+  const at = records.find((record) => record.seq === head.seq);
+  if (at == null || at.hash !== head.hash) return "The log was rewritten outside the app: its entries don't lead to the head the app sealed.";
+  // The app seals the head right after each line, so at most one line (the app stopping in between) is past it.
+  if (last.seq > head.seq + 1) return `Entries were added to the log outside the app after entry ${head.seq + 1}.`;
+  return null;
+}
+
+/**
+ * The audit log: lines chained by their hashes, and a head (the last line's seq and hash) sealed
+ * with safeStorage in `<log>.head`, so a log cut short, emptied, deleted or rewritten from the start
+ * doesn't check out. A line the app was writing when it stopped (cut short, without its newline)
+ * is dropped when the log is opened, and the drop is logged.
+ */
 export class VaultAudit {
   private last: { seq: number; hash: string } | null = null;
+  private readonly headFile: string;
 
-  constructor(readonly file: string) {}
+  constructor(
+    readonly file: string,
+    private readonly sealer: Sealer | null = null,
+  ) {
+    this.headFile = `${file}.head`;
+    this.open();
+  }
 
   append(entry: VaultAuditEntry): VaultAuditRecord {
     const last = this.last ?? this.tail();
-    const body = { seq: last.seq + 1, at: new Date().toISOString(), ...entry, prev: last.hash };
+    const sealing = this.canSeal();
+    const body = { seq: last.seq + 1, at: new Date().toISOString(), ...entry, ...(sealing ? { sealed: true as const } : {}), prev: last.hash };
     const hash = sha256(JSON.stringify(body));
     mkdirSync(dirname(this.file), { recursive: true });
     appendFileSync(this.file, `${JSON.stringify({ ...body, hash })}\n`, { mode: 0o600 });
     this.last = { seq: body.seq, hash };
+    if (sealing) this.writeHead(this.last);
     return { ...body, hash };
   }
 
   view(limit = 10): VaultAuditView {
-    const { ok, records, brokenAt } = verifyAuditChain(this.read());
+    const { ok: chained, records, brokenAt } = verifyAuditChain(this.read());
+    const sealing = this.canSeal();
+    const problem = !chained ? `The log's hash chain breaks at line ${brokenAt}: it was changed outside the app.` : sealing ? auditHeadProblem(records, this.readHead()) : null;
     const recent = records
       .filter((record) => record.event === "fill")
       .slice(-limit)
       .reverse()
-      .map((record) => ({ at: record.at, label: record.label ?? "", site: record.site ?? "", fields: record.fields ?? [], agentId: record.agentId ?? "" }));
-    return { ok, entries: ok ? records.length : (brokenAt ?? 1) - 1, brokenAt, recent };
+      .map((record) => ({ at: record.at, label: record.label ?? "", site: record.site ?? "", fields: record.fields ?? [], maybe: record.maybe ?? [], agentId: record.agentId ?? "" }));
+    return { ok: problem == null, entries: records.length, brokenAt, problem, unsealed: !sealing, recent };
+  }
+
+  /** Drops a line cut short as the app stopped, and seals the head of a log from before heads were kept. */
+  private open(): void {
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(this.file);
+    } catch {
+      return;
+    }
+    if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) {
+      const end = bytes.lastIndexOf(0x0a) + 1;
+      const rest = bytes.subarray(end).toString("utf8");
+      let complete = false;
+      try {
+        const record = JSON.parse(rest) as VaultAuditRecord;
+        complete = typeof record.hash === "string" && Number.isInteger(record.seq);
+      } catch {
+        complete = false;
+      }
+      if (complete) appendFileSync(this.file, "\n");
+      else {
+        truncateSync(this.file, end);
+        this.append({ event: "recovered", reason: "a line the app was writing when it stopped was cut short, and was dropped" });
+      }
+    }
+    // A log from before heads were kept is taken as it is, once.
+    if (this.canSeal() && this.readHead() === "missing") {
+      const { ok, records } = verifyAuditChain(this.read());
+      const last = records[records.length - 1];
+      if (ok && last != null && last.sealed !== true) this.writeHead({ seq: last.seq, hash: last.hash });
+    }
+  }
+
+  private canSeal(): boolean {
+    try {
+      return this.sealer != null && this.sealer.isEncryptionAvailable() && this.sealer.getSelectedStorageBackend?.() !== "basic_text";
+    } catch {
+      return false;
+    }
+  }
+
+  private readHead(): { seq: number; hash: string } | "missing" | "unreadable" {
+    let text: string;
+    try {
+      text = readFileSync(this.headFile, "utf8");
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
+    }
+    try {
+      const stored = JSON.parse(text) as { version?: number; sealed?: string };
+      const head = JSON.parse(this.sealer!.decryptString(Buffer.from(String(stored.sealed), "base64"))) as { seq?: unknown; hash?: unknown };
+      if (stored.version === 1 && Number.isInteger(head.seq) && typeof head.hash === "string") return { seq: head.seq as number, hash: head.hash };
+    } catch {
+      // changed, or sealed under another account
+    }
+    return "unreadable";
+  }
+
+  /** Written next to the log and renamed over the old head, so a reader never sees half of one. */
+  private writeHead(head: { seq: number; hash: string }): void {
+    try {
+      const sealed = this.sealer!.encryptString(JSON.stringify(head)).toString("base64");
+      const temp = `${this.headFile}.${randomBytes(4).toString("hex")}`;
+      writeFileSync(temp, JSON.stringify({ version: 1, sealed }), { mode: 0o600 });
+      renameSync(temp, this.headFile);
+    } catch {
+      // Not sealed this time: the head lags, and the next line seals it again.
+    }
   }
 
   private read(): string {
@@ -396,22 +507,48 @@ export interface VaultField extends BrowserTarget {
   inPage: boolean;
   /** Its document's origin. */
   origin: string;
+  /** The element (the renderer's backend node id), and the tab and document it was found in. */
+  node: number;
+  tab: number;
+  document: number;
 }
 
 export interface VaultFill {
   ref: string;
+  /** The element the ref named when the user allowed the fill: the ref must still name it. */
+  node: number;
   value: string;
   /** A password: only into a password field. */
   password: boolean;
 }
 
+/** What a fill did, by ref: the browser waits for the field it's on before it answers, even when interrupted. */
+export interface VaultFillResult {
+  /** Fields the value went into. */
+  filled: string[];
+  /** Dropdowns with no option that's the value: left as they were. */
+  skipped: string[];
+  /** A field whose value was sent but whose fill didn't finish (the page didn't answer): it may hold the value. */
+  uncertain: string[];
+  submitted: boolean;
+  navigated: boolean;
+  error: string | null;
+}
+
 /** What the vault needs from the agent browser (src/main/agent-browser.ts implements it). */
 export interface VaultBrowser {
-  /** The agent's current page as the DevTools protocol reports it; site is null unless it's an http(s) page whose origins agree. */
-  page(agentId: string): Promise<{ url: string; site: string | null } | null>;
+  /**
+   * The agent's current page as the DevTools protocol reports it, with its tab and that tab's
+   * document count; site is null unless it's an http(s) page whose origins agree.
+   */
+  page(agentId: string): Promise<{ url: string; site: string | null; tab: number; document: number } | null>;
   fields(agentId: string, refs: string[]): Promise<Map<string, VaultField>>;
-  /** Fills in the page, in the agent's turn; `stillOn` re-checks the page before each field. Never throws after a field is filled. */
-  fill(agentId: string, fills: VaultFill[], options: { site: string; submit: boolean; callId: string; stillOn(url: string): boolean }): Promise<{ filled: number; submitted: boolean; navigated: boolean; error: string | null }>;
+  /**
+   * Fills in the page, in the agent's turn, only in `tab` while it's the current tab and still on
+   * `document`, and only where each ref still names its `node`; `stillOn` re-checks the page before
+   * each field. Never throws after a field is filled.
+   */
+  fill(agentId: string, fills: VaultFill[], options: { site: string; tab: number; document: number; submit: boolean; callId: string; stillOn(url: string): boolean }): Promise<VaultFillResult>;
   /** Text from the page with the vault values the agent's window holds blanked. */
   scrub(agentId: string, text: string): string;
 }
@@ -497,9 +634,12 @@ export class VaultFiller {
     const own = Object.values(this.deps.vault.reveal(item.id, item.fields));
     const describe = (field: VaultField) => this.deps.browser.scrub(call.agentId, scrubValues(describeTarget(field), own));
     const fields: VaultPlanInfo["fields"] = [];
+    const kinds: string[][] = [];
     for (const [key, ref] of wanted) {
       const field = found.get(ref);
       if (field == null) throw new VaultError(`${ref} isn't a ref on this page. Take a snapshot (browser_snapshot) first.`);
+      // Read from another tab or page than the one checked above (the user switched tabs, the page moved on).
+      if (field.tab !== page.tab || field.document !== page.document) throw new VaultError("The agent browser's page changed while the fill was being checked, so nothing was filled. Take a snapshot and try again.");
       const what = `${ref} (${describe(field)})`;
       // A frame's field isn't the page's own, even a frame from the page's origin (another document, another address).
       if (!field.inPage) throw new VaultError(`${what} is inside a frame, and the vault fills only the page's own fields, so nothing is filled into it.`);
@@ -510,9 +650,11 @@ export class VaultFiller {
       if (key === "password" && !passwordField(field)) throw new VaultError(`${what} isn't a password field; a password only fills into one.`);
       if (key !== "password" && passwordField(field)) throw new VaultError(`${what} is a password field; only a login's password fills into one.`);
       if (field.tag === "select" && item.kind === "login") throw new VaultError(`${what} is a dropdown; a login fills text fields.`);
-      fields.push({ key: key as VaultFillKey, ref, element: describe(field), secret: key === "password" });
+      fields.push({ key: key as VaultFillKey, ref, node: field.node, element: describe(field), secret: key === "password" });
+      kinds.push([field.tag, field.inputType, field.autocomplete, field.fieldName]);
     }
-    return { itemId: item.id, kind: item.kind, label, site: page.site, subject: `vault:${call.agentId}/${item.id}@${page.site}`, fields, submit: call.submit };
+    const subject = `vault:${call.agentId}/${item.id}@${page.site}#${vaultBinding(page, fields, kinds, call.submit)}`;
+    return { itemId: item.id, kind: item.kind, label, site: page.site, tab: page.tab, document: page.document, subject, fields, submit: call.submit };
   }
 
   /** request_credential, once the user allowed it on this PC: checks everything again, then fills. */
@@ -521,27 +663,54 @@ export class VaultFiller {
     if (call.expectSite == null || plan.site !== call.expectSite) {
       throw new VaultError(`The page is on ${siteLabel(plan.site)} now, not ${siteLabel(call.expectSite)} as when you were asked, so nothing was filled.`);
     }
-    if (call.approvalId == null || !this.deps.spendApproval(call.approvalId, plan.subject)) throw new VaultError("This fill wasn't allowed in the app on this computer, so nothing was filled.");
+    // The subject names the tab, its document and each field as the card showed them, so this also
+    // refuses a fill whose refs name other elements now, or that the user switched tabs under.
+    if (call.approvalId == null || !this.deps.spendApproval(call.approvalId, plan.subject)) {
+      throw new VaultError("This fill wasn't allowed in the app on this computer for this page and these fields (the page or its fields may have changed since you were asked), so nothing was filled.");
+    }
 
     const item = this.deps.vault.get(plan.itemId)!;
     const stored = this.deps.vault.reveal(item.id, [...new Set(plan.fields.map((field) => sourceField(field.key)))]);
     const fills: VaultFill[] = [];
-    const keys: string[] = [];
+    const keyOf = new Map<string, string>();
     for (const field of plan.fields) {
       const value = item.kind === "login" ? (stored[field.key] ?? "") : contactFillValue(stored, field.key);
       if (value.length === 0) continue;
-      fills.push({ ref: field.ref, value, password: field.secret });
-      keys.push(field.key);
+      fills.push({ ref: field.ref, node: field.node, value, password: field.secret });
+      keyOf.set(field.ref, field.key);
     }
     if (fills.length === 0) throw new VaultError(`${plan.label} has nothing to put in those fields.`);
     const stillOn = (url: string) => siteOf(url) === plan.site && (item.site == null || vaultSiteMatches(item.site, url));
-    const result = await this.deps.browser.fill(call.agentId, fills, { site: plan.site, submit: plan.submit, callId: call.callId, stillOn });
-    const filledKeys = keys.slice(0, result.filled);
-    if (result.filled > 0) this.deps.audit.append({ event: "fill", itemId: item.id, label: plan.label, site: plan.site, fields: filledKeys, agentId: call.agentId });
-    const site = siteLabel(plan.site);
-    const count = `${result.filled} field${result.filled === 1 ? "" : "s"}`;
-    if (result.error != null) return { output: result.filled > 0 ? `Filled ${count} on ${site} (${filledKeys.join(", ")}), then stopped: ${result.error}` : `Nothing was filled: ${result.error}` };
-    const submitted = result.submitted ? (result.navigated ? " and pressed Enter; the page changed" : " and pressed Enter") : "";
-    return { output: `Filled ${count} on ${site} (${filledKeys.join(", ")}) from ${plan.label}${submitted}. You don't see the values: snapshots show these fields as filled from the vault, and screenshots cover them. Take a snapshot to see the page.` };
+    const result = await this.deps.browser.fill(call.agentId, fills, { site: plan.site, tab: plan.tab, document: plan.document, submit: plan.submit, callId: call.callId, stillOn });
+    return { output: this.report(call.agentId, plan, result, keyOf) };
   }
+
+  /** Writes what the fill did to the audit log (also a field it may have filled) and says it, value-free, by fill key. */
+  private report(agentId: string, plan: VaultPlanInfo, result: VaultFillResult, keyOf: Map<string, string>): string {
+    const keys = (refs: string[]) => refs.map((ref) => keyOf.get(ref) ?? ref);
+    const filled = keys(result.filled);
+    const uncertain = keys(result.uncertain);
+    const skipped = keys(result.skipped);
+    if (filled.length > 0 || uncertain.length > 0) {
+      this.deps.audit.append({ event: "fill", itemId: plan.itemId, label: plan.label, site: plan.site, fields: filled, ...(uncertain.length > 0 ? { maybe: uncertain } : {}), agentId });
+    }
+    const site = siteLabel(plan.site);
+    const count = `${filled.length} field${filled.length === 1 ? "" : "s"}`;
+    const notes = [
+      ...(skipped.length > 0 ? [`${skipped.join(", ")} ${skipped.length === 1 ? "was" : "were"} left as ${skipped.length === 1 ? "it was" : "they were"}: no option in the dropdown is the saved value`] : []),
+      ...(uncertain.length > 0 ? [`${uncertain.join(", ")} may hold the value: the page didn't answer while it was filled`] : []),
+    ];
+    const extra = notes.length > 0 ? ` ${notes.map((note) => `${note[0].toUpperCase()}${note.slice(1)}.`).join(" ")}` : "";
+    if (result.error != null) return filled.length > 0 ? `Filled ${count} on ${site} (${filled.join(", ")}), then stopped: ${result.error}${extra}` : `Nothing was filled: ${result.error}${extra}`;
+    if (filled.length === 0) return `Nothing was filled on ${site}.${extra}`;
+    const submitted = result.submitted ? (result.navigated ? " and pressed Enter; the page changed" : " and pressed Enter") : "";
+    return `Filled ${count} on ${site} (${filled.join(", ")}) from ${plan.label}${submitted}.${extra} You don't see the values: snapshots show these fields as filled from the vault, and screenshots cover them. Take a snapshot to see the page.`;
+  }
+}
+
+/** The part of a fill's approval subject that names its tab, document and fields as the card showed them. */
+function vaultBinding(page: { tab: number; document: number }, fields: VaultPlanInfo["fields"], kinds: string[][], submit: boolean): string {
+  const described = fields.map((field, index) => [field.key, field.ref, field.node, field.element, field.secret, ...kinds[index]]);
+  const digest = createHash("sha256").update(JSON.stringify({ tab: page.tab, document: page.document, submit, fields: described })).digest("hex").slice(0, 24);
+  return `t${page.tab}.d${page.document}.${digest}`;
 }

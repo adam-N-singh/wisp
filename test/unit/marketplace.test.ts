@@ -724,7 +724,11 @@ test("box gateway: a plugin turned off stops its server and hides its skills, ke
   );
   const off = (await entry()).plugin!.installed!;
   assert.deepEqual([off.enabled, off.values, off.configuredKeys.sort(), off.serverIds], [false, { greeting: "Hi there" }, ["greeting", "token"], [serverId]]);
-  assert.equal((await server())?.enabled, true, "its server’s own switch is left as it was");
+  // Clients see its server as off because its plugin is (Settings shows its switch off and locked, no sign-in);
+  // its own switch is left as it was, and can't be flipped meanwhile.
+  assert.deepEqual([(await server())?.enabled, (await server())?.pluginOff], [false, true]);
+  assert.equal((JSON.parse(readFileSync(join(dataDir, "mcp.json"), "utf8")) as { servers: Array<{ id: string; enabled: boolean }> }).servers.find((config) => config.id === serverId)?.enabled, true);
+  await refused("setMcpServerEnabled", { serverId, enabled: true }, 409, /plugin echo, which is turned off/);
   await api("setMcpPluginEnabled", { pluginId: "echo@acme-tools", enabled: false });
 
   // Still off after a restart: its server doesn't start.
@@ -740,6 +744,7 @@ test("box gateway: a plugin turned off stops its server and hides its skills, ke
   // Back on: the same server with its values and settings, and the skills again.
   await api("setMcpPluginEnabled", { pluginId: "echo@acme-tools", enabled: true });
   await until(async () => (await server())?.status === "connected");
+  assert.deepEqual([(await server())?.enabled, (await server())?.pluginOff], [true, undefined]);
   assert.deepEqual(
     (await api<McpServerTool[]>("mcpServerTools", { serverId })).map((tool) => [tool.name, tool.description, tool.isDisabled]),
     [["hello", "Hi there", true]],
@@ -984,4 +989,40 @@ test("box gateway: /<plugin>:<skill> runs the plugin's skill exactly, and an age
   // Both runs answered before the box closes.
   await until(async () => (await api<{ entries: TranscriptEntry[] }>("readTranscriptEnd", { id: agent.id, limit: 30 })).entries.filter((item) => item.kind === "message" && item.role === "assistant" && !item.isStreaming).length >= 2);
   await until(async () => !(await api<AgentSummary[]>("rosterAgents", {})).some((row) => row.id === agent.id && row.isRunning));
+});
+
+test("box gateway: the daily check marks a change to a plugin's servers alone, at the same commit", async () => {
+  const github = await fakeGithub();
+  // A plugin in a repository of its own, with no plugin.json: its marketplace entry declares its server.
+  const kits = (header: string) => ({
+    ".claude-plugin/marketplace.json": JSON.stringify({
+      name: "kits",
+      owner: { name: "K" },
+      plugins: [{ name: "remote", source: { source: "github", repo: "acme/remote-kit" }, mcpServers: { lookup: { type: "http", url: `${github.base}/mcp`, headers: { "X-Kit": header } } } }],
+    }),
+  });
+  github.push("acme/kits", kits("one"));
+  const remoteCommit = github.push("acme/remote-kit", { "skills/far/SKILL.md": SKILL("far", "Use from afar.", "FAR.") });
+  let now = Date.now();
+  const box = await bootBox(tempDir(), github.base, { marketplaceClock: () => now });
+  const { api } = client(() => box);
+  await api("addMarketplace", { source: "acme/kits" });
+  await api("refreshMarketplace", { id: "kits", plugin: "remote" });
+  const plugin = async () => (await api<McpCatalogEntry[]>("readAppCatalog", {})).find((candidate) => candidate.id === "remote@kits")!.plugin!;
+  await api("connectCatalogApp", { entryId: "remote@kits", approvalKey: (await plugin()).approvalKey });
+  const view = async () => (await api<MarketplaceView[]>("readMarketplaces", {})).find((candidate) => candidate.id === "kits")!;
+
+  // The marketplace changes the server's header; the plugin's repository doesn't move.
+  github.push("acme/kits", kits("two"));
+  now += 24 * 3600_000 + 60_000;
+  await box.checkPluginUpdates();
+  const found = (await plugin()).installed!;
+  assert.deepEqual([found.commit, found.updateFound?.commit, found.updateFound?.serversChanged, found.updateAvailable], [remoteCommit, remoteCommit, true, false], "marked, though its commit is the one installed");
+  assert.equal((await view()).foundUpdateCount, 1);
+
+  // Refresh reads it as an update that asks again, since what it reaches changed; the mark goes.
+  await api("refreshMarketplace", { id: "kits" });
+  const read = await plugin();
+  assert.deepEqual([read.installed!.updateAvailable, read.installed!.serversChanged, read.installed!.updateFound, (await view()).foundUpdateCount], [true, true, null, 0]);
+  assert.ok(read.servers[0].transport === "http" && read.servers[0].headers["X-Kit"] === "two");
 });

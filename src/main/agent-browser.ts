@@ -62,7 +62,7 @@ import { ipcServerTransport } from "../shared/rpc/transports";
 import { type AgentBrowserState, agentBrowserToolbarEdge, type AgentBrowserToolbarView } from "../shared/edges";
 import { type AgentBrowserBounds, placeWindow } from "./agent-browser-bounds";
 import { coverRegions, holdsValue, quadRegion, type Region, scaleRegion, type ScreenScan, scrubClipboard, scrubValues, valueRegions } from "./agent-browser-mask";
-import { type AXNode, type FieldInfo, type FrameContent, needsFieldInfo, RefTable, renderSnapshot } from "./agent-browser-snapshot";
+import { type AXNode, type FieldInfo, fieldsToDescribe, type FrameContent, RefTable, renderSnapshot } from "./agent-browser-snapshot";
 import { forgetFrameWorld, inWorld } from "./agent-browser-worlds";
 import { fillable, type VaultBrowser, type VaultField, type VaultFill } from "./vault";
 
@@ -75,6 +75,8 @@ const DOWNLOAD_LIMIT = 1024 ** 3;
 const LOAD_TIMEOUT_MS = 30_000;
 const CDP_TIMEOUT_MS = 15_000;
 const WORLD = "wisp-agent-browser";
+/** How many fields' DOM details a snapshot asks for at a time. */
+const FIELD_BATCH = 100;
 /** How many same-origin frames a snapshot reads, and how deep in frames within frames. */
 const MAX_FRAMES = 20;
 const MAX_FRAME_DEPTH = 3;
@@ -443,17 +445,21 @@ export class AgentBrowsers {
       page: async (agentId) => {
         const win = this.windows.get(agentId);
         const tab = win != null ? this.activeTab(win) : null;
-        return tab != null ? await this.realPage(tab) : null;
+        if (tab == null) return null;
+        const document = tab.documents;
+        const page = await this.realPage(tab);
+        return { ...page, tab: tab.id, document };
       },
       fields: async (agentId, refs) => {
         const win = this.windows.get(agentId);
         const tab = win != null ? this.activeTab(win) : null;
         const found = new Map<string, VaultField>();
         if (win == null || tab == null) return found;
+        const document = tab.documents;
         for (const ref of refs) {
           if (tab.refs.get(ref) == null) continue;
           const backendNodeId = this.backendId(tab, ref);
-          const field = { ...(await this.describe(tab, ref)), ...(await this.fieldHome(tab, backendNodeId)) };
+          const field = { ...(await this.describe(tab, ref)), ...(await this.fieldHome(tab, backendNodeId)), node: backendNodeId, tab: tab.id, document };
           // A field's label is the page's, and goes on the card: a page repeating a value doesn't put it there.
           found.set(ref, { ...field, name: scrubValues(field.name, win.vaultValues), href: scrubValues(field.href, win.vaultValues) });
         }
@@ -484,29 +490,37 @@ export class AgentBrowsers {
     return { inPage: home?.inPage === true, origin: String(home?.origin ?? "") };
   }
 
-  private async fillFromVault(agentId: string, fills: VaultFill[], options: { site: string; submit: boolean; callId: string; stillOn(url: string): boolean }): ReturnType<VaultBrowser["fill"]> {
+  /**
+   * Fills from the vault in the tab and document the user allowed, into the elements the refs named
+   * then. An interruption stops it before the next field (and before Enter), and the answer waits
+   * for the field it was on, so what it reports, and the vault logs, is what the page holds.
+   */
+  private async fillFromVault(agentId: string, fills: VaultFill[], options: { site: string; tab: number; document: number; submit: boolean; callId: string; stillOn(url: string): boolean }): ReturnType<VaultBrowser["fill"]> {
+    const result: Awaited<ReturnType<VaultBrowser["fill"]>> = { filled: [], skipped: [], uncertain: [], submitted: false, navigated: false, error: null };
     const win = this.windows.get(agentId);
-    if (win == null) return { filled: 0, submitted: false, navigated: false, error: "the agent has no browser open." };
-    let interrupt!: (error: Error) => void;
-    const interrupted = new Promise<never>((_resolve, reject) => (interrupt = reject));
-    interrupted.catch(() => undefined);
-    const token: Call = { cancelled: false, wake: null, interrupt };
+    if (win == null) return { ...result, error: "the agent has no browser open." };
+    // Not raced against the interruption: the field being filled when it comes is waited for.
+    const token: Call = { cancelled: false, wake: null, interrupt: () => undefined };
     this.calls.set(options.callId, token);
-    let filled = 0;
-    let submitted = false;
-    let navigated = false;
     const task = win.queue.then(async () => {
       await this.agentTurn(win, token);
-      const tab = this.requireTab(win);
-      const documents = tab.documents;
+      const tab = win.tabs.find((candidate) => candidate.id === options.tab);
+      const stillThere = () => {
+        if (tab == null || win.activeId !== tab.id) throw new BrowserError("the agent browser's current tab isn't the one you were asked about any more.");
+        if (tab.documents !== options.document) throw new BrowserError(`the page moved on since you were asked (it isn't the same page of ${siteLabel(options.site)} any more).`);
+        return tab;
+      };
       let last: number | null = null;
       for (const fill of fills) {
+        if (token.cancelled) throw new BrowserError("interrupted");
         // Each field is checked again just before its value goes in: the page may have moved on.
-        const page = await this.realPage(tab);
-        if (tab.documents !== documents || page.site !== options.site || !options.stillOn(page.url)) throw new BrowserError(`the page isn't on ${siteLabel(options.site)} any more.`);
-        const backendNodeId = this.backendId(tab, fill.ref);
-        const target = await this.inspect(tab, backendNodeId);
-        const home = await this.fieldHome(tab, backendNodeId);
+        const current = stillThere();
+        const page = await this.realPage(current);
+        if (current.documents !== options.document || page.site !== options.site || !options.stillOn(page.url)) throw new BrowserError(`the page isn't on ${siteLabel(options.site)} any more.`);
+        if (current.refs.get(fill.ref)?.backendNodeId !== fill.node) throw new BrowserError(`${fill.ref} names another element now than when you were asked.`);
+        const backendNodeId = fill.node;
+        const target = await this.inspect(current, backendNodeId);
+        const home = await this.fieldHome(current, backendNodeId);
         if (!home.inPage || home.origin !== options.site) throw new BrowserError(`${fill.ref} is in a frame from another site now.`);
         const password = target.inputType === "password" || /\b(current|new)-password\b/.test(target.autocomplete);
         const secret = sensitiveField(target);
@@ -514,37 +528,48 @@ export class AgentBrowsers {
           throw new BrowserError(`${fill.ref} isn't the kind of field it was when you were asked.`);
         }
         if (token.cancelled) throw new BrowserError("interrupted");
+        stillThere();
         // Marked before the value goes in, and left marked if the call fails: a value that landed
         // while the protocol's answer timed out stays masked.
-        tab.filled.add(backendNodeId);
+        current.filled.add(backendNodeId);
         win.vaultValues.add(fill.value);
-        if (target.tag === "select") {
-          if ((await this.callOn(tab, backendNodeId, CHOOSE_EXACT, [fill.value])) !== true) {
-            // No option is the value: the dropdown didn't change.
-            tab.filled.delete(backendNodeId);
-            continue;
+        try {
+          if (target.tag === "select") {
+            if ((await this.callOn(current, backendNodeId, CHOOSE_EXACT, [fill.value])) !== true) {
+              // No option is the value: the dropdown didn't change.
+              current.filled.delete(backendNodeId);
+              result.skipped.push(fill.ref);
+              continue;
+            }
+          } else {
+            await this.replaceText(current, backendNodeId, fill.value);
           }
-        } else {
-          await this.replaceText(tab, backendNodeId, fill.value);
+        } catch (error) {
+          // The value was on its way: the field may hold it (the audit says so).
+          result.uncertain.push(fill.ref);
+          throw error;
         }
         last = backendNodeId;
-        filled++;
+        result.filled.push(fill.ref);
       }
       if (options.submit && last != null) {
-        await this.cdp(tab, "DOM.focus", { backendNodeId: last });
-        await this.press(tab, parseKeyChord("Enter")!);
-        submitted = true;
-        await this.settle(tab);
-        navigated = tab.documents !== documents;
+        // Not after an interruption the agent has been told about, nor on a page that moved on.
+        if (token.cancelled) throw new BrowserError("interrupted, so Enter wasn't pressed");
+        const current = stillThere();
+        await this.cdp(current, "DOM.focus", { backendNodeId: last });
+        await this.press(current, parseKeyChord("Enter")!);
+        result.submitted = true;
+        await this.settle(current);
+        result.navigated = current.documents !== options.document;
       }
     });
     win.queue = task.catch(() => undefined);
     try {
-      await Promise.race([task, interrupted]);
-      return { filled, submitted, navigated, error: null };
+      await task;
+      return result;
     } catch (error) {
       const message = error instanceof BrowserError ? error.message : "the page didn't take the value.";
-      return { filled, submitted, navigated, error: message === "interrupted" ? "interrupted." : message };
+      return { ...result, error: message.startsWith("interrupted") ? `${message}.` : message };
     } finally {
       this.calls.delete(options.callId);
     }
@@ -1047,18 +1072,30 @@ export class AgentBrowsers {
       const { nodes } = await this.cdp<{ nodes: AXNode[] }>(tab, "Accessibility.getFullAXTree");
       const frames = await this.readFrames(tab, nodes);
       const all = [...nodes, ...[...frames.values()].flatMap((content) => ("nodes" in content ? content.nodes : []))];
-      const fields = new Map<number, FieldInfo>();
-      const wanted = all.filter((node) => node.backendDOMNodeId != null && needsFieldInfo(String(node.role?.value ?? ""))).slice(0, 300);
-      await Promise.all(
-        wanted.map(async (node) => {
-          const described = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tab, "DOM.describeNode", { backendNodeId: node.backendDOMNodeId }).catch(() => null);
-          if (described != null) fields.set(node.backendDOMNodeId!, fieldInfo(described.node));
-        }),
-      );
+      const fields = await this.fieldInfos(tab, all);
       body = renderSnapshot(nodes, tab.refs, { rootRef, pageUrl: page.url, fields, frames, filled: tab.filled }).text;
     }
     const notes = win.notes.splice(0);
     return [lead, ...notes, untrustedPage(page, body)].join("\n");
+  }
+
+  /**
+   * The DOM details (type, autocomplete, name) that tell a field holding a secret, by node, for the
+   * fields fieldsToDescribe picks in the page and its frames alike. A field that holds a value but is
+   * left without its details (past the cap, or gone mid-read) shows no value in the snapshot.
+   */
+  private async fieldInfos(tab: Tab, nodes: AXNode[]): Promise<Map<number, FieldInfo>> {
+    const fields = new Map<number, FieldInfo>();
+    const wanted = fieldsToDescribe(nodes);
+    for (let start = 0; start < wanted.length; start += FIELD_BATCH) {
+      await Promise.all(
+        wanted.slice(start, start + FIELD_BATCH).map(async (node) => {
+          const described = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tab, "DOM.describeNode", { backendNodeId: node.backendDOMNodeId }).catch(() => null);
+          if (described != null) fields.set(node.backendDOMNodeId!, fieldInfo(described.node));
+        }),
+      );
+    }
+    return fields;
   }
 
   /**

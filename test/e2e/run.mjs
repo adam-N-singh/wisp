@@ -230,10 +230,14 @@ try {
     await card.click();
     const stage = page.getByRole("region", { name: "Page: Counter" });
     await stage.getByText("Canvas · Revision 1 · Made by Wisp", { exact: false }).waitFor({ timeout: 10_000 });
+    // Clicked as soon as the button shows, a slow first run (a fresh build) can beat the canvas's own
+    // script to it, and the click does nothing: the stage marks the frame loaded once that has run.
+    await page.locator('iframe[title="Counter"]:not(.page-stage__canvas--loading)').waitFor({ timeout: 15_000 });
     const frame = page.frameLocator('iframe[title="Counter"]');
     await frame.getByRole("button", { name: "Add one" }).click({ timeout: 10_000 });
+    await frame.getByText("1 clicks so far").waitFor({ timeout: 10_000 });
     await frame.getByRole("button", { name: "Add one" }).click();
-    await frame.getByText("2 clicks so far").waitFor({ timeout: 5_000 });
+    await frame.getByText("2 clicks so far").waitFor({ timeout: 10_000 });
     assert.equal(await page.locator('iframe[title="Counter"]').getAttribute("sandbox"), "allow-scripts allow-pointer-lock");
     await page.screenshot({ path: join(shots, "05e-canvas-stage.png") });
     if (caught) {

@@ -13,6 +13,9 @@ export const VAULT_PERMISSION_ID = "vault";
 
 export type VaultItemKind = "login" | "contact";
 
+/** The longest value the vault keeps in a field, in characters (saving and importing alike). */
+export const VAULT_MAX_VALUE = 4_000;
+
 /** What a login keeps. The site is metadata (it decides where the login fills); the rest is sealed. */
 export const LOGIN_FIELDS = ["username", "password", "notes"] as const;
 /** What contact info keeps, all sealed. */
@@ -71,13 +74,17 @@ export interface VaultItemDraft {
 }
 
 export interface VaultAuditView {
-  /** The hash chain checks out from the first line to the last. */
+  /** The hash chain checks out from the first line to the last, and the last is the one the sealed head names. */
   ok: boolean;
   entries: number;
   /** The line where the chain breaks (1-based), when it does. */
   brokenAt: number | null;
-  /** The latest fills, newest first. */
-  recent: Array<{ at: string; label: string; site: string; fields: string[]; agentId: string }>;
+  /** What's wrong with the log, as Settings says it; null when it's intact. */
+  problem: string | null;
+  /** The log can't be checked against a sealed head (no secure storage on this PC), so lines cut off its end wouldn't show. */
+  unsealed: boolean;
+  /** The latest fills, newest first; `maybe` are fields whose fill didn't finish, which may hold the value. */
+  recent: Array<{ at: string; label: string; site: string; fields: string[]; maybe: string[]; agentId: string }>;
 }
 
 export interface VaultView {
@@ -95,7 +102,9 @@ export interface VaultImportResult {
   updated: number;
   unchanged: number;
   skipped: number;
-  /** Notes left out because they looked like a payment card number (cards aren't kept). */
+  /** Logins left out because a password or username was longer than the vault keeps (counted in `skipped` too). */
+  tooLong: number;
+  /** Notes left out because they looked like a payment card number (cards aren't kept) or were longer than the vault keeps. */
   notesDropped: number;
 }
 
@@ -113,10 +122,29 @@ export interface VaultPlanInfo {
   label: string;
   /** The page's real origin, read over the DevTools protocol. */
   site: string;
-  /** "vault:<agent>/<item>@<origin>": the approval names it, and main checks it before filling. */
+  /** The agent browser's tab the fill is for, and which of its documents (it counts navigations). */
+  tab: number;
+  document: number;
+  /**
+   * "vault:<agent>/<item>@<origin>#<binding>": the approval names it, and main checks it again before
+   * filling. The binding is the tab, its document and each field as the card showed it (its ref, the
+   * element behind it, how it reads), so an approval doesn't carry over to another tab, a page that
+   * moved on, or a ref that names something else now.
+   */
   subject: string;
-  fields: Array<{ key: VaultFillKey; ref: string; element: string; secret: boolean }>;
+  /** `node` is the element behind the ref (the renderer's backend node id). */
+  fields: Array<{ key: VaultFillKey; ref: string; node: number; element: string; secret: boolean }>;
   submit: boolean;
+}
+
+/** The site a vault approval's subject names ("vault:<agent>/<item>@<origin>#<binding>"), or null. */
+export function vaultSubjectSite(subject: string): string | null {
+  if (!subject.startsWith("vault:")) return null;
+  // An origin has neither "@" nor "#" in it (addresses with a user name aren't opened), nor does the binding.
+  const at = subject.lastIndexOf("@");
+  if (at < 0) return null;
+  const site = subject.slice(at + 1).split("#")[0];
+  return site.length > 0 ? site : null;
 }
 
 export interface VaultFillReply {

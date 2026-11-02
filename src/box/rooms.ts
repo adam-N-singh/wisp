@@ -17,8 +17,9 @@
 //   and its mentions start nothing.
 // - Each turn has a deadline; time spent waiting for the user's approval or answer doesn't count.
 // - Turns run one at a time and end SENT, PASS, SKIPPED, TIMEOUT, CANCELLED or ERROR, as the room
-//   row's `groupTurns` say; `activeGroupMemberId` names the member taking its turn. A message sent
-//   meanwhile skips the turns still waiting, and the next round answers it once the current turn ends.
+//   row's `groupTurns` say; `activeGroupMemberId` names the member taking its turn. Messages sent
+//   meanwhile skip the turns still waiting, and once the current turn ends the next round answers
+//   them all, as if they were one message: each one's mentions give turns, in the order sent.
 // - Stop interrupts every member's turn in the room and says "Stopped." at once; a message sent
 //   while the stopped turn winds down (or into a room started fresh) starts the next round.
 // - A member whose background command ended gets a turn to say so (rooms are woken through it).
@@ -77,16 +78,16 @@ interface Turn {
 }
 
 interface Round {
-  /** The person's message it answers; null for a member woken by its own background command. */
-  trigger: MessageEntry | null;
+  /** The person's messages it answers, in the order sent; none for a member woken by its own background command. */
+  triggers: MessageEntry[];
   turns: Turn[];
   posts: number;
   maxPosts: number;
   stopped: boolean;
   /** Stopped to start the room fresh or delete it: nothing more is posted. */
   silent: boolean;
-  /** A message sent while this round ran, or after it was stopped: the next round answers it. */
-  next: MessageEntry | null;
+  /** Messages sent while this round ran, or after it was stopped: the next round answers them all. */
+  next: MessageEntry[];
   active: Turn | null;
   lastPost: string | null;
   failed: boolean;
@@ -218,7 +219,7 @@ export class Rooms {
     const round = this.rounds.get(roomId);
     if (round == null) return;
     round.silent = true;
-    round.next = null;
+    round.next = [];
     this.stop(roomId);
   }
 
@@ -275,8 +276,8 @@ export class Rooms {
     });
     this.harness.patchAgent(roomId, { lastEntry: { kind: "text", text: preview(input.prompt) }, lastMessagePreview: preview(input.prompt), lastMessageId: message.id, newestEntryId: message.id, lastActivityAt: Date.now() });
     const round = this.rounds.get(roomId);
-    if (round != null) round.next = message;
-    else if (this.members(room).length > 0) void this.run(roomId, message);
+    if (round != null) round.next.push(message);
+    else if (this.members(room).length > 0) void this.run(roomId, [message]);
     return true;
   }
 
@@ -288,7 +289,7 @@ export class Rooms {
     const round = this.rounds.get(roomId);
     if (round == null || round.stopped) return false;
     round.stopped = true;
-    round.next = null;
+    round.next = [];
     if (!round.silent) this.notice(roomId, "Stopped.", "info");
     const sessionId = groupSessionId(roomId);
     const room = this.store.getAgent(roomId);
@@ -311,7 +312,7 @@ export class Rooms {
     if (room == null || !room.isGroup || !room.memberIds.includes(agentId)) return true; // it isn't in the room any more: the message waits there
     const round = this.rounds.get(roomId);
     if (round == null) {
-      void this.run(roomId, null, agentId);
+      void this.run(roomId, [], agentId);
       return true;
     }
     if (!round.stopped && !round.turns.some((turn) => turn.memberId === agentId && turn.outcome == null && !turn.running)) {
@@ -326,25 +327,27 @@ export class Rooms {
     return this.store.entries(memberId, groupSessionId(roomId)).findLast((entry) => entry.kind === "message")?.role === "user";
   }
 
-  /** A round answering the person's message, or, with no message, a turn for the member that was woken. */
-  private async run(roomId: string, trigger: MessageEntry | null, woken?: string): Promise<void> {
+  /**
+   * A round answering the person's messages (each gives turns to those it mentions, or to every
+   * member, once each in the order sent), or, with none, a turn for the member that was woken.
+   */
+  private async run(roomId: string, triggers: MessageEntry[], woken?: string): Promise<void> {
     const room = this.store.getAgent(roomId);
     if (room == null) return;
     const members = this.members(room);
-    const mentioned = trigger != null ? mentionedMembers(trigger.content, members) : [];
+    const called = new Set<string>();
+    for (const trigger of triggers) {
+      const mentioned = mentionedMembers(trigger.content, members);
+      for (const id of mentioned.length > 0 ? mentioned : members.map((member) => member.id)) called.add(id);
+    }
     const round: Round = {
-      trigger,
-      turns:
-        trigger == null
-          ? woken != null
-            ? [{ memberId: woken, hop: 0, running: false, woken: true }]
-            : []
-          : (mentioned.length > 0 ? mentioned : members.map((member) => member.id)).map((memberId) => ({ memberId, hop: 0, running: false })),
+      triggers,
+      turns: triggers.length === 0 ? (woken != null ? [{ memberId: woken, hop: 0, running: false, woken: true }] : []) : [...called].map((memberId) => ({ memberId, hop: 0, running: false })),
       posts: 0,
       maxPosts: 2 * members.length,
       stopped: false,
       silent: false,
-      next: null,
+      next: [],
       active: null,
       lastPost: null,
       failed: false,
@@ -363,7 +366,7 @@ export class Rooms {
         const batch = current != null && member != null && current.memberIds.includes(member.id) ? this.batch(roomId, current, member) : null;
         // A woken member answers what it was told even with nothing new in the room.
         const told = turn.woken === true && member != null && current?.memberIds.includes(member.id) === true && this.unanswered(roomId, member.id);
-        if (round.next != null || round.posts >= round.maxPosts || current == null || member == null || (batch == null && !told)) {
+        if (round.next.length > 0 || round.posts >= round.maxPosts || current == null || member == null || (batch == null && !told)) {
           turn.outcome = "SKIPPED";
           continue;
         }
@@ -407,7 +410,7 @@ export class Rooms {
       this.rounds.delete(roomId);
       this.settle(roomId, round);
       // Stop dropped what was waiting; what came after it, also into a room started fresh, is answered now.
-      if (round.next != null) void this.run(roomId, round.next);
+      if (round.next.length > 0) void this.run(roomId, round.next);
     }
   }
 
@@ -521,7 +524,7 @@ export class Rooms {
   private settle(roomId: string, round: Round): void {
     const room = this.store.getAgent(roomId);
     if (room == null) return;
-    const trigger = round.trigger;
+    const trigger = round.triggers.at(-1);
     this.harness.patchAgent(roomId, {
       isRunning: false,
       activeGroupMemberId: undefined,
