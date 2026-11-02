@@ -619,7 +619,7 @@ export function ServerManage({ server, entry, onRemoved }: { server: McpServerSu
         {server.status === "connected" ? (
           <McpToolList server={server} />
         ) : (
-          <p className="muted">{server.enabled ? "The tools show here once it’s connected." : "Turned off in Settings → MCP servers."}</p>
+          <p className="muted">{server.pluginOff === true ? "Off while its plugin is turned off." : server.enabled ? "The tools show here once it’s connected." : "Turned off in Settings → MCP servers."}</p>
         )}
       </section>
       <InstructionsEditor key={server.id} server={server} />
@@ -646,7 +646,12 @@ function AccountCard({ server, entry, onRemoved }: { server: McpServerSummary; e
       setBusy(false);
     }
   };
-  const tools = server.status === "connected" ? `${server.toolCount} tool${server.toolCount === 1 ? "" : "s"}${server.disabledToolCount > 0 ? `, ${server.disabledToolCount} off` : ""}` : MCP_STATUS[server.status];
+  const tools =
+    server.pluginOff === true
+      ? "Off: its plugin is turned off"
+      : server.status === "connected"
+        ? `${server.toolCount} tool${server.toolCount === 1 ? "" : "s"}${server.disabledToolCount > 0 ? `, ${server.disabledToolCount} off` : ""}`
+        : MCP_STATUS[server.status];
 
   return (
     <div className="mcp-server account-card">

@@ -3,12 +3,13 @@
 // makeGroupChat / changeGroupMembers. Members run on a scripted model that answers by its own name.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { startBoxServer } from "../../src/box-server/server";
 import { AsyncTasks } from "../../src/box/async-tasks";
+import type { ClaudeCodeEngine, EngineHost } from "../../src/box/claude-code";
 import { Harness, type LocalToolCall } from "../../src/box/harness";
 import { McpManager } from "../../src/box/mcp";
 import { streamMock } from "../../src/box/models/mock";
@@ -43,7 +44,15 @@ type Script = (request: ScriptedRequest, name: string) => ScriptedReply | Promis
 
 async function roomSetup(
   script: Script | null,
-  options: { members?: Array<[string, string, string?]>; deadlineMs?: number; callLocalTool?: (call: LocalToolCall) => ToolResult; asyncTasks?: boolean } = {},
+  options: {
+    members?: Array<[string, string, string?]>;
+    deadlineMs?: number;
+    callLocalTool?: (call: LocalToolCall) => ToolResult;
+    asyncTasks?: boolean;
+    /** The box's model settings, in place of the scripted model's (null: none configured). */
+    models?: () => BoxModelConfig | null;
+    claudeCode?: ClaudeCodeEngine;
+  } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "wisp-rooms-"));
   dirs.push(dir);
@@ -68,7 +77,7 @@ async function roomSetup(
       : undefined;
   const harness: Harness = new Harness({
     store,
-    models: () => model?.models ?? MOCK,
+    models: options.models ?? (() => model?.models ?? MOCK),
     resolveDeps: { chatGptToken: async () => "unused" },
     workspaceRoot: () => join(dir, "workspaces"),
     localTools: () => [SHELL],
@@ -81,7 +90,7 @@ async function roomSetup(
           : { kind: "ok", output: "ran\n" },
     asyncTasks: tasks,
     mcp: new McpManager(() => undefined, () => undefined),
-    claudeCode: null,
+    claudeCode: options.claudeCode ?? null,
     cloud: null,
     cloudConfig: () => null,
     sessions: {
@@ -525,4 +534,67 @@ test("a page a member writes in a room shows its card in the room; an edit from 
   const reloaded = new BoxStore(dir).getPage("atlas", page().id)!;
   assert.equal(reloaded.cardId, null);
   assert.deepEqual(reloaded.sessionCards, { [session]: "t3s2" });
+});
+
+test("every message sent while a round runs is answered: the next round gives a turn to each one's mentions, in the order sent", async () => {
+  const { say, rooms, room, turns, asked } = await roomSetup((request, name) => (lastSaid(request).includes("slow") ? { text: `${name} took a while.`, delayMs: 300 } : { text: `${name} on it.` }), {
+    members: [["scout", "Scout"], ["atlas", "Atlas"], ["echo", "Echo"]],
+  });
+  say("slow one");
+  await until(() => (rooms as any).rounds.get(room.id)?.active != null, 5_000, "the first turn");
+  say("@Atlas check B");
+  say("@Scout check A");
+  await until(() => turns().join() === "Atlas@0 SENT,Scout@0 SENT" && !rooms.isRunning(room.id), 10_000, "the next round");
+  for (const name of ["Atlas", "Scout"]) assert.match(asked(name).at(-1)!.lastUser, /\nUser: @Atlas check B\nUser: @Scout check A\n/, `${name} sees both messages`);
+  assert.equal(asked("Echo").length, 0, "Echo's turn in the first round was skipped, and neither message mentions it");
+});
+
+test("a member that can't take its turn says why in the room", async () => {
+  const { say, settled, turns, lines } = await roomSetup(null, { models: () => null });
+  say("hello");
+  await settled();
+  assert.deepEqual(turns(), ["Scout@0 ERROR", "Atlas@0 ERROR"]);
+  const reason = "No model is configured. Open Settings → Models to connect one (or use the offline mock).";
+  assert.deepEqual(lines().filter((line) => line.startsWith("notice:")), [`notice:Scout couldn’t answer: ${reason}`, `notice:Atlas couldn’t answer: ${reason}`]);
+});
+
+test("deleting a member or the room mid-turn: the stopped turn writes nothing for what was deleted", async () => {
+  // Claude Code turns that wait to be stopped, then do what a turn still does as it winds down.
+  const engine = {
+    runTurn: async (host: EngineHost) => {
+      await new Promise((resolve) => (host.signal.aborted ? resolve(null) : host.signal.addEventListener("abort", () => resolve(null))));
+      host.setTodos([{ id: "1", content: "late", status: "pending", updatedAt: 1 }]);
+      host.notice("info", "Late.");
+      return { sessionId: "cc-late", failed: null, text: "" };
+    },
+  } as unknown as ClaudeCodeEngine;
+  const options = { claudeCode: engine, models: (): BoxModelConfig => ({ ...MOCK, defaultModel: { provider: "claude-code", model: "default" }, claudeCode: { executable: "claude" } }) };
+  /** Deletes the agent as the box does (host.ts removeAgents). */
+  const remove = ({ rooms, harness, store }: Awaited<ReturnType<typeof roomSetup>>, id: string) => {
+    if (rooms.isRoom(id)) rooms.deleteRoom(id);
+    else rooms.memberDeleted(id);
+    harness.interrupt(id);
+    store.deleteAgent(id);
+  };
+
+  const member = await roomSetup(null, options);
+  member.say("hello");
+  await until(() => member.harness.isRunning("scout", groupSessionId(member.room.id)), 5_000, "Scout's turn");
+  remove(member, "scout");
+  await until(() => member.harness.isRunning("atlas", groupSessionId(member.room.id)), 5_000, "Atlas's turn, after Scout's ended");
+  member.rooms.stop(member.room.id);
+  await member.settled();
+  assert.equal(existsSync(join(member.dir, "sessions", "scout")), false, "Scout's sessions aren't made again");
+  assert.equal(existsSync(join(member.dir, "todos", "scout.json")), false);
+  assert.equal(existsSync(join(member.dir, "transcripts", "scout.jsonl")), false);
+
+  const group = await roomSetup(null, options);
+  const session = groupSessionId(group.room.id);
+  group.say("hello");
+  await until(() => group.harness.isRunning("scout", session), 5_000, "Scout's turn");
+  remove(group, group.room.id);
+  await until(() => !group.harness.isRunning("scout") && !group.rooms.isRunning(group.room.id), 5_000, "the stopped turn");
+  assert.deepEqual(readdirSync(join(group.dir, "sessions", "scout")).filter((file) => file.startsWith("group~")), [], "no room session file of Scout's comes back");
+  assert.deepEqual(group.store.sessionState("scout", session), {});
+  assert.equal(existsSync(join(group.dir, "transcripts", `${group.room.id}.jsonl`)), false);
 });

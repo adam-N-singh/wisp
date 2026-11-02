@@ -5,7 +5,7 @@
 // audit log's latest fills and whether its hash chain is intact.
 import { type FormEvent, useEffect, useState } from "react";
 import { siteLabel } from "../../shared/agent-browser";
-import { CONTACT_FIELDS, FIELD_LABELS, type VaultImportResult, type VaultItemDraft, type VaultItemKind, type VaultItemSummary, vaultItemLabel, type VaultView } from "../../shared/vault";
+import { CONTACT_FIELDS, FIELD_LABELS, VAULT_MAX_VALUE, type VaultImportResult, type VaultItemDraft, type VaultItemKind, type VaultItemSummary, vaultItemLabel, type VaultView } from "../../shared/vault";
 import { main } from "../bridge";
 import { Icon } from "./icons";
 
@@ -22,8 +22,9 @@ const blank = (kind: VaultItemKind): VaultItemDraft => ({ id: null, kind, title:
 function importText(result: VaultImportResult): string {
   const from = result.format === "firefox" ? "Firefox" : "Chrome or Edge";
   const parts = [`${result.added} added`, `${result.updated} updated`, `${result.unchanged} unchanged`, `${result.skipped} skipped`];
-  const notes = result.notesDropped > 0 ? ` Notes on ${result.notesDropped} looked like a card number and were left out.` : "";
-  return `Imported a ${from} export: ${parts.join(", ")}.${notes} Delete the exported file now: it holds your passwords in plain text.`;
+  const tooLong = result.tooLong > 0 ? ` ${result.tooLong} of those skipped ${result.tooLong === 1 ? "has a password or username" : "have passwords or usernames"} longer than the vault keeps (${VAULT_MAX_VALUE.toLocaleString()} characters), so ${result.tooLong === 1 ? "it was" : "they were"} left out rather than cut short; add ${result.tooLong === 1 ? "it" : "them"} by hand if you need ${result.tooLong === 1 ? "it" : "them"}.` : "";
+  const notes = result.notesDropped > 0 ? ` Notes on ${result.notesDropped} ${result.notesDropped === 1 ? "login" : "logins"} looked like a card number or were too long, and were left out.` : "";
+  return `Imported a ${from} export: ${parts.join(", ")}.${tooLong}${notes} Delete the exported file now: it holds your passwords in plain text.`;
 }
 
 export function VaultSettings() {
@@ -135,7 +136,9 @@ export function VaultSettings() {
 
       <h3>Fills</h3>
       <p className="muted">
-        {audit.ok ? `Every fill is written to vault-audit.jsonl on this PC, without its values. The log’s ${audit.entries} ${audit.entries === 1 ? "entry is" : "entries are"} hash-chained and intact.` : `The audit log’s hash chain breaks at line ${audit.brokenAt}: it was changed outside the app.`}
+        {audit.ok
+          ? `Every fill is written to vault-audit.jsonl on this PC, without its values. The log’s ${audit.entries} ${audit.entries === 1 ? "entry is" : "entries are"} hash-chained and intact${audit.unsealed ? " (without secure storage, entries cut off its end wouldn’t show)" : ", up to the last one the app sealed"}.`
+          : `The audit log isn’t intact: ${audit.problem ?? `its hash chain breaks at line ${audit.brokenAt}.`}`}
       </p>
       {audit.recent.length === 0 ? (
         <p className="muted">No fills yet.</p>
@@ -145,7 +148,8 @@ export function VaultSettings() {
             <li key={`${fill.at}-${fill.label}`}>
               <span>{fill.label}</span>
               <span className="muted">
-                on {siteLabel(fill.site)} · {fill.fields.map((field) => FIELD_LABELS[field as keyof typeof FIELD_LABELS] ?? field).join(", ")} · {new Date(fill.at).toLocaleString()}
+                on {siteLabel(fill.site)} · {fill.fields.map((field) => FIELD_LABELS[field as keyof typeof FIELD_LABELS] ?? field).join(", ")}
+                {fill.maybe.length > 0 ? ` (and maybe ${fill.maybe.map((field) => FIELD_LABELS[field as keyof typeof FIELD_LABELS] ?? field).join(", ")}: the page didn’t answer)` : ""} · {new Date(fill.at).toLocaleString()}
               </span>
             </li>
           ))}

@@ -465,8 +465,14 @@ export class PluginHost {
   private foundUpdate(installed: InstalledPlugin): InstalledPluginView["updateFound"] {
     const check = this.store.getMarketplace(installed.marketplaceId)?.check;
     const found = check?.updates[installed.pluginId];
-    if (check == null || found == null || found.commit === installed.commit) return null;
-    if (this.indexed(installed.marketplaceId, installed.name)?.files?.commit === found.commit) return null;
+    if (check == null || found == null) return null;
+    // These files and servers, or (a check made before it recorded them) this commit.
+    const isFound = (files: { commit: string; hash: string } | null | undefined, servers: IndexedPlugin["servers"]) =>
+      files != null && (found.hash != null ? files.hash === found.hash && serversKeyOf(servers) === found.serversKey : files.commit === found.commit);
+    // Installed already, or read by a refresh since (then updateAvailable shows it).
+    if (isFound({ commit: installed.commit, hash: installed.hash }, installed.plugin.servers)) return null;
+    const indexed = this.indexed(installed.marketplaceId, installed.name);
+    if (indexed != null && isFound(indexed.files, indexed.servers)) return null;
     return { commit: found.commit, checkedAt: check.at, serversChanged: found.serversChanged };
   }
 
@@ -658,7 +664,7 @@ export class PluginHost {
 
   /** The box's servers as they should run: a turned-off plugin's stay stopped, with their settings as they are. */
   runnable(configs: McpServerConfig[]): McpServerConfig[] {
-    const off = new Set(this.store.installedPlugins().filter((plugin) => plugin.enabled === false).flatMap((plugin) => Object.values(plugin.serverIds)));
+    const off = serversOfPluginsOff(this.store);
     return off.size === 0 ? configs : configs.map((config) => (config.enabled && off.has(config.id) ? { ...config, enabled: false } : config));
   }
 
@@ -757,11 +763,13 @@ export class PluginHost {
           newer = await fetchPlugin(newer, scratch, "check", this.deps.hosts);
         }
         if (newer.files == null) continue;
-        const serversChanged = serversKeyOf(newer.servers) !== serversKeyOf(plugin.plugin.servers);
+        const serversKey = serversKeyOf(newer.servers);
+        const serversChanged = serversKey !== serversKeyOf(plugin.plugin.servers);
         if (newer.files.hash === plugin.hash && !serversChanged) continue;
-        // The index already has these files: the plugin's page shows that update as it is.
-        if (this.indexed(id, plugin.name)?.files?.hash === newer.files.hash) continue;
-        updates[plugin.pluginId] = { commit: newer.files.commit, serversChanged };
+        // The index already has these files and servers: the plugin's page shows that update as it is.
+        const inIndex = this.indexed(id, plugin.name);
+        if (inIndex?.files?.hash === newer.files.hash && serversKeyOf(inIndex.servers) === serversKey) continue;
+        updates[plugin.pluginId] = { commit: newer.files.commit, serversChanged, hash: newer.files.hash, serversKey };
       }
     } catch (error) {
       if (!(error instanceof MarketplaceError)) throw error;
@@ -903,6 +911,11 @@ export class PluginHost {
 }
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The ids of the servers of installed plugins the user turned off: they don't run, whatever their own switch says. */
+export function serversOfPluginsOff(store: BoxStore): Set<string> {
+  return new Set(store.installedPlugins().filter((plugin) => plugin.enabled === false).flatMap((plugin) => Object.values(plugin.serverIds)));
+}
 
 /** The names of the skills an update changes this way. */
 const names = (skills: PluginSkillChange[], change: PluginSkillChange["change"]) => skills.filter((skill) => skill.change === change).map((skill) => skill.name);

@@ -6,7 +6,7 @@
 // file or deletes it. Links the canvas asks to open go to main (`openLinkFromCanvas`) while it has the
 // focus, and main opens them only right after a real click or key press.
 import { useEffect, useRef, useState } from "react";
-import { CANVAS_LINK_MESSAGE, canvasFrameUrl } from "../../shared/canvas";
+import { CANVAS_LINK_INTERVAL_MS, CANVAS_LINK_MESSAGE, canvasFrameUrl, rateLimit } from "../../shared/canvas";
 import type { AgentSummary } from "../../shared/model";
 import type { LibraryPage, PageRevisionInfo } from "../../shared/pages";
 import { gateway, main } from "../bridge";
@@ -16,6 +16,8 @@ import { Menu } from "./AgentMenu";
 import { Icon } from "./icons";
 import { useTheme } from "./RichContent";
 import { timestampLabel } from "./time";
+
+const LINK_REFUSED = "The canvas asked to open a link, which opens only from a click on it, and only for web, mail and phone links.";
 
 const whoMade = (canvas: Pick<LibraryPage, "updatedBy">, agent: AgentSummary) => (canvas.updatedBy === "user" ? "Restored by you" : `Made by ${agent.name}`);
 
@@ -306,7 +308,7 @@ export function CanvasStage({ agent, open, narrow }: { agent: AgentSummary; open
         key={src}
         src={src}
         title={canvas.title}
-        onLinkRefused={() => setNotice({ tone: "error", text: "The canvas asked to open a link, which opens only from a click on it, and only for web, mail and phone links." })}
+        onLinkRefused={() => setNotice((current) => (current?.text === LINK_REFUSED ? current : { tone: "error", text: LINK_REFUSED }))}
       />
     </section>
   );
@@ -322,11 +324,13 @@ function CanvasFrame({ src, title, onLinkRefused }: { src: string; title: string
   const refused = useRef(onLinkRefused);
   refused.current = onLinkRefused;
   useEffect(() => {
+    // A canvas asking in a loop is heard twice a second: the rest neither reach main nor re-render the stage.
+    const looked = rateLimit(CANVAS_LINK_INTERVAL_MS);
     const onMessage = (event: MessageEvent) => {
       // Only this frame's; its origin is opaque, so the window it posts from is what identifies it.
       if (event.source == null || event.source !== frame.current?.contentWindow) return;
       const data = event.data as { type?: unknown; url?: unknown } | null;
-      if (data?.type !== CANVAS_LINK_MESSAGE || typeof data.url !== "string") return;
+      if (data?.type !== CANVAS_LINK_MESSAGE || typeof data.url !== "string" || !looked()) return;
       if (document.activeElement !== frame.current) return refused.current();
       void main.openLinkFromCanvas({ url: data.url.slice(0, 8192) }).then(
         (opened) => !opened && refused.current(),

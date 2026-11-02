@@ -243,9 +243,12 @@ try {
     const card = page.getByRole("button", { name: "Open Remote counter" });
     await card.waitFor({ timeout: 20_000 });
     await card.click();
+    // As on this PC's run: clicked only once the stage marks the frame loaded, so a slow first run
+    // doesn't click into a document that's still coming in.
+    await page.locator('iframe[title="Remote counter"]:not(.page-stage__canvas--loading)').waitFor({ timeout: 20_000 });
     const frame = page.frameLocator('iframe[title="Remote counter"]');
     await frame.getByRole("button", { name: "Click" }).click({ timeout: 15_000 });
-    await frame.getByText("clicked here").waitFor({ timeout: 5_000 });
+    await frame.getByText("clicked here").waitFor({ timeout: 10_000 });
     const agentId = (await boxAgents()).find((agent) => agent.name === "Remote Wisp").id;
     if (!existsSync(join(boxData, "pages", agentId, "index.json"))) throw new Error("the canvas isn't on the box server");
     if (existsSync(join(userData, "box", "pages", agentId))) throw new Error("the canvas was kept on this PC");

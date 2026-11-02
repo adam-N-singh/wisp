@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,11 +8,11 @@ import { type AXNode, RefTable, renderSnapshot } from "../../src/main/agent-brow
 import { coverRegions, HIDDEN_VALUE, holdsValue, quadRegion, scaleRegion, scrubClipboard, scrubValues, valueRegions } from "../../src/main/agent-browser-mask";
 import { forgetFrameWorld, inWorld } from "../../src/main/agent-browser-worlds";
 import { clipboardChord, parseKeyChord } from "../../src/shared/agent-browser";
-import { type Sealer, Vault, VaultAudit, type VaultBrowser, type VaultField, type VaultFill, VaultFiller, verifyAuditChain } from "../../src/main/vault";
+import { auditHeadProblem, type Sealer, Vault, VaultAudit, type VaultBrowser, type VaultField, type VaultFill, VaultFiller, type VaultFillResult, verifyAuditChain } from "../../src/main/vault";
 import { parseCsv, parsePasswordExport } from "../../src/main/vault-csv";
 import { evaluate, grantRecipient } from "../../src/local-exec/policy";
 import { LOCAL_TOOLS, type ToolContext } from "../../src/local-exec/tools";
-import { containsPaymentCard, contactFillValue, maskHint, normalizeSite, vaultItemLabel, vaultSiteMatches } from "../../src/shared/vault";
+import { containsPaymentCard, contactFillValue, maskHint, normalizeSite, VAULT_MAX_VALUE, vaultItemLabel, vaultSiteMatches, vaultSubjectSite } from "../../src/shared/vault";
 
 const dirs: string[] = [];
 const tempDir = () => {
@@ -119,7 +120,7 @@ test("csv import: Chrome, Edge and Firefox exports; app logins and blank passwor
   const dir = tempDir();
   const vault = new Vault(dir, fakeSealer());
   const first = await vault.importLogins(chrome);
-  assert.deepEqual(first, { format: "chrome", added: 2, updated: 0, unchanged: 0, skipped: 2, notesDropped: 1 });
+  assert.deepEqual(first, { format: "chrome", added: 2, updated: 0, unchanged: 0, skipped: 2, tooLong: 0, notesDropped: 1 });
   assert.equal((await vault.importLogins(chrome)).unchanged, 2, "importing again changes nothing");
   const second = await vault.importLogins(firefox);
   assert.equal(second.updated, 1, "Firefox's newer password for the same login replaces it");
@@ -167,26 +168,39 @@ const field = (ref: string, extra: Partial<VaultField> = {}): VaultField => ({
   href: "",
   inPage: true,
   origin: "https://shop.example",
+  // The element behind the ref: e1 is node 101, e2 node 102, …; tab 1, its first document.
+  node: 100 + Number(ref.slice(1)),
+  tab: 1,
+  document: 1,
   ...extra,
 });
 
-function fakeBrowser(page: { url: string; site: string | null } | null, fields: Record<string, VaultField>) {
+type FakePage = { url: string; site: string | null; tab?: number; document?: number } | null;
+type FillOptions = Parameters<VaultBrowser["fill"]>[2];
+
+function fakeBrowser(page: FakePage, fields: Record<string, VaultField>) {
   const fills: VaultFill[][] = [];
+  const options: FillOptions[] = [];
   /** What the agent's window holds from earlier fills, as the real browser would blank. */
   const held = new Set<string>();
+  /** What the next fill does; by default every field takes its value. */
+  let next: ((list: VaultFill[], options: FillOptions) => VaultFillResult) | null = null;
   const browser: VaultBrowser = {
-    page: async () => page,
+    page: async () => (page != null ? { tab: 1, document: 1, ...page } : null),
     fields: async (_agentId, refs) => new Map(refs.filter((ref) => fields[ref] != null).map((ref) => [ref, fields[ref]])),
-    fill: async (_agentId, list, options) => {
+    fill: async (_agentId, list, given) => {
       fills.push(list);
-      return { filled: list.length, submitted: options.submit, navigated: false, error: null };
+      options.push(given);
+      const result = next?.(list, given) ?? { filled: list.map((fill) => fill.ref), skipped: [], uncertain: [], submitted: given.submit, navigated: false, error: null };
+      next = null;
+      return result;
     },
     scrub: (_agentId, text) => scrubValues(text, held),
   };
-  return { browser, fills, held, setPage: (next: typeof page) => (page = next) };
+  return { browser, fills, options, held, fields, setPage: (value: FakePage) => (page = value), onNextFill: (run: typeof next) => (next = run) };
 }
 
-async function setup(page = { url: "https://shop.example/login", site: "https://shop.example" as string | null }, fields = { e1: field("e1"), e2: field("e2") }) {
+async function setup(page: FakePage = { url: "https://shop.example/login", site: "https://shop.example" }, fields: Record<string, VaultField> = { e1: field("e1"), e2: field("e2") }) {
   const dir = tempDir();
   const vault = new Vault(dir, fakeSealer());
   const audit = new VaultAudit(join(dir, "vault-audit.jsonl"));
@@ -272,7 +286,9 @@ test("request_credential: fields are checked (a password only into a password fi
   await assert.rejects(plan("vnope", { username: "e1" }), /no vault item/);
 
   const ok = await plan(login.id, { username: "e1", password: "e2" });
-  assert.equal(ok.subject, `vault:a1/${login.id}@https://shop.example`);
+  assert.match(ok.subject, new RegExp(`^vault:a1/${login.id}@https://shop\\.example#t1\\.d1\\.[0-9a-f]{24}$`));
+  assert.equal(vaultSubjectSite(ok.subject), "https://shop.example");
+  assert.deepEqual([ok.tab, ok.document, ok.fields.map((entry) => entry.node)], [1, 1, [101, 102]]);
   assertValueFree(JSON.stringify(ok), "the plan");
   // Contact info fills on any site, still asking there.
   const anywhere = await plan(contact.id, { email: "e1" });
@@ -285,7 +301,8 @@ test("request_credential: the card always asks, is never remembered, and names n
   const plan = await LOCAL_TOOLS.request_credential.plan({ item_id: login.id, fields: { username: "e1", password: "e2" }, submit: true }, context);
   assert.equal(plan.risk, "dangerous");
   assert.equal(plan.title, "Fill your login on shop.example");
-  assert.equal(plan.description, `vault:a1/${login.id}@https://shop.example`);
+  assert.match(plan.description ?? "", new RegExp(`^vault:a1/${login.id}@https://shop\\.example#t1\\.d1\\.`));
+  assert.equal(plan.scope, plan.description, "the approval's subject is the whole binding");
   assert.deepEqual(plan.reasons, ["Login for shop.example (j…@gmail.com)", "fills Username into e1 (textbox “Email”), Password into e2 (textbox “Password”)", "then presses Enter to submit the form"]);
   assertValueFree(JSON.stringify(plan), "the card");
   const input = { permissionId: "vault", ...plan, workspace: "C:\\w" };
@@ -298,13 +315,17 @@ test("request_credential: the card always asks, is never remembered, and names n
 test("request_credential: fills only on the user's approval for that item on that site, spent once; the result is value-free", async () => {
   const { filler, login, contact, fake, approvals, audit } = await setup();
   const call = { agentId: "a1", itemId: login.id, fields: { username: "e1", password: "e2" }, submit: true, callId: "c1" };
-  const subject = `vault:a1/${login.id}@https://shop.example`;
+  // What the card named: the subject the plan made when the user was asked.
+  const subjectOf = async (agentId: string, itemId: string, fields: Record<string, string>, submit: boolean) => (await filler.plan({ agentId, itemId, fields, submit })).subject;
+  const subject = await subjectOf("a1", login.id, call.fields, true);
 
   await assert.rejects(filler.fill({ ...call, expectSite: "https://shop.example", approvalId: null }), /wasn't allowed in the app on this computer/);
-  approvals.set("ap-other", `vault:a1/${contact.id}@https://shop.example`);
+  approvals.set("ap-other", await subjectOf("a1", contact.id, { email: "e1" }, true));
   await assert.rejects(filler.fill({ ...call, expectSite: "https://shop.example", approvalId: "ap-other" }), /wasn't allowed/, "an approval for another item doesn't fill this one");
-  approvals.set("ap-a2", `vault:a2/${login.id}@https://shop.example`);
+  approvals.set("ap-a2", await subjectOf("a2", login.id, call.fields, true));
   await assert.rejects(filler.fill({ ...call, expectSite: "https://shop.example", approvalId: "ap-a2" }), /wasn't allowed/, "nor one for another agent");
+  approvals.set("ap-nosubmit", await subjectOf("a1", login.id, call.fields, false));
+  await assert.rejects(filler.fill({ ...call, expectSite: "https://shop.example", approvalId: "ap-nosubmit" }), /wasn't allowed/, "nor one that didn't press Enter");
   approvals.set("ap1", subject);
   await assert.rejects(filler.fill({ ...call, expectSite: "https://elsewhere.example", approvalId: "ap1" }), /not elsewhere\.example as when you were asked/);
   assert.equal(fake.fills.length, 0);
@@ -313,16 +334,17 @@ test("request_credential: fills only on the user's approval for that item on tha
   assert.equal(reply.output.startsWith("Filled 2 fields on shop.example (username, password) from Login for shop.example (j…@gmail.com) and pressed Enter."), true, reply.output);
   assertValueFree(reply.output, "the result");
   assert.deepEqual(fake.fills[0], [
-    { ref: "e1", value: USERNAME, password: false },
-    { ref: "e2", value: PASSWORD, password: true },
+    { ref: "e1", node: 101, value: USERNAME, password: false },
+    { ref: "e2", node: 102, value: PASSWORD, password: true },
   ]);
+  assert.deepEqual([fake.options[0].tab, fake.options[0].document], [1, 1], "the browser fills only in the tab and document the user was asked about");
   await assert.rejects(filler.fill({ ...call, expectSite: "https://shop.example", approvalId: "ap1" }), /wasn't allowed/, "an approval fills once");
 
   // Contact info fills on any site (on its own approval there), and parts of itself.
-  approvals.set("ap2", `vault:a1/${contact.id}@https://shop.example`);
+  approvals.set("ap2", await subjectOf("a1", contact.id, { given_name: "e1" }, false));
   const contactReply = await filler.fill({ agentId: "a1", itemId: contact.id, fields: { given_name: "e1" }, submit: false, expectSite: "https://shop.example", approvalId: "ap2", callId: "c2" });
   assert.match(contactReply.output, /^Filled 1 field on shop\.example \(given_name\) from Contact info “Home” \(a…@example\.com\)\./);
-  assert.deepEqual(fake.fills[1], [{ ref: "e1", value: "Ada", password: false }]);
+  assert.deepEqual(fake.fills[1], [{ ref: "e1", node: 101, value: "Ada", password: false }]);
 
   const log = readFileSync(audit.file, "utf8");
   assertValueFree(log, "the audit log");
@@ -437,7 +459,7 @@ test("vault: an unreadable vault.json is never written over (only a missing one 
     assert.match(vault.problem() ?? "", reason, what);
     assert.deepEqual(vault.list(), [], `${what}: nothing listed`);
     await assert.rejects(vault.save({ kind: "contact", title: "", values: { name: "Ada" } }), /Nothing was changed, and the file is left as it is/, `${what}: save`);
-    await assert.rejects(vault.importLogins({ format: "chrome", logins: [{ site: "https://a.example", title: "", username: "u", password: "p", notes: "" }], skipped: 0 }), /left as it is/, `${what}: import`);
+    await assert.rejects(vault.importLogins({ format: "chrome", logins: [{ site: "https://a.example", title: "", username: "u", password: "p", notes: "" }], skipped: 0, tooLong: 0, notesTooLong: 0 }), /left as it is/, `${what}: import`);
     assert.throws(() => vault.reveal("v1", ["password"]), /left as it is/, `${what}: reveal`);
     const filler = new VaultFiller({ vault, audit: new VaultAudit(join(dir, "audit.jsonl")), browser: fakeBrowser(null, {}).browser, spendApproval: () => false });
     await assert.rejects(filler.list("a1"), /The vault can't be read right now/, `${what}: vault_list says so`);
@@ -577,4 +599,233 @@ test("frames: a frame that navigates drops its world, and a stale world is made 
     /No node/,
   );
   assert.equal(runs, 1, "other errors aren't retried");
+});
+
+// ---- second review round ----------------------------------------------------------------------
+
+test("request_credential: an approval is for the tab, its document and each field as the card showed it", async () => {
+  const { filler, login, fake, approvals } = await setup();
+  const call = { agentId: "a1", itemId: login.id, fields: { username: "e1", password: "e2" }, submit: true, callId: "c1" };
+  const asked = await filler.plan(call);
+  const fillWith = (approvalId: string) => filler.fill({ ...call, expectSite: "https://shop.example", approvalId });
+  const original = { e1: { ...fake.fields.e1 }, e2: { ...fake.fields.e2 } };
+  // The page and its fields as the browser would read them in another tab or document.
+  const moveTo = (where: { tab?: number; document?: number }) => {
+    fake.setPage({ url: "https://shop.example/login", site: "https://shop.example", ...where });
+    for (const ref of ["e1", "e2"] as const) fake.fields[ref] = { ...original[ref], ...where };
+  };
+  const changes: Array<[string, () => void]> = [
+    // A same-site navigation and a new snapshot: refs start over, and e1 is a display-name field now.
+    ["the ref names another element", () => (fake.fields.e1 = { ...original.e1, node: 777, name: "Display name", autocomplete: "nickname", inputType: "text" })],
+    ["the same element reads differently", () => (fake.fields.e1 = { ...original.e1, name: "Search" })],
+    ["the page navigated (same refs, same elements' looks)", () => moveTo({ document: 2 })],
+    ["the user switched tabs", () => moveTo({ tab: 2 })],
+  ];
+  for (const [what, change] of changes) {
+    approvals.set("ap", asked.subject);
+    change();
+    // The daemon plans the resent call again: its subject (the card's scope) no longer matches.
+    assert.notEqual((await filler.plan(call)).subject, asked.subject, `${what}: the subject changes`);
+    await assert.rejects(fillWith("ap"), /wasn't allowed .* for this page and these fields/, what);
+    assert.equal(fake.fills.length, 0, `${what}: nothing filled`);
+    moveTo({});
+  }
+  // Fields read from another tab than the page (a switch in the middle of planning) aren't planned at all.
+  fake.fields.e2 = { ...fake.fields.e2, tab: 2 };
+  await assert.rejects(filler.plan(call), /page changed while the fill was being checked/);
+  fake.fields.e2 = { ...fake.fields.e2, tab: 1 };
+  // Unchanged, it fills, with the elements and the tab the user was asked about.
+  approvals.set("ap", asked.subject);
+  await fillWith("ap");
+  assert.deepEqual(
+    fake.fills[0].map((fill) => [fill.ref, fill.node]),
+    [
+      ["e1", 101],
+      ["e2", 102],
+    ],
+  );
+  assert.deepEqual([fake.options[0].tab, fake.options[0].document], [asked.tab, asked.document]);
+});
+
+test("request_credential: the log and the reply name the fields that were filled, also when one was skipped or the fill stopped", async () => {
+  const fields = {
+    e1: field("e1"),
+    e7: field("e7", { role: "combobox", name: "Country", tag: "select", inputType: "", autocomplete: "country-name" }),
+    e8: field("e8", { name: "City", inputType: "text", autocomplete: "address-level2" }),
+  };
+  const { filler, contact, fake, approvals, audit } = await setup(undefined, fields);
+  const fillWith = async (map: Record<string, string>, result: Omit<VaultFillResult, "submitted" | "navigated">) => {
+    const call = { agentId: "a1", itemId: contact.id, fields: map, submit: false, callId: "c" };
+    approvals.set("ap", (await filler.plan(call)).subject);
+    fake.onNextFill(() => ({ submitted: false, navigated: false, ...result }));
+    return (await filler.fill({ ...call, expectSite: "https://shop.example", approvalId: "ap" })).output;
+  };
+  const lastFill = () => verifyAuditChain(readFileSync(audit.file, "utf8")).records.filter((record) => record.event === "fill").at(-1);
+
+  // The country isn't an option of the dropdown: only the city went in.
+  const skipped = await fillWith({ country: "e7", city: "e8" }, { filled: ["e8"], skipped: ["e7"], uncertain: [], error: null });
+  assert.match(skipped, /^Filled 1 field on shop\.example \(city\) from Contact info “Home”.*\. Country was left as it was: no option in the dropdown is the saved value\./);
+  assert.deepEqual([lastFill()?.fields, lastFill()?.maybe], [["city"], undefined]);
+
+  // Interrupted while the second field was going in: the first is logged, the second as "maybe".
+  const stopped = await fillWith({ email: "e1", city: "e8" }, { filled: ["e1"], skipped: [], uncertain: ["e8"], error: "interrupted." });
+  assert.match(stopped, /^Filled 1 field on shop\.example \(email\), then stopped: interrupted\. City may hold the value/);
+  assert.deepEqual([lastFill()?.fields, lastFill()?.maybe], [["email"], ["city"]]);
+
+  // Nothing confirmed, but a value was on its way: still logged.
+  const entries = verifyAuditChain(readFileSync(audit.file, "utf8")).records.length;
+  const none = await fillWith({ email: "e1" }, { filled: [], skipped: [], uncertain: ["e1"], error: "The page didn't answer (Input.insertText)." });
+  assert.match(none, /^Nothing was filled: The page didn't answer/);
+  assert.equal(verifyAuditChain(readFileSync(audit.file, "utf8")).records.length, entries + 1);
+  assert.deepEqual([lastFill()?.fields, lastFill()?.maybe], [[], ["email"]]);
+
+  // Nothing at all went in: no entry.
+  await fillWith({ country: "e7" }, { filled: [], skipped: ["e7"], uncertain: [], error: null });
+  assert.equal(verifyAuditChain(readFileSync(audit.file, "utf8")).records.length, entries + 1);
+  assertValueFree(readFileSync(audit.file, "utf8"), "the audit log");
+});
+
+test("snapshot: a filled listbox, or an input the page gave another role, shows as filled with nothing of its value", () => {
+  const node = (nodeId: string, role: string, name: string, extra: Partial<AXNode> = {}): AXNode => ({ nodeId, role: { value: role }, name: { value: name }, ...extra });
+  const nodes: AXNode[] = [
+    node("1", "RootWebArea", "Form", { childIds: ["2", "5", "7", "8", "9"] }),
+    // <select size=3> (or multiple) filled with "UK": its options would say which is selected.
+    node("2", "listbox", "Country", { backendDOMNodeId: 21, childIds: ["3", "4"] }),
+    node("3", "option", "FR", { parentId: "2", properties: [{ name: "selected", value: { value: false } }] }),
+    node("4", "option", "UK", { parentId: "2", properties: [{ name: "selected", value: { value: true } }] }),
+    // <input role=button> filled: a button's name can be its value.
+    node("5", "button", "Ada", { backendDOMNodeId: 22, childIds: ["6"] }),
+    node("6", "StaticText", "Ada", { parentId: "5" }),
+    // role=generic, and one hidden from the tree.
+    node("7", "generic", "", { backendDOMNodeId: 23, value: { value: "42" } }),
+    node("8", "listbox", "Hidden", { backendDOMNodeId: 24, ignored: true, childIds: [] }),
+    // An unfilled listbox still says what's selected.
+    node("9", "listbox", "Size", { backendDOMNodeId: 25, childIds: ["10"] }),
+    node("10", "option", "M", { parentId: "9", properties: [{ name: "selected", value: { value: true } }] }),
+  ];
+  for (const entry of nodes) for (const child of entry.childIds ?? []) nodes.find((candidate) => candidate.nodeId === child)!.parentId = entry.nodeId;
+  const text = renderSnapshot(nodes, new RefTable(), { filled: new Set([21, 22, 23, 24]) }).text;
+  assert.equal(text, ['- listbox "Country" [filled from your vault] [ref=e1]', "- button [filled from your vault] [ref=e2]", "- field [filled from your vault]", '- listbox "Size" [ref=e3]', '  - option "M" [selected]'].join("\n"));
+  assert.doesNotMatch(text, /UK|FR|Ada|42|Hidden/);
+});
+
+test("csv import: a password or username longer than the vault keeps is left out and reported, never cut short", async () => {
+  const long = "p".repeat(VAULT_MAX_VALUE + 1);
+  const parsed = parsePasswordExport(
+    [
+      "name,url,username,password,note",
+      `a,https://a.example/,ada,${long},`,
+      `b,https://b.example/,${"u".repeat(VAULT_MAX_VALUE + 1)},pw,`,
+      `c,https://c.example/,cy,${"p".repeat(VAULT_MAX_VALUE)},${"n".repeat(VAULT_MAX_VALUE + 1)}`,
+      "d,https://d.example/,dee,pw2,a note",
+    ].join("\n"),
+  );
+  assert.deepEqual([parsed.skipped, parsed.tooLong, parsed.notesTooLong], [2, 2, 1]);
+  assert.deepEqual(
+    parsed.logins.map((login) => [login.site, login.password.length, login.notes.length]),
+    [
+      ["https://c.example", VAULT_MAX_VALUE, 0],
+      ["https://d.example", 3, 6],
+    ],
+    "a password at the limit is kept whole; a too-long note is left out, its login kept",
+  );
+  const result = await new Vault(tempDir(), fakeSealer()).importLogins(parsed);
+  assert.deepEqual([result.added, result.skipped, result.tooLong, result.notesDropped], [2, 2, 2, 1]);
+});
+
+test("audit: a sealed head catches a log cut short, emptied, deleted or rewritten, and a torn last line is recovered", () => {
+  const sealer = fakeSealer();
+  const setupLog = () => {
+    const file = join(tempDir(), "vault-audit.jsonl");
+    const audit = new VaultAudit(file, sealer);
+    for (const site of ["https://a.example", "https://b.example", "https://c.example"]) audit.append({ event: "fill", itemId: "v1", label: "Login", site, fields: ["password"], agentId: "a1" });
+    return { file, audit };
+  };
+  const problem = (file: string) => new VaultAudit(file, sealer).view().problem;
+
+  const intact = setupLog();
+  assert.deepEqual([intact.audit.view().ok, intact.audit.view().problem, intact.audit.view().unsealed], [true, null, false]);
+  assert.equal(readFileSync(`${intact.file}.head`, "utf8").includes(verifyAuditChain(readFileSync(intact.file, "utf8")).records[2].hash), false, "the head is sealed, not in the clear");
+
+  // The last line dropped: the chain still checks out, the head doesn't.
+  const cut = setupLog();
+  writeFileSync(cut.file, `${readFileSync(cut.file, "utf8").trim().split("\n").slice(0, 2).join("\n")}\n`);
+  assert.equal(verifyAuditChain(readFileSync(cut.file, "utf8")).ok, true);
+  assert.equal(problem(cut.file), "The log's last entry was removed outside the app (it had 3).");
+
+  // Rewritten from the start with fresh hashes.
+  const rewritten = setupLog();
+  const lines: string[] = [];
+  let prev = "0".repeat(64);
+  for (let seq = 1; seq <= 3; seq++) {
+    const body = { seq, at: new Date().toISOString(), event: "fill", site: "https://other.example", sealed: true, prev };
+    const hash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    lines.push(JSON.stringify({ ...body, hash }));
+    prev = hash;
+  }
+  writeFileSync(rewritten.file, `${lines.join("\n")}\n`);
+  assert.equal(verifyAuditChain(readFileSync(rewritten.file, "utf8")).ok, true);
+  assert.match(problem(rewritten.file) ?? "", /rewritten outside the app/);
+
+  // Emptied, deleted, or its head deleted.
+  const emptied = setupLog();
+  writeFileSync(emptied.file, "");
+  assert.match(problem(emptied.file) ?? "", /gone or empty, though it had 3 entries/);
+  const deleted = setupLog();
+  rmSync(deleted.file);
+  assert.match(problem(deleted.file) ?? "", /gone or empty/);
+  const headless = setupLog();
+  rmSync(`${headless.file}.head`);
+  assert.match(problem(headless.file) ?? "", /sealed head is missing/);
+  const forged = setupLog();
+  writeFileSync(`${forged.file}.head`, JSON.stringify({ version: 1, sealed: Buffer.from('{"seq":3,"hash":"x"}').toString("base64") }));
+  assert.match(problem(forged.file) ?? "", /sealed head can't be read/);
+
+  // Lines appended outside the app past the head (one past it is the app stopping between line and head).
+  const added = setupLog();
+  const records = verifyAuditChain(readFileSync(added.file, "utf8")).records;
+  let last = records[2].hash;
+  let extra = "";
+  for (let seq = 4; seq <= 5; seq++) {
+    const body = { seq, at: new Date().toISOString(), event: "fill", sealed: true, prev: last };
+    last = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    extra += `${JSON.stringify({ ...body, hash: last })}\n`;
+    if (seq === 4) {
+      writeFileSync(added.file, readFileSync(added.file, "utf8") + extra);
+      extra = "";
+      assert.equal(problem(added.file), null, "one line past the head is the app stopping between the two");
+    }
+  }
+  writeFileSync(added.file, readFileSync(added.file, "utf8") + extra);
+  assert.match(problem(added.file) ?? "", /added to the log outside the app after entry 4/);
+
+  // A line cut short as the app stopped: dropped when the log is opened, the drop logged, the chain going on.
+  const torn = setupLog();
+  writeFileSync(torn.file, `${readFileSync(torn.file, "utf8")}{"seq":4,"at":"2026-11-02T10:00:00.000Z","event":"fil`);
+  const reopened = new VaultAudit(torn.file, sealer);
+  const view = reopened.view();
+  assert.deepEqual([view.ok, view.entries], [true, 4]);
+  const after = verifyAuditChain(readFileSync(torn.file, "utf8")).records;
+  assert.deepEqual([after[3].event, after[3].seq], ["recovered", 4]);
+  reopened.append({ event: "deleted", itemId: "v1" });
+  assert.deepEqual([reopened.view().ok, reopened.view().entries], [true, 5]);
+  // A complete last line missing only its newline is kept.
+  const unended = setupLog();
+  writeFileSync(unended.file, readFileSync(unended.file, "utf8").trimEnd());
+  assert.deepEqual([new VaultAudit(unended.file, sealer).view().ok, new VaultAudit(unended.file, sealer).view().entries], [true, 3]);
+
+  // A log from before heads were kept is taken as it is once, then checked from there on.
+  const legacyFile = join(tempDir(), "vault-audit.jsonl");
+  const legacy = new VaultAudit(legacyFile);
+  legacy.append({ event: "added", itemId: "v1" });
+  legacy.append({ event: "fill", itemId: "v1" });
+  assert.deepEqual([legacy.view().ok, legacy.view().unsealed], [true, true], "without secure storage, nothing to check the end against");
+  writeFileSync(legacyFile, `${readFileSync(legacyFile, "utf8").trim().split("\n")[0]}\n`);
+  assert.equal(new VaultAudit(legacyFile).view().ok, true, "unsealed, a cut end doesn't show (README says so)");
+  const adopted = new VaultAudit(legacyFile, sealer);
+  assert.equal(adopted.view().problem, null);
+  writeFileSync(legacyFile, "");
+  assert.match(problem(legacyFile) ?? "", /gone or empty, though it had 1 entry/);
+
+  assert.equal(auditHeadProblem([], "missing"), null, "a new log");
 });

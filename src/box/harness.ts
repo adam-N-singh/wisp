@@ -286,6 +286,7 @@ export class Harness {
    * Returns false when the nonce was already accepted (duplicate send). A prompt that starts with
    * "/<command>" runs that skill unless `skill` names one. A reply keeps its quote (or, without one,
    * the start of the message it names) and who wrote that message, while the box still has it.
+   * `settled` is told how the run that answers it ends, even one that ends before this returns.
    */
   submitPrompt(
     agentId: string,
@@ -305,6 +306,7 @@ export class Harness {
       /** In a member's group session: the room's last entry the message brings it up to. */
       roomThroughSeq?: number;
     },
+    settled?: (outcome: TurnOutcome) => void,
   ): boolean {
     const row = this.requireAgent(agentId);
     const c = conversation(agentId, input.sessionId);
@@ -370,15 +372,17 @@ export class Harness {
       if (waiter.c.key === c.key && waiter.kind === "widget") this.settleWidget(c, waiter.entryId, { respondedValue: input.prompt }, input.prompt);
     }
     const run = this.runs.get(c.key);
+    const told = settled != null ? [settled] : [];
     if (run != null && !run.abort.signal.aborted) {
       run.pendingInput = true;
       run.turn = turn;
       run.clientNonce = nonce ?? run.clientNonce;
+      run.settled.push(...told);
     } else if (run != null) {
       // Stopped (or started fresh) and still winding down: the prompt is the next run's, not this one's.
-      run.next = { turn, clientNonce: nonce ?? message.id, settled: run.next?.settled ?? [] };
+      run.next = { turn, clientNonce: nonce ?? message.id, settled: [...(run.next?.settled ?? []), ...told] };
     } else {
-      void this.run(c, turn, nonce ?? message.id);
+      void this.run(c, turn, nonce ?? message.id, told);
     }
     return true;
   }
@@ -389,12 +393,8 @@ export class Harness {
    * and this waits for that one.
    */
   runTurn(agentId: string, sessionId: string, input: Omit<Parameters<Harness["submitPrompt"]>[1], "sessionId">): Promise<TurnOutcome> {
-    const c = conversation(agentId, sessionId);
     return new Promise((resolve) => {
-      if (!this.submitPrompt(agentId, { ...input, sessionId })) return resolve({ outcome: "error", texts: [], error: "That message was already sent." });
-      const run = this.runs.get(c.key);
-      if (run == null) return resolve({ outcome: "error", texts: [], error: "The turn didn't start." });
-      (run.next ?? run).settled.push(resolve);
+      if (!this.submitPrompt(agentId, { ...input, sessionId }, resolve)) resolve({ outcome: "error", texts: [], error: "That message was already sent." });
     });
   }
 
@@ -879,8 +879,10 @@ export class Harness {
     const name = call.function.name;
     const turn = entry.turn;
     const step = entry.step;
-    this.patch(c, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
     const finish = (status: "done" | "failed", output: string, error: string | null = null) => this.finishTool(c, entry, status, output, error);
+    // Its session or agent was deleted or started fresh under the run (a Claude Code call that came in late): it writes nothing.
+    if (!this.current(c)) return finish("failed", "", "Interrupted.");
+    this.patch(c, { currentActivity: { kind: "tool", tool: name, detail: entry.summary, callId: call.id } });
     if (entry.detail?.error != null) return finish("failed", "", entry.detail.error);
     const args = entry.detail?.args ?? {};
     const signal = run.abort.signal;
@@ -892,7 +894,7 @@ export class Harness {
           sessionId: c.sessionId,
           store: this.deps.store,
           signal,
-          emitTodos: (todos: AgentTodo[]) => this.deps.emit("todos", c.sessionId === MAIN_SESSION ? { agentId, todos } : { agentId, sessionId: c.sessionId, todos }),
+          setTodos: (todos: AgentTodo[]) => this.saveTodos(c, todos),
           automationsChanged: (automation, action) => {
             this.recordAutomationEvent(automation, action);
             this.deps.emit("automations", { agentId, automations: this.deps.store.listAutomations(agentId) });
@@ -1488,10 +1490,7 @@ export class Harness {
       finishToolEntry: (entry, status, output, error) => this.finishTool(c, entry, status, output, error),
       notice: (tone, text) => this.notice(c, run.turn, tone, text),
       setActivity: (activity) => this.patch(c, { currentActivity: activity ?? undefined }),
-      setTodos: (todos) => {
-        this.deps.store.setTodos(agentId, todos, c.sessionId);
-        this.deps.emit("todos", c.sessionId === MAIN_SESSION ? { agentId, todos } : { agentId, sessionId: c.sessionId, todos });
-      },
+      setTodos: (todos) => this.saveTodos(c, todos),
       requestApproval: (entry, ask) => this.requestPermission(c, run, entry.turn, entry.step, entry, ask),
       runAppTool: async (step, name, args) => {
         const call: ToolCall = { id: `app_${randomUUID()}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
@@ -1528,12 +1527,19 @@ export class Harness {
   }
 
   /**
-   * The conversation is still the one `c` was made for: not deleted, and for a run's, not started
-   * fresh since the run began (its transcript's epoch is the one the run started in).
+   * The conversation is still the one `c` was made for: neither it nor its agent deleted, and for a
+   * run's, not started fresh since the run began (its transcript's epoch is the one the run started in).
    */
   private current(c: Conversation): boolean {
-    if (this.gone.has(c.key)) return false;
+    if (this.gone.has(c.key) || this.deps.store.getAgent(c.agentId) == null) return false;
     return c.epoch == null || c.epoch === this.deps.store.ordered(c.agentId, c.sessionId).epoch;
+  }
+
+  /** Saves the session's todo list and tells clients; a run's list goes nowhere once its session or agent is gone or started fresh. */
+  private saveTodos(c: Conversation, todos: AgentTodo[]): void {
+    if (!this.current(c)) return;
+    this.deps.store.setTodos(c.agentId, todos, c.sessionId);
+    this.deps.emit("todos", c.sessionId === MAIN_SESSION ? { agentId: c.agentId, todos } : { agentId: c.agentId, sessionId: c.sessionId, todos });
   }
 
   /** Broadcast a streaming partial at most every STREAM_EMIT_MS, without persisting. */

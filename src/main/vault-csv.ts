@@ -2,7 +2,7 @@
 // Chrome and Edge ("name,url,username,password[,note]") and Firefox ("url,username,password,
 // httpRealm,formActionOrigin,guid,…"). Only a file the user picks is read, on this PC; no browser's
 // or password manager's own store is ever opened. Pure, so it's unit-tested.
-import { normalizeSite } from "../shared/vault";
+import { normalizeSite, VAULT_MAX_VALUE } from "../shared/vault";
 
 export const CSV_MAX_BYTES = 5 * 1024 * 1024;
 export const CSV_MAX_ROWS = 10_000;
@@ -18,8 +18,12 @@ export interface ImportedLogin {
 export interface ParsedExport {
   format: "chrome" | "firefox";
   logins: ImportedLogin[];
-  /** Rows without a web address or a password (app logins, blank rows). */
+  /** Rows left out: without a web address or a password (app logins, blank rows), or too long (counted in `tooLong` too). */
   skipped: number;
+  /** Rows left out because the password or username is longer than the vault keeps; never cut short, which would save a login that doesn't work. */
+  tooLong: number;
+  /** Notes longer than the vault keeps, left out (their logins are kept). */
+  notesTooLong: number;
 }
 
 /** RFC 4180: quoted fields with "" for a quote, and line breaks inside quotes; CRLF, LF or CR rows. */
@@ -72,18 +76,32 @@ export function parsePasswordExport(text: string): ParsedExport {
   const note = column("note", "notes");
   const logins: ImportedLogin[] = [];
   let skipped = 0;
+  let tooLong = 0;
+  let notesTooLong = 0;
   for (const row of rows.slice(1)) {
     const site = normalizeSite((row[url] ?? "").trim());
     const secret = row[password] ?? "";
+    const user = row[username] ?? "";
     // App logins (android://…), empty passwords and blank lines aren't for the agent browser.
     if (site == null || !/^https?:/.test(site) || secret.length === 0) {
       skipped++;
       continue;
     }
+    // A password or username cut short wouldn't sign in: the row is left out and the report says so.
+    if (secret.length > VAULT_MAX_VALUE || user.length > VAULT_MAX_VALUE) {
+      skipped++;
+      tooLong++;
+      continue;
+    }
+    let notes = note >= 0 ? (row[note] ?? "") : "";
+    if (notes.length > VAULT_MAX_VALUE) {
+      notes = "";
+      notesTooLong++;
+    }
     // Chrome names a login after its host, which the label already says.
     const title = name >= 0 ? (row[name] ?? "").trim().slice(0, 120) : "";
     const host = new URL(site).hostname.replace(/^www\./, "");
-    logins.push({ site, title: title.replace(/^www\./i, "").toLowerCase() === host ? "" : title, username: (row[username] ?? "").slice(0, 1000), password: secret.slice(0, 4000), notes: note >= 0 ? (row[note] ?? "").slice(0, 10_000) : "" });
+    logins.push({ site, title: title.replace(/^www\./i, "").toLowerCase() === host ? "" : title, username: user, password: secret, notes });
   }
-  return { format, logins, skipped };
+  return { format, logins, skipped, tooLong, notesTooLong };
 }

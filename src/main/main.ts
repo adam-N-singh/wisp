@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { app, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, nativeTheme, net, protocol, safeStorage, screen, session, shell } from "electron";
 import { autoUpdater } from "electron-updater";
 import { BOT_TEMPLATE_EXTENSION, botTemplateFileName } from "../shared/bot-template";
-import { CanvasLinkGate } from "../shared/canvas";
+import { CANVAS_LINK_INTERVAL_MS, CanvasLinkGate, CanvasRefusalLog, rateLimit } from "../shared/canvas";
 import { serveEdge } from "../shared/rpc/runtime";
 import { ipcServerTransport, type PortPeer } from "../shared/rpc/transports";
 import { type BoxLocationState, type BoxModelConfig, boxHostEdge, coordinatorControlEdge, type DeepLink, localHostEdge, mainEdge, type ThemeState } from "../shared/edges";
@@ -246,7 +246,7 @@ async function main(): Promise<void> {
   // A fill runs only on an Allow once the user gave on this PC for a card that named that item on that
   // site (its description, `vault:<item>@<origin>`), which local-exec has taken and main now spends.
   const vault = new Vault(userDataDir, safeStorage);
-  const vaultAudit = new VaultAudit(join(userDataDir, "vault-audit.jsonl"));
+  const vaultAudit = new VaultAudit(join(userDataDir, "vault-audit.jsonl"), safeStorage);
   const vaultFiller = new VaultFiller({
     vault,
     audit: vaultAudit,
@@ -583,6 +583,9 @@ async function main(): Promise<void> {
   // Canvases, from whichever box is in use (this PC's or a server), and the links they ask to open.
   handleCanvasProtocol(protocol, new CanvasFrames(() => processes.gatewayAddress(), (url, init) => net.fetch(url, init)));
   const canvasLinks = new CanvasLinkGate();
+  // A canvas asking in a loop gets its requests looked at twice a second, and its refusals logged once a minute.
+  const canvasLinkCalls = rateLimit(CANVAS_LINK_INTERVAL_MS);
+  const canvasLinkRefusals = new CanvasRefusalLog();
 
   // ---- main edge (renderer -> main), main window top frame only ----------------------------
   const mainTargets = () => (mainWindow != null && !mainWindow.isDestroyed() ? [mainWindow.webContents] : []);
@@ -806,9 +809,10 @@ async function main(): Promise<void> {
         return picked.filePath;
       },
       openLinkFromCanvas: async ({ url }) => {
-        const verdict = canvasLinks.admit(url, canvasOnPage(win().webContents));
+        const verdict = canvasLinkCalls() ? canvasLinks.admit(url, canvasOnPage(win().webContents)) : { open: false as const, reason: "too many requests" };
         if (!verdict.open) {
-          console.error(`[canvas] a link wasn't opened (${verdict.reason})`);
+          const line = canvasLinkRefusals.note(verdict.reason);
+          if (line != null) console.error(line);
           return false;
         }
         await shell.openExternal(verdict.url);

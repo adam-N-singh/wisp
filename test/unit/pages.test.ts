@@ -124,6 +124,53 @@ test("page text: the title is the first # heading outside code, excerpts leave m
   assert.deepEqual([pageFileName("Q3: plan / draft?"), pageFileName("  ...  "), pageFileName("Notes.")], ["Q3 plan draft.md", "Document.md", "Notes.md"]);
 });
 
+test("document text is read in one pass: 256 KB lines built to make the title and excerpt scans backtrack take milliseconds, and read as before", () => {
+  // Each made a pattern rescan the rest of its line from every place it could start: a heading's
+  // trailing spaces or `#`s, links that never close, spaces that never reach a table pipe.
+  const line = (unit: string, lead = "", tail = "") => lead + unit.repeat(Math.floor((MAX_PAGE_SOURCE - lead.length - tail.length) / unit.length)) + tail;
+  const sources = [
+    line(" ", "# a", "b"),
+    line(" #", "# a", "x"),
+    line("\t", "# a", "#x"),
+    line("["),
+    line("[](", "# "),
+    line("![a](", "text "),
+    line("[a]"),
+    line(" ", "a", "b"),
+    line(" *a"),
+    line("_a "),
+    line("- ", "", "x"),
+    line("|-", "", "x"),
+    line(" ", "| a", "x"),
+  ];
+  for (const source of sources) {
+    const started = process.hrtime.bigint();
+    documentTitle(source);
+    documentExcerpt(source);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1_000, `${JSON.stringify(source.slice(0, 8))}… (${source.length} characters) took ${ms.toFixed(0)} ms`);
+  }
+  // Headings: the closing `#`s go only after a space, and a line the old pattern couldn't end (a `\r`) is no title.
+  const titles: Array<[string, string | null]> = [
+    ["# Title #\n", "Title"],
+    ["#   Spaced   out   ##  \t\n", "Spaced out"],
+    ["# C# notes\n", "C# notes"],
+    ["# Title#\n", "Title#"],
+    ["# a ## ##\n", "a ##"],
+    ["# ##\n", "##"],
+    ["#   \n# Next\n", "Next"],
+    ["# CRLF\r\n# Plain\n", "Plain"],
+    ["   # Indented\n", "Indented"],
+    ["    # Code, not a heading\n", null],
+    ["# [a [b](u) and ![img](x.png) [c](https://en.wikipedia.org/wiki/F_(x))\n", "a [b and img c)"],
+    ["# [never](closed and [x]\n", "[never](closed and [x]"],
+  ];
+  for (const [source, title] of titles) assert.equal(documentTitle(source), title, JSON.stringify(source));
+  // Excerpts: links read as their labels, and a table's pipes as dots, however the spaces around them run.
+  assert.equal(documentExcerpt("# T\n\n|  a   |b|   c  |\n| [x [y](u) |   z\n"), "a · b · c x [y · z");
+  assert.equal(documentExcerpt("# T\n\na | | b\n"), "a · · b");
+});
+
 test("page store: revisions keep their Markdown by hash, survive a restart, the oldest go past the limit, and deleting removes what no page names", () => {
   const { dir, store } = setup();
   store.putAgent(agent("a2"));

@@ -3,7 +3,8 @@
 // Elements an agent can act on (and the landmarks it can read on their own) get a ref ("e7"),
 // which stays the element's while its document lives, so refs from an earlier snapshot still work
 // after the page changes around them. Text fields show what's in them, except password, payment
-// card and one-time code fields and fields filled from the vault. A frame from the page's own
+// card and one-time code fields, fields filled from the vault, and any field whose DOM details
+// (`fields`) weren't read, since those are what tell a secret field apart. A frame from the page's own
 // origin is read in its place, from its own tree (agent-browser.ts fetches it), and its elements'
 // refs name their frame, so clicks and typing reach them; a frame from anywhere else is named, with
 // where it's from, but not read. No HTML: names, roles, states and text only. Pure, so it's
@@ -53,7 +54,7 @@ export interface SnapshotOptions {
   maxChars?: number;
   /** The page's address, so links on the same site show as paths. */
   pageUrl?: string;
-  /** By backendDOMNodeId, in the page's tree and its frames' alike. */
+  /** By backendDOMNodeId, in the page's tree and its frames' alike. A field holding a value that isn't here shows no value. */
   fields?: Map<number, FieldInfo>;
   /** Fields filled from the vault: they show as filled, never with what's in them. */
   filled?: ReadonlySet<number>;
@@ -106,6 +107,21 @@ const TEXT_LIMIT = 2_000;
 /** The fields whose DOM details (FieldInfo) the snapshot wants, to keep secrets out of it. */
 export function needsFieldInfo(role: string): boolean {
   return VALUE_ROLES.has(role);
+}
+
+/** Fields whose DOM details a snapshot reads, at most: those with something in them, then empty ones. */
+export const MAX_FIELDS_HOLDING = 2_000;
+export const MAX_EMPTY_FIELDS = 300;
+
+/**
+ * The fields whose DOM details (FieldInfo) to read, from the page's tree and its frames' together:
+ * every one with something in it first, wherever it is, then empty ones (a select's options). A
+ * field holding a value that's left out shows no value (renderSnapshot).
+ */
+export function fieldsToDescribe(nodes: AXNode[]): AXNode[] {
+  const fields = nodes.filter((node) => node.backendDOMNodeId != null && needsFieldInfo(String(node.role?.value ?? "")));
+  const holding = (node: AXNode) => clean(node.value?.value).length > 0;
+  return [...fields.filter(holding).slice(0, MAX_FIELDS_HOLDING), ...fields.filter((node) => !holding(node)).slice(0, MAX_EMPTY_FIELDS)];
 }
 
 /**
@@ -197,6 +213,20 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
     if (node == null) return [];
     const role = String(node.role?.value ?? "");
     if (SKIPPED.has(role)) return [];
+    // A field filled from the vault shows as filled whatever its role: a listbox's options would say
+    // which one is selected, and a role the page gave an input (button, option, generic) could read
+    // its value out as its name or its text. Only a listbox's name (its label) shows; value roles
+    // are masked below, with their label.
+    const filledId = node.backendDOMNodeId;
+    const vaultFilled = filledId != null && options.filled?.has(filledId) === true;
+    // Hidden from the accessibility tree: nothing of it (nor of its options) shows.
+    if (vaultFilled && node.ignored === true) return [];
+    if (vaultFilled && !VALUE_ROLES.has(role)) {
+      const label = ROLE_LABELS[role] ?? (TRANSPARENT.has(role) || role.length === 0 ? "field" : role);
+      const shown = role === "listbox" ? clean(node.name?.value) : "";
+      const ref = INTERACTIVE.has(role) || REGIONS.has(role) ? refs.refFor(filledId, label, shown, tree.frameId) : null;
+      return [{ kind: "line", text: `${label}${shown.length > 0 ? ` ${quote(shown)}` : ""} [filled from your vault]${ref != null ? ` [ref=${ref}]` : ""}`, name: shown, children: [] }];
+    }
     if (node.ignored === true) return children(node, tree);
     const name = clean(node.name?.value);
     if (role === "StaticText") return name.length > 0 ? [{ kind: "text", text: String(node.name?.value ?? "") }] : [];
@@ -231,7 +261,12 @@ export function renderSnapshot(nodes: AXNode[], refs: RefTable, options: Snapsho
       // A masked value (•••) still tells its length; secrets show as their kind only.
       if (secret != null) attrs.push(secret === "password" ? "password" : secret);
       if (backendNodeId != null && options.filled?.has(backendNodeId) === true) attrs.push("filled from your vault");
-      else if (secret == null) value = cut(clean(node.value?.value), TEXT_LIMIT);
+      else if (secret == null) {
+        const shown = cut(clean(node.value?.value), TEXT_LIMIT);
+        // Without its DOM details a card or code field labelled plainly ("Number") can't be told, so what's in it stays out.
+        if (shown.length > 0 && field == null) attrs.push("value not shown");
+        else value = shown;
+      }
       if (field?.tag === "select" || role === "combobox") {
         const options = descendants(node, "option", tree).map((option) => clean(option.name?.value)).filter((text) => text.length > 0);
         if (options.length > 0) attrs.push(`options: ${options.slice(0, 25).map((text) => quote(cut(text, 60))).join(", ")}${options.length > 25 ? `, … ${options.length - 25} more` : ""}`);

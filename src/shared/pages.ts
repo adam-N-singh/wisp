@@ -67,6 +67,18 @@ export interface LibraryPage {
   updatedBy: PageAuthor;
 }
 
+/**
+ * Of what a client knows of a page and a view that just arrived (a read's answer, an event), the one
+ * to keep: answers and events come by different routes, so an older revision never replaces a newer
+ * one. At the same revision the one that arrived wins, unless it's a read that an event overtook
+ * (`overtaken`), which may say less (a rename).
+ */
+export function newerPage<T extends Pick<LibraryPage, "revision">>(known: T | null | undefined, arrived: T, overtaken = false): T {
+  if (known == null || arrived.revision > known.revision) return arrived;
+  if (arrived.revision < known.revision) return known;
+  return overtaken ? known : arrived;
+}
+
 /** `readPage`: the page and one revision's Markdown (`canvasPage`: a canvas's HTML), the newest unless another was asked for. */
 export interface PageDocument extends LibraryPage {
   source: string;
@@ -107,6 +119,65 @@ export function cleanPageTitle(text: string): string {
   return line.length <= MAX_PAGE_TITLE ? line : `${line.slice(0, MAX_PAGE_TITLE - 1).trimEnd()}…`;
 }
 
+// Document text is read in one pass over each line. The patterns these replace rescanned the rest of
+// a line from every place they could start (a heading's trailing spaces, a `[` that never made a link),
+// so one long line in a document could hold up every agent in the box.
+
+const isBlank = (char: string | undefined) => char === " " || char === "\t";
+
+/**
+ * A level-1 heading's text, as `/^ {0,3}#[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/` read it: without its
+ * closing `#`s (only after a space) and trailing spaces; null when the line isn't one.
+ */
+function headingText(line: string): string | null {
+  const open = /^ {0,3}#[ \t]+/.exec(line);
+  if (open == null) return null;
+  const rest = line.slice(open[0].length);
+  // `.` doesn't take a line break, and nothing after it could, so such a line was never a heading.
+  if (rest.length === 0 || /[\r\n\u2028\u2029]/.test(rest)) return null;
+  let end = rest.length;
+  while (end > 0 && isBlank(rest[end - 1])) end--;
+  let hashes = end;
+  while (hashes > 0 && rest[hashes - 1] === "#") hashes--;
+  if (hashes < end && isBlank(rest[hashes - 1])) {
+    let text = hashes - 1;
+    while (text > 0 && isBlank(rest[text - 1])) text--;
+    if (text > 0) end = text;
+  }
+  return rest.slice(0, end);
+}
+
+/** Where `char` next appears at or after each index of `text` (-1 when it doesn't). */
+function nextOf(text: string, char: string): Int32Array {
+  const next = new Int32Array(text.length + 1).fill(-1);
+  for (let index = text.length - 1, at = -1; index >= 0; index--) {
+    if (text[index] === char) at = index;
+    next[index] = at;
+  }
+  return next;
+}
+
+/** Links and images as their labels: what `.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")` gave. */
+function linkLabels(text: string): string {
+  if (!text.includes("[")) return text;
+  const bracket = nextOf(text, "]");
+  const paren = nextOf(text, ")");
+  let out = "";
+  let kept = 0;
+  for (let index = 0; index < text.length; index++) {
+    const open = text[index] === "[" ? index : text[index] === "!" && text[index + 1] === "[" ? index + 1 : -1;
+    if (open < 0) continue;
+    const close = bracket[open + 1];
+    if (close < 0 || text[close + 1] !== "(") continue;
+    const end = paren[close + 2];
+    if (end < 0) continue;
+    out += text.slice(kept, index) + text.slice(open + 1, close);
+    kept = end + 1;
+    index = end;
+  }
+  return out + text.slice(kept);
+}
+
 /** The text of a document's first level-1 heading (`# Title`) outside code, without its inline marks; null if it has none. */
 export function documentTitle(source: string): string | null {
   let fence: string | null = null;
@@ -118,11 +189,10 @@ export function documentTitle(source: string): string | null {
       continue;
     }
     if (fence != null) continue;
-    const heading = /^ {0,3}#[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/.exec(line)?.[1];
+    const heading = headingText(line);
     if (heading == null) continue;
     const text = cleanPageTitle(
-      heading
-        .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      linkLabels(heading)
         .replace(/(\*\*|__|`)/g, "")
         .replace(/(^|\s)[*_](\S[^*_]*\S|\S)[*_](?=\s|$)/g, "$1$2"),
     );
@@ -151,12 +221,19 @@ export function documentExcerpt(source: string, limit = 240): string {
     const line = trimmed
       .replace(/^#{1,6}\s+/, "")
       .replace(/^>\s?/, "")
-      .replace(/^([-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?/, "")
-      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/^([-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?/, "");
+    const cells = linkLabels(line)
       .replace(/(\*\*|__|`|~~)/g, "")
       .replace(/^\||\|$/g, "")
-      .replace(/\s*\|\s*/g, " · ");
-    if (line.length > 0) lines.push(line);
+      .split("|");
+    // Each pipe and the spaces around it as one dot (what `/\s*\|\s*/g` did, which rescanned every run of spaces).
+    const text = cells
+      .map((cell, index) => {
+        const start = index > 0 ? cell.trimStart() : cell;
+        return index < cells.length - 1 ? start.trimEnd() : start;
+      })
+      .join(" · ");
+    if (text.length > 0) lines.push(text);
     if (lines.join(" ").length >= limit) break;
   }
   const text = lines.join(" ").replace(/\s+/g, " ").trim();
@@ -193,12 +270,81 @@ export function pageFileName(title: string, kind: PageKind = "document"): string
   return `${base}.${kind === "canvas" ? "html" : "md"}`;
 }
 
-/** Text from a canvas for its card and its title: what the page shows, without script, style or tags. */
+// A canvas's text, title and excerpt are read from HTML the agent wrote, in the box host that every
+// agent and the gateway share, so each is one pass from left to right: a lazy regex like
+// `<!--[\s\S]*?-->` reads to the end again for every opener that never closes, which on 256 KB of
+// `<!--` is billions of steps. Each scan here looks at each `<` once.
+
+/** Elements whose content isn't text the page shows. */
+const HIDDEN_ELEMENT = /<(script|style|template|svg|noscript)\b/iy;
+
+/** Where `</name>` (any case, with space before its `>`) starts and ends, from `from` on; null when it never closes. */
+function closingTag(html: string, name: string, from: number): { start: number; end: number } | null {
+  const close = new RegExp(`<\\/${name}\\s*>`, "iy");
+  for (let at = html.indexOf("<", from); at >= 0; at = html.indexOf("<", at + 1)) {
+    close.lastIndex = at;
+    if (close.test(html)) return { start: at, end: close.lastIndex };
+  }
+  return null;
+}
+
+/** Where the next `<name` (a whole tag name) starts, from `from` on, and where its name ends; null when there's none. */
+function openingTag(html: string, name: string, from: number): { start: number; end: number } | null {
+  const open = new RegExp(`<${name}\\b`, "iy");
+  for (let at = html.indexOf("<", from); at >= 0; at = html.indexOf("<", at + 1)) {
+    open.lastIndex = at;
+    if (open.test(html)) return { start: at, end: open.lastIndex };
+  }
+  return null;
+}
+
+/** The HTML with every `<name …>…</name>` element left out (`all`) or only the first; an element that never closes stays. */
+function withoutElements(html: string, name: string, all: boolean): string {
+  const parts: string[] = [];
+  let at = 0;
+  for (let open = openingTag(html, name, 0); open != null; open = all ? openingTag(html, name, at) : null) {
+    const close = closingTag(html, name, open.end);
+    if (close == null) break;
+    parts.push(html.slice(at, open.start), " ");
+    at = close.end;
+  }
+  parts.push(html.slice(at));
+  return parts.join("");
+}
+
+/**
+ * Text from a canvas for its card and its title: what the page shows, without comments, script,
+ * style or tags. A comment or a hidden element that never closes hides the rest, as it does on the page.
+ */
 function canvasText(html: string): string {
-  return html
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<(script|style|template|svg|noscript)\b[\s\S]*?<\/\1\s*>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
+  const parts: string[] = [];
+  let at = 0;
+  while (at < html.length) {
+    const lt = html.indexOf("<", at);
+    if (lt < 0) {
+      parts.push(html.slice(at));
+      break;
+    }
+    parts.push(html.slice(at, lt), " ");
+    HIDDEN_ELEMENT.lastIndex = lt;
+    const hidden = HIDDEN_ELEMENT.exec(html);
+    if (html.startsWith("<!--", lt)) {
+      const end = html.indexOf("-->", lt + 4);
+      at = end < 0 ? html.length : end + 3;
+    } else if (hidden != null) {
+      at = closingTag(html, hidden[1], HIDDEN_ELEMENT.lastIndex)?.end ?? html.length;
+    } else {
+      const gt = html.indexOf(">", lt + 1);
+      // A `<` with no `>` after it is text, and so is everything after it.
+      if (gt < 0) {
+        parts.push(html.slice(lt));
+        break;
+      }
+      at = gt + 1;
+    }
+  }
+  return parts
+    .join("")
     .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -209,10 +355,19 @@ function canvasText(html: string): string {
     .trim();
 }
 
-/** A canvas's <title>, or else its first <h1>; null when it has neither. */
+/** The inner HTML of the first `<name …>…</name>`; null when there's none, or it never closes. */
+function firstElement(html: string, name: string): string | null {
+  const open = openingTag(html, name, 0);
+  const gt = open != null ? html.indexOf(">", open.end) : -1;
+  const close = gt >= 0 ? closingTag(html, name, gt + 1) : null;
+  return close != null ? html.slice(gt + 1, close.start) : null;
+}
+
+/** A canvas's <title>, or else its first <h1>; null when it has neither. Read only within the size a page may have. */
 export function canvasTitle(html: string): string | null {
-  for (const pattern of [/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i, /<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i]) {
-    const found = pattern.exec(html)?.[1];
+  const page = html.length > MAX_PAGE_SOURCE ? html.slice(0, MAX_PAGE_SOURCE) : html;
+  for (const name of ["title", "h1"]) {
+    const found = firstElement(page, name);
     const text = found != null ? cleanPageTitle(canvasText(found)) : "";
     if (text.length > 0) return text;
   }
@@ -221,7 +376,8 @@ export function canvasTitle(html: string): string | null {
 
 /** A line or two of what a canvas shows, for its card; its title (the <head>) left out. */
 export function canvasExcerpt(html: string, limit = 240): string {
-  const text = canvasText(html.replace(/<head\b[\s\S]*?<\/head\s*>/i, " ").replace(/<title\b[\s\S]*?<\/title\s*>/gi, " "));
+  const page = html.length > MAX_PAGE_SOURCE ? html.slice(0, MAX_PAGE_SOURCE) : html;
+  const text = canvasText(withoutElements(withoutElements(page, "head", false), "title", true));
   return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 }
 

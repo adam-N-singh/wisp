@@ -44,8 +44,12 @@ export interface MarketplaceRecord {
 /** The daily check's last look at a marketplace: newer files for installed plugins that no refresh has read. */
 export interface MarketplaceCheck {
   at: number;
-  /** By installed plugin id: the commit the newer files are at, and whether its servers change with them. */
-  updates: Record<string, { commit: string; serversChanged: boolean }>;
+  /**
+   * By installed plugin id: the commit the newer files are at, and whether its servers change with
+   * them. `hash` and `serversKey` say which update it is: a change to the servers alone (a plugin
+   * whose marketplace entry declares them) keeps the commit. Checks before them have neither.
+   */
+  updates: Record<string, { commit: string; serversChanged: boolean; hash?: string; serversKey?: string }>;
 }
 
 /** Where a plugin's files are: a folder of the marketplace's repository ("" for its root), a GitHub repository, or a source the box can't fetch. */

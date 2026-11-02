@@ -1,11 +1,12 @@
 // The vault's tools (src/shared/vault.ts). Main keeps the vault and fills from it (src/main/vault.ts);
 // the daemon offers the tools and plans each fill for the policy. vault_list is a read (labels, no
 // values). request_credential is rated dangerous: the user is asked on this PC every time, for that
-// item on the site main read from the page, and it's never remembered. The call goes on to main with
-// the site it was rated for and the approval's id, and main checks both again before a value moves.
+// item on the site main read from the page, in that tab and into those fields, and it's never
+// remembered. The call goes on to main with the site it was rated for and the approval's id, and main
+// checks the approval's whole subject again before a value moves.
 import { randomUUID } from "node:crypto";
 import { siteLabel } from "../shared/agent-browser";
-import { CONTACT_FILL_KEYS, FIELD_LABELS, LOGIN_FILL_KEYS, VAULT_FILL_KEYS, VAULT_PERMISSION_ID, type VaultFillKey } from "../shared/vault";
+import { CONTACT_FILL_KEYS, FIELD_LABELS, LOGIN_FILL_KEYS, VAULT_FILL_KEYS, VAULT_PERMISSION_ID, type VaultFillKey, vaultSubjectSite } from "../shared/vault";
 import type { LocalTool, ToolContext } from "./tools";
 
 const object = (properties: Record<string, unknown>, required: string[] = []) => ({ type: "object", properties, required, additionalProperties: false });
@@ -73,7 +74,9 @@ export const VAULT_TOOLS: Record<"vault_list" | "request_credential", LocalTool>
       return {
         risk: "dangerous",
         reasons: [info.label, `fills ${fields.join(", ")}`, ...(info.submit ? ["then presses Enter to submit the form"] : [])],
-        // The agent, the item and the page's origin: an approval is for this agent's fill of this item on this site only.
+        // The agent, the item, the page's origin, and the tab, its document and each field as the card
+        // shows them: an approval is for exactly this fill. Resent with the user's answer, the call is
+        // planned again, and a subject that changed meanwhile (a ref naming another element) isn't approved.
         scope: info.subject,
         paths: [],
         action: "use-app",
@@ -83,10 +86,7 @@ export const VAULT_TOOLS: Record<"vault_list" | "request_credential", LocalTool>
       };
     },
     async execute(args, context) {
-      const subject = context.plan?.scope ?? "";
-      // An origin has no "@" in it (addresses with a user name aren't opened).
-      const at = subject.lastIndexOf("@");
-      const expectSite = subject.startsWith("vault:") && at > 0 ? subject.slice(at + 1) : null;
+      const expectSite = vaultSubjectSite(context.plan?.scope ?? "");
       const callId = randomUUID();
       const onAbort = () => void context.host.browser.cancel({ callId }).catch(() => undefined);
       context.signal.addEventListener("abort", onAbort);

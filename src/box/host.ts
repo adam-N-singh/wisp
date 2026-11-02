@@ -66,7 +66,7 @@ import { addMemory, editMemory, MemoryError, reviewMemory } from "./memory";
 import { MessageActionError, nextFeedback, toggleReaction } from "./message-actions";
 import { conversationOutline } from "./outline";
 import { documentView, libraryPage, PageError, readCanvas, readDocument, storedPage, retitleCanvas, requirePage, restoreRevision, revisionList, writePage } from "./pages";
-import { PluginError, PluginHost } from "./plugins";
+import { PluginError, PluginHost, serversOfPluginsOff } from "./plugins";
 import { RoomError, Rooms } from "./rooms";
 import { buildAutomation, Scheduler } from "./scheduler";
 import { buildSkill, fetchSkillText, skillFromMarkdown } from "./skills";
@@ -192,8 +192,15 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
   };
 
   const mcp = new McpManager(() => broadcast("apps-state", mcpState()), log, options.mcpAuth);
-  /** The servers as clients see them, stamped with the change they reflect. */
-  const mcpState = () => ({ servers: mcp.state(store.mcpServers()), ordered: mcp.ordered() });
+  /**
+   * The servers as clients see them, stamped with the change they reflect. A turned-off plugin's
+   * show as off (`pluginOff`), since they don't run whatever their own switch says.
+   */
+  const mcpState = () => {
+    const off = serversOfPluginsOff(store);
+    const servers = mcp.state(store.mcpServers()).map((server) => (off.has(server.id) ? { ...server, enabled: false, pluginOff: true } : server));
+    return { servers, ordered: mcp.ordered() };
+  };
   // The servers start once the plugins are read (below): a plugin turned off keeps its servers stopped.
 
   // Claude Code runs reach back into this box through the bridge MCP server.
@@ -1055,6 +1062,9 @@ export async function startBoxHost(options: BoxHostOptions): Promise<BoxHost> {
     },
     setMcpServerEnabled: ({ serverId, enabled }) => {
       const server = requireMcpServer(serverId);
+      // Its switch would do nothing while its plugin is off; the plugin's switch is the one.
+      const owner = plugins.pluginOfServer(serverId);
+      if (owner?.enabled === false) throw new CommandError(409, `It comes with the plugin ${owner.plugin.displayName}, which is turned off. Turn the plugin back on in Connect Apps first.`, "plugin/off");
       store.putMcpServer({ ...server, enabled });
       syncMcp();
       return mcpState();

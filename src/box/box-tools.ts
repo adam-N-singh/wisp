@@ -19,7 +19,8 @@ export interface BoxToolContext {
   sessionId: string;
   store: BoxStore;
   signal: AbortSignal;
-  emitTodos(todos: AgentTodo[]): void;
+  /** Saves the session's todo list and tells clients (nothing once the session or agent is gone). */
+  setTodos(todos: AgentTodo[]): void;
   automationsChanged(automation: Automation, action: "created" | "deleted"): void;
   memoriesChanged(): void;
   askUser(prompt: string, options: ChoiceOption[], allowCustom: boolean): Promise<string>;
@@ -135,8 +136,7 @@ export const BOX_TOOLS: Record<string, BoxTool> = {
         status: TODO_STATUSES.includes(item.status) ? item.status : "pending",
         updatedAt: now,
       }));
-      context.store.setTodos(context.agentId, todos, context.sessionId);
-      context.emitTodos(todos);
+      context.setTodos(todos);
       const done = todos.filter((todo) => todo.status === "completed").length;
       return { output: `Todo list saved: ${done}/${todos.length} completed.` };
     },
@@ -290,7 +290,9 @@ export const BOX_TOOLS: Record<string, BoxTool> = {
     summary: (args, context) => {
       const existing = typeof args.canvas_id === "string" ? context.store.getPage(context.agentId, args.canvas_id) : undefined;
       const given = cleanPageTitle(String(args.title ?? ""));
-      const title = given.length > 0 ? given : (existing?.title ?? (typeof args.contents === "string" ? canvasTitle(args.contents) : null) ?? "a canvas");
+      // Written before the call runs, so before its size check: a canvas over the limit isn't read for a title.
+      const readable = typeof args.contents === "string" && args.contents.length <= MAX_PAGE_SOURCE ? args.contents : null;
+      const title = given.length > 0 ? given : (existing?.title ?? (readable != null ? canvasTitle(readable) : null) ?? "a canvas");
       return `${existing != null ? "Updated" : "Made"} ${quote(title)}`;
     },
     async run(args, context) {
